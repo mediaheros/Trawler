@@ -208,6 +208,16 @@ pub fn run() {
             commands_import::import_estimate,
             commands_import::import_disambiguate,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // clicking the Dock icon with the window hidden is THE macOS
+            // gesture for "bring it back" — without this it does nothing
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = event {
+                tray::show_main(app_handle);
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app_handle, &event);
+        });
 }

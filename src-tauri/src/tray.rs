@@ -7,7 +7,7 @@ use tauri::{
     App, AppHandle, Manager,
 };
 
-fn show_main(app: &AppHandle) {
+pub(crate) fn show_main(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
         let _ = w.unminimize();
@@ -26,7 +26,9 @@ pub fn init(app: &App) -> tauri::Result<()> {
         .icon(app.default_window_icon().expect("app icon").clone())
         .tooltip("Trawler")
         .menu(&menu)
-        .show_menu_on_left_click(false)
+        // macOS status items open their menu on left-click — that's the norm;
+        // on Windows left-click is reserved and double-click opens the app
+        .show_menu_on_left_click(cfg!(target_os = "macos"))
         .on_menu_event(|app, event| match event.id.as_ref() {
             "open" => show_main(app),
             "check" => {
