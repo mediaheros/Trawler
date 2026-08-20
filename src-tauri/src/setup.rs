@@ -29,11 +29,15 @@ fn local_app_data() -> PathBuf {
 /// owns %LOCALAPPDATA%\Trawler for Trawler itself — updates and uninstalls
 /// operate on that folder). Legacy installs that landed inside it keep working.
 pub fn managed_prowlarr_exe() -> PathBuf {
-    let new = local_app_data().join("TrawlerTools").join("Prowlarr").join("Prowlarr.exe");
+    #[cfg(windows)]
+    const EXE: &str = "Prowlarr.exe";
+    #[cfg(not(windows))]
+    const EXE: &str = "Prowlarr";
+    let new = local_app_data().join("TrawlerTools").join("Prowlarr").join(EXE);
     if new.exists() {
         return new;
     }
-    let legacy = local_app_data().join("Trawler").join("Prowlarr").join("Prowlarr.exe");
+    let legacy = local_app_data().join("Trawler").join("Prowlarr").join(EXE);
     if legacy.exists() { legacy } else { new }
 }
 
@@ -52,6 +56,7 @@ fn managed_prowlarr_data() -> PathBuf {
     local_app_data().join("TrawlerTools").join("ProwlarrData")
 }
 
+#[cfg(windows)]
 fn qbt_exe_candidates() -> Vec<PathBuf> {
     let mut out = vec![];
     // honor real environment paths, not a hardcoded C: drive
@@ -70,7 +75,22 @@ fn qbt_exe_candidates() -> Vec<PathBuf> {
     out
 }
 
+#[cfg(target_os = "macos")]
+fn qbt_exe_candidates() -> Vec<PathBuf> {
+    let mut out = vec![PathBuf::from("/Applications/qbittorrent.app/Contents/MacOS/qbittorrent")];
+    if let Some(home) = dirs::home_dir() {
+        out.push(home.join("Applications/qbittorrent.app/Contents/MacOS/qbittorrent"));
+    }
+    out
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn qbt_exe_candidates() -> Vec<PathBuf> {
+    vec![PathBuf::from("/usr/bin/qbittorrent"), PathBuf::from("/usr/local/bin/qbittorrent")]
+}
+
 /// InstallLocation from qBittorrent's uninstall key (HKCU then HKLM).
+#[cfg(windows)]
 fn qbt_exe_from_registry() -> Option<PathBuf> {
     for root in ["HKCU", "HKLM"] {
         let mut cmd = std::process::Command::new("reg");
@@ -103,6 +123,18 @@ fn qbt_exe_from_registry() -> Option<PathBuf> {
     None
 }
 
+#[cfg(target_os = "macos")]
+fn qbt_ini_path() -> PathBuf {
+    // qBittorrent on macOS ignores Application Support for settings and reads
+    // ~/.config/qBittorrent/qBittorrent.ini — verified against 5.2.3
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".config")
+        .join("qBittorrent")
+        .join("qBittorrent.ini")
+}
+
+#[cfg(not(target_os = "macos"))]
 fn qbt_ini_path() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -124,10 +156,10 @@ pub struct SetupStatus {
     pub prowlarr_has_indexers: bool,
 }
 
+#[cfg(windows)]
 fn process_running(name: &str) -> bool {
     let mut cmd = std::process::Command::new("tasklist");
     cmd.args(["/FI", &format!("IMAGENAME eq {name}"), "/FO", "CSV", "/NH"]);
-    #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
@@ -135,6 +167,34 @@ fn process_running(name: &str) -> bool {
     cmd.output()
         .map(|o| String::from_utf8_lossy(&o.stdout).contains(name))
         .unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+fn process_running(name: &str) -> bool {
+    // pgrep matches the BINARY name — strip any .exe a shared caller passes
+    let name = name.trim_end_matches(".exe");
+    std::process::Command::new("pgrep")
+        .args(["-x", name])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Force-stop a process by image name, per-platform.
+pub(crate) fn kill_process(name: &str) {
+    #[cfg(windows)]
+    {
+        let mut kill = std::process::Command::new("taskkill");
+        kill.args(["/IM", name, "/F"]);
+        use std::os::windows::process::CommandExt;
+        kill.creation_flags(0x0800_0000);
+        let _ = kill.output();
+    }
+    #[cfg(not(windows))]
+    {
+        let name = name.trim_end_matches(".exe");
+        let _ = std::process::Command::new("pkill").args(["-x", name]).output();
+    }
 }
 
 pub async fn status(state: &AppState) -> SetupStatus {
@@ -235,6 +295,12 @@ fn spawn_detached(exe: &PathBuf, args: &[String]) -> Result<()> {
         use std::os::windows::process::CommandExt;
         // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP: survives Trawler exiting
         cmd.creation_flags(0x0000_0008 | 0x0000_0200);
+    }
+    #[cfg(unix)]
+    {
+        // own process group: survives Trawler exiting, immune to our signals
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
     }
     cmd.spawn().map_err(|e| AppError::Other(format!("failed to start {}: {e}", exe.display())))?;
     Ok(())
@@ -359,20 +425,29 @@ pub async fn install_prowlarr(app: &AppHandle) -> Result<String> {
         ));
     }
     let release: Value = api.error_for_status()?.json().await?;
+    // per-platform asset: windows zip, mac tar.gz matched to the CPU
+    #[cfg(windows)]
+    const ASSET_SUFFIX: &str = "windows-core-x64.zip";
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    const ASSET_SUFFIX: &str = "osx-core-arm64.tar.gz";
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    const ASSET_SUFFIX: &str = "osx-core-x64.tar.gz";
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    const ASSET_SUFFIX: &str = "linux-core-x64.tar.gz";
     let asset_url = release
         .get("assets")
         .and_then(|a| a.as_array())
         .and_then(|assets| {
             assets.iter().find_map(|a| {
                 let name = a.get("name")?.as_str()?;
-                if name.ends_with("windows-core-x64.zip") {
+                if name.ends_with(ASSET_SUFFIX) {
                     a.get("browser_download_url")?.as_str().map(String::from)
                 } else {
                     None
                 }
             })
         })
-        .ok_or_else(|| AppError::Other("could not find a Prowlarr Windows build".into()))?;
+        .ok_or_else(|| AppError::Other("could not find a Prowlarr build for this platform".into()))?;
 
     emit(app, "prowlarr", "log", json!({ "message": "Downloading Prowlarr…" }));
     // ~100 MB: the client's 60s TOTAL deadline would abort this on any
@@ -404,28 +479,49 @@ pub async fn install_prowlarr(app: &AppHandle) -> Result<String> {
     let target = managed_prowlarr_dir();
     let _ = std::fs::remove_dir_all(&target);
     std::fs::create_dir_all(&target)?;
-    let cursor = std::io::Cursor::new(bytes);
-    let mut archive =
-        zip::ZipArchive::new(cursor).map_err(|e| AppError::Other(format!("bad archive: {e}")))?;
-    // the zip contains a single top-level "Prowlarr/" folder — strip it
-    for i in 0..archive.len() {
-        let mut file = archive
-            .by_index(i)
-            .map_err(|e| AppError::Other(format!("archive read: {e}")))?;
-        let Some(path) = file.enclosed_name() else { continue };
-        let stripped: PathBuf = path.components().skip(1).collect();
-        if stripped.as_os_str().is_empty() {
-            continue;
-        }
-        let out = target.join(&stripped);
-        if file.is_dir() {
-            std::fs::create_dir_all(&out)?;
-        } else {
-            if let Some(parent) = out.parent() {
-                std::fs::create_dir_all(parent)?;
+    #[cfg(windows)]
+    {
+        let cursor = std::io::Cursor::new(bytes);
+        let mut archive =
+            zip::ZipArchive::new(cursor).map_err(|e| AppError::Other(format!("bad archive: {e}")))?;
+        // the zip contains a single top-level "Prowlarr/" folder — strip it
+        for i in 0..archive.len() {
+            let mut file = archive
+                .by_index(i)
+                .map_err(|e| AppError::Other(format!("archive read: {e}")))?;
+            let Some(path) = file.enclosed_name() else { continue };
+            let stripped: PathBuf = path.components().skip(1).collect();
+            if stripped.as_os_str().is_empty() {
+                continue;
             }
-            let mut w = std::fs::File::create(&out)?;
-            std::io::copy(&mut file, &mut w)?;
+            let out = target.join(&stripped);
+            if file.is_dir() {
+                std::fs::create_dir_all(&out)?;
+            } else {
+                if let Some(parent) = out.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let mut w = std::fs::File::create(&out)?;
+                std::io::copy(&mut file, &mut w)?;
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        // tar.gz: hand it to the system tar, which preserves exec bits
+        let tarball = target.join("prowlarr-download.tar.gz");
+        std::fs::write(&tarball, &bytes)?;
+        let ok = std::process::Command::new("tar")
+            .args(["-xzf"])
+            .arg(&tarball)
+            .args(["--strip-components=1", "-C"])
+            .arg(&target)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        let _ = std::fs::remove_file(&tarball);
+        if !ok {
+            return Err(AppError::Other("couldn't extract the Prowlarr archive".into()));
         }
     }
 
@@ -477,11 +573,46 @@ pub async fn flaresolverr_running(state: &AppState) -> bool {
 }
 
 pub fn start_flaresolverr() -> Result<()> {
-    let exe = managed_flaresolverr_exe();
-    if !exe.exists() {
-        return Err(AppError::Other("FlareSolverr isn't installed".into()));
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("docker")
+            .args(["start", FS_CONTAINER])
+            .output()
+            .map_err(|e| AppError::Other(format!("docker: {e}")))?;
+        if !out.status.success() {
+            return Err(AppError::Other("the FlareSolverr container wouldn't start".into()));
+        }
+        return Ok(());
     }
-    spawn_detached(&exe, &[])
+    #[allow(unreachable_code)]
+    {
+        let exe = managed_flaresolverr_exe();
+        if !exe.exists() {
+            return Err(AppError::Other("FlareSolverr isn't installed".into()));
+        }
+        spawn_detached(&exe, &[])
+    }
+}
+
+/// Tear the managed FlareSolverr down locally (process/container + files).
+pub fn remove_flaresolverr_local() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("docker").args(["rm", "-f", FS_CONTAINER]).output();
+        return Ok(());
+    }
+    #[allow(unreachable_code)]
+    {
+        kill_process("flaresolverr.exe");
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        if let Some(dir) = managed_flaresolverr_exe().parent().map(PathBuf::from) {
+            if dir.exists() {
+                std::fs::remove_dir_all(&dir)
+                    .map_err(|e| AppError::Other(format!("couldn't remove {}: {e}", dir.display())))?;
+            }
+        }
+        Ok(())
+    }
 }
 
 pub async fn wait_for_flaresolverr(state: &AppState, secs: u64) -> bool {
@@ -494,9 +625,72 @@ pub async fn wait_for_flaresolverr(state: &AppState, secs: u64) -> bool {
     false
 }
 
+/// Is Docker usable? (macOS path: FlareSolverr ships no darwin binary.)
+#[cfg(target_os = "macos")]
+fn docker_available() -> bool {
+    std::process::Command::new("docker")
+        .args(["info", "--format", "ok"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// The container name the managed Docker route owns.
+#[cfg(target_os = "macos")]
+const FS_CONTAINER: &str = "trawler-flaresolverr";
+
+/// macOS: FlareSolverr publishes no darwin binary, so the managed route runs
+/// the official container instead. Still strictly opt-in.
+#[cfg(target_os = "macos")]
+pub async fn install_flaresolverr(app: &AppHandle) -> Result<()> {
+    let state_guard = app.state::<AppState>();
+    let state: &AppState = state_guard.inner();
+    if !docker_available() {
+        return Err(AppError::Other(
+            "FlareSolverr has no Mac build, so Trawler runs it via Docker — install Docker Desktop (docker.com) first, then click again".into(),
+        ));
+    }
+    emit(app, "flaresolverr", "log", json!({ "message": "Starting the FlareSolverr container…" }));
+    // a previous container (stopped or stale) gets replaced, not duplicated
+    let _ = std::process::Command::new("docker").args(["rm", "-f", FS_CONTAINER]).output();
+    let run = std::process::Command::new("docker")
+        .args([
+            "run", "-d", "--name", FS_CONTAINER, "--restart", "unless-stopped",
+            "-p", "8191:8191", "ghcr.io/flaresolverr/flaresolverr:latest",
+        ])
+        .output()
+        .map_err(|e| AppError::Other(format!("docker: {e}")))?;
+    if !run.status.success() {
+        return Err(AppError::Other(format!(
+            "the FlareSolverr container refused to start: {}",
+            String::from_utf8_lossy(&run.stderr).chars().take(200).collect::<String>()
+        )));
+    }
+    if !wait_for_flaresolverr(state, 90).await {
+        return Err(AppError::Other("FlareSolverr's container started but :8191 never answered".into()));
+    }
+    Ok(())
+}
+
+/// Does the managed FlareSolverr exist on this machine? (exe on Windows,
+/// container on macOS)
+pub fn flaresolverr_installed() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        return std::process::Command::new("docker")
+            .args(["container", "inspect", FS_CONTAINER])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+    }
+    #[allow(unreachable_code)]
+    managed_flaresolverr_exe().exists()
+}
+
 /// Download the latest FlareSolverr (~350 MB — it bundles a browser), extract
 /// it next to managed Prowlarr, and start it. Opt-in only; never part of the
 /// wizard.
+#[cfg(not(target_os = "macos"))]
 pub async fn install_flaresolverr(app: &AppHandle) -> Result<()> {
     let state_guard = app.state::<AppState>();
     let state: &AppState = state_guard.inner();
@@ -753,14 +947,7 @@ pub async fn configure_and_launch_qbt(qbit_url: &str) -> Result<()> {
             "couldn't find qBittorrent's program folder — install it from qbittorrent.org, or set its Web UI up manually in Settings".into(),
         ))?;
     if process_running("qbittorrent.exe") {
-        let mut kill = std::process::Command::new("taskkill");
-        kill.args(["/IM", "qbittorrent.exe", "/F"]);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            kill.creation_flags(0x0800_0000);
-        }
-        let _ = kill.output();
+        kill_process("qbittorrent.exe");
         for _ in 0..10 {
             tokio::time::sleep(std::time::Duration::from_millis(700)).await;
             if !process_running("qbittorrent.exe") {
@@ -795,13 +982,121 @@ pub async fn configure_and_launch_qbt(qbit_url: &str) -> Result<()> {
     }
     std::fs::write(&ini_path, updated)?;
 
+    #[cfg(target_os = "macos")]
+    {
+        // LaunchServices gives it a dock icon and a real app session
+        let _ = exe; // resolved above to prove the install exists
+        return std::process::Command::new("open")
+            .args(["-a", "qbittorrent"])
+            .output()
+            .map_err(|e| AppError::Other(format!("couldn't launch qBittorrent: {e}")))
+            .map(|_| ());
+    }
+    #[allow(unreachable_code)]
     spawn_detached(&exe, &[])
+}
+
+/// Install qBittorrent on macOS: official dmg from SourceForge, mounted and
+/// copied to /Applications — no admin prompt, no package manager needed.
+#[cfg(target_os = "macos")]
+pub async fn install_qbt_macos(app: &AppHandle) -> Result<()> {
+    let state_guard = app.state::<AppState>();
+    let state: &AppState = state_guard.inner();
+    if qbt_exe_candidates().iter().any(|p| p.exists()) {
+        return Ok(());
+    }
+    emit(app, "qbit", "log", json!({ "message": "Finding the latest qBittorrent…" }));
+    let rss = state
+        .http
+        .get("https://sourceforge.net/projects/qbittorrent/rss?path=/qbittorrent-mac")
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await?
+        .text()
+        .await?;
+    let ver = rss
+        .split("qbittorrent-mac/qbittorrent-")
+        .nth(1)
+        .and_then(|s| s.split('/').next())
+        .ok_or_else(|| AppError::Other("couldn't find the latest qBittorrent for macOS".into()))?
+        .to_string();
+    let url = format!(
+        "https://downloads.sourceforge.net/project/qbittorrent/qbittorrent-mac/qbittorrent-{ver}/qbittorrent-{ver}.dmg"
+    );
+    emit(app, "qbit", "log", json!({ "message": format!("Downloading qBittorrent {ver}…") }));
+    let resp = state
+        .http
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(1800))
+        .send()
+        .await?
+        .error_for_status()
+        .map_err(|e| AppError::Other(format!("qBittorrent download failed: {e}")))?;
+    let tools = local_app_data().join("TrawlerTools");
+    std::fs::create_dir_all(&tools)?;
+    let dmg = tools.join("qbittorrent-download.dmg");
+    struct TempFile(PathBuf);
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _guard = TempFile(dmg.clone());
+    {
+        let mut out = std::fs::File::create(&dmg)?;
+        let mut stream = resp;
+        while let Some(chunk) = stream.chunk().await? {
+            use std::io::Write;
+            out.write_all(&chunk)?;
+        }
+    }
+    emit(app, "qbit", "log", json!({ "message": "Installing…" }));
+    let mount = std::process::Command::new("hdiutil")
+        .args(["attach", "-nobrowse", "-plist"])
+        .arg(&dmg)
+        .output()
+        .map_err(|e| AppError::Other(format!("hdiutil: {e}")))?;
+    let plist = String::from_utf8_lossy(&mount.stdout);
+    let vol = plist
+        .split("<key>mount-point</key>")
+        .nth(1)
+        .and_then(|s| s.split("<string>").nth(1))
+        .and_then(|s| s.split("</string>").next())
+        .ok_or_else(|| AppError::Other("couldn't mount the qBittorrent disk image".into()))?
+        .to_string();
+    let src = PathBuf::from(&vol).join("qbittorrent.app");
+    let copied = std::process::Command::new("cp")
+        .arg("-R")
+        .arg(&src)
+        .arg("/Applications/")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !copied {
+        // no write access to /Applications — fall back to the user's own
+        if let Some(home) = dirs::home_dir() {
+            let user_apps = home.join("Applications");
+            let _ = std::fs::create_dir_all(&user_apps);
+            let _ = std::process::Command::new("cp").arg("-R").arg(&src).arg(&user_apps).output();
+        }
+    }
+    let _ = std::process::Command::new("hdiutil").args(["detach", "-quiet"]).arg(&vol).output();
+    if !qbt_exe_candidates().iter().any(|p| p.exists()) {
+        return Err(AppError::Other("the qBittorrent install didn't land in Applications".into()));
+    }
+    emit(app, "qbit", "done", json!({ "message": "qBittorrent installed" }));
+    Ok(())
 }
 
 /// Install qBittorrent via winget and babysit it: stream status while the
 /// download / UAC / install runs, return once the exe actually exists. The
 /// caller's button stays busy the whole time instead of going quiet.
 pub async fn install_qbt_via_winget(app: &AppHandle) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        return install_qbt_macos(app).await;
+    }
+    #[allow(unreachable_code)]
     if qbt_exe_candidates().iter().any(|p| p.exists()) {
         return Ok(());
     }

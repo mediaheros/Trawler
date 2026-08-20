@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { ChevronDown, Loader2, Plus, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
 import { api, onSetupStep, type FlaresolverrStatus, type Indexer, type IndexerDef } from "../lib/api";
 import { useStore } from "../store";
+import { isMac } from "../lib/platform";
 import { Badge, Button, IconBtn, TextInput, cx } from "./ui";
 
 /** Verified against Prowlarr's catalog this session — healthy public defs. */
@@ -321,9 +322,9 @@ function FlaresolverrCard({ onUnlocked }: { onUnlocked: () => void }) {
         <div className="min-w-0 flex-1">
           <div className="text-[12px] font-medium">Some indexers sit behind Cloudflare</div>
           <div className="text-[11px] leading-snug text-faint">
-            1337x, EZTV and friends block server requests. Optional fix: Trawler can run
-            FlareSolverr for you (~350 MB download — it bundles a browser) and route
-            protected indexers through it. Everything else works fine without this.
+            {isMac
+              ? "1337x, EZTV and friends block server requests. Optional fix: Trawler can run FlareSolverr for you via Docker (needs Docker Desktop) and route protected indexers through it. Everything else works fine without this."
+              : "1337x, EZTV and friends block server requests. Optional fix: Trawler can run FlareSolverr for you (~350 MB download — it bundles a browser) and route protected indexers through it. Everything else works fine without this."}
           </div>
         </div>
         <Button onClick={() => void unlock()} busy={busy} className="shrink-0 px-2.5 py-1.5 text-[11.5px]">

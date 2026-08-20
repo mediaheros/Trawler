@@ -765,8 +765,10 @@ pub async fn add_indexer(state: State<'_, AppState>, name: String) -> Result<Str
             // Cloudflare wall — retry through FlareSolverr ONLY when the user
             // actually opted in (managed install present + proxy registered);
             // adding an indexer must never mutate Prowlarr's global config
-            let opted_in = crate::setup::managed_flaresolverr_exe().exists()
-                && crate::setup::flaresolverr_running(&state).await
+            // a registered proxy is deliberate opt-in (only setup_flaresolverr
+            // or the user's own Prowlarr config creates one) — no exe check,
+            // which also covers the macOS Docker route
+            let opted_in = crate::setup::flaresolverr_running(&state).await
                 && client.flaresolverr_proxy_exists().await.unwrap_or(false);
             if !opted_in {
                 return Err(e);

@@ -13,6 +13,7 @@ import {
 import { api, type Release } from "../lib/api";
 import { fmtAge, fmtBytes } from "../lib/format";
 import { useStore, type SortKey } from "../store";
+import { modKey } from "../lib/platform";
 import { Badge, Button, CenterMessage, Chip, SeederDot, Segmented, cx } from "../components/ui";
 
 export default function SearchView() {
@@ -149,7 +150,7 @@ export default function SearchView() {
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               onKeyDown={(e) => (e.key === "Enter" || e.key === "Return") && runSearch()}
-              placeholder="Search movies and TV shows…   (Ctrl+K)"
+              placeholder={`Search movies and TV shows…   (${modKey}${modKey === "Ctrl" ? "+" : ""}K)`}
               spellCheck={false}
               className={cx(
                 "w-full rounded-xl border border-line2 bg-bg2 pl-9.5 pr-9 text-ink outline-none",

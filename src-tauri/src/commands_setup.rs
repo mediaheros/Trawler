@@ -146,7 +146,7 @@ pub struct FlaresolverrStatus {
 
 #[tauri::command]
 pub async fn flaresolverr_status(state: State<'_, AppState>) -> Result<FlaresolverrStatus> {
-    let installed = setup::managed_flaresolverr_exe().exists();
+    let installed = setup::flaresolverr_installed();
     let running = setup::flaresolverr_running(&state).await;
     let proxied = if running {
         let cfg = state.config.read().await.clone();
@@ -184,14 +184,14 @@ pub async fn setup_flaresolverr(app: tauri::AppHandle, state: State<'_, AppState
         AppError::Other(format!("Prowlarr isn't reachable, and the unlock needs it: {e}"))
     })?;
 
-    // someone already running FlareSolverr (Docker, their own copy) skips the
-    // download entirely — :8191 answering with the real greeting is enough
+    // someone already running FlareSolverr (their own copy) skips the
+    // install entirely — :8191 answering with the real greeting is enough
     if !setup::flaresolverr_running(&state).await {
-        if setup::managed_flaresolverr_exe().exists() {
+        if setup::flaresolverr_installed() {
             let started = setup::start_flaresolverr().is_ok()
                 && setup::wait_for_flaresolverr(&state, 30).await;
             if !started {
-                // wedged install (half-extracted, wrong arch, …) — replace it
+                // wedged install (half-extracted, stale container, …) — replace
                 setup::install_flaresolverr(&app).await?;
             }
         } else {
@@ -272,23 +272,7 @@ pub async fn disable_flaresolverr(state: State<'_, AppState>) -> Result<()> {
     if let Ok(client) = crate::commands::prowlarr_pub(&state.http, &cfg) {
         let _ = client.remove_flaresolverr().await;
     }
-    #[cfg(windows)]
-    {
-        let mut kill = std::process::Command::new("taskkill");
-        kill.args(["/IM", "flaresolverr.exe", "/F"]);
-        use std::os::windows::process::CommandExt;
-        kill.creation_flags(0x0800_0000);
-        let _ = kill.output();
-    }
-    let dir = setup::managed_flaresolverr_exe()
-        .parent()
-        .map(std::path::PathBuf::from);
-    if let Some(dir) = dir {
-        // give the process a beat to die before deleting its files
-        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-        std::fs::remove_dir_all(&dir)
-            .map_err(|e| AppError::Other(format!("couldn't remove {}: {e}", dir.display())))?;
-    }
+    setup::remove_flaresolverr_local()?;
     {
         let conn = state.db.lock().await;
         crate::db::log_activity(&conn, "system", None, "FlareSolverr turned off and removed");

@@ -104,9 +104,7 @@ pub fn run() {
                 }
                 // FlareSolverr is opt-in; but once opted in, it should come
                 // back after a reboot without the user thinking about it
-                if setup::managed_flaresolverr_exe().exists()
-                    && !setup::flaresolverr_running(&state).await
-                {
+                if setup::flaresolverr_installed() && !setup::flaresolverr_running(&state).await {
                     let _ = setup::start_flaresolverr();
                 }
             });

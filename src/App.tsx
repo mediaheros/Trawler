@@ -6,6 +6,7 @@ import FirstRun from "./components/FirstRun";
 import UpdateBanner from "./components/UpdateBanner";
 import { ToastStack, cx } from "./components/ui";
 import { useStore, type View } from "./store";
+import { isMac, modKey, modHeld } from "./lib/platform";
 import SearchView from "./views/Search";
 import AgentView from "./views/Agent";
 import ShowsView from "./views/Shows";
@@ -58,7 +59,7 @@ export default function App() {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.ctrlKey && !e.shiftKey && !e.altKey) {
+      if (modHeld(e) && !e.shiftKey && !e.altKey) {
         if (e.key === "1") setView("search");
         if (e.key === "2") setView("agent");
         if (e.key === "3") setView("shows");
@@ -89,7 +90,7 @@ export default function App() {
               key={v}
               type="button"
               onClick={() => setView(v)}
-              title={`${label} (Ctrl+${i + 1})`}
+              title={`${label} (${modKey}${isMac ? "" : "+"}${i + 1})`}
               className={cx(
                 "relative flex size-9 cursor-pointer items-center justify-center rounded-xl transition-all duration-150",
                 view === v
