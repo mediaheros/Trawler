@@ -243,7 +243,7 @@ async fn execute_plan(app: &tauri::AppHandle, state: &AppState, plan: &PlannedGr
     match result {
         Ok(_) => {
             db::mark_grabbed(&conn, &fresh_ep_ids, &plan.title);
-            db::ledger_insert(&conn, &ck, None, &plan.title, magnet_hash(plan.magnet_url.as_deref()).as_deref(), plan.size);
+            db::ledger_insert(&conn, &ck, None, &plan.title, magnet_hash(plan.magnet_url.as_deref()).as_deref(), plan.size, &fresh_ep_ids);
             let what = if plan.is_pack {
                 format!("{} S{:02} season pack", plan.show_name, plan.season)
             } else {
@@ -330,6 +330,11 @@ fn reopen_dead_grabs(
                  WHERE state = 'grabbed' AND grabbed_title = ?1",
                 [&title],
             );
+            let linked: Option<String> = conn
+                .query_row("SELECT ep_ids FROM grab_ledger WHERE id = ?1", [id], |r| r.get(0))
+                .ok()
+                .flatten();
+            db::set_episodes_state_by_ids(&conn, &db::parse_ep_ids(linked.as_deref()), "wanted", None);
             // A stalled UPGRADE grab (same content key already completed once)
             // needs no medic — the user keeps the copy they already have, and
             // the agent would only refuse "already grabbed" replacements.
@@ -601,6 +606,11 @@ async fn completion_pass(app: &tauri::AppHandle, state: &AppState) -> Vec<DeadGr
                  WHERE state = 'grabbed' AND grabbed_title = ?1",
                 [&title],
             );
+            let linked: Option<String> = conn
+                .query_row("SELECT ep_ids FROM grab_ledger WHERE id = ?1", [id], |r| r.get(0))
+                .ok()
+                .flatten();
+            db::set_episodes_state_by_ids(&conn, &db::parse_ep_ids(linked.as_deref()), "wanted", None);
             db::log_activity(
                 &conn,
                 "system",
@@ -670,33 +680,46 @@ async fn completion_pass(app: &tauri::AppHandle, state: &AppState) -> Vec<DeadGr
         }
     }
 
-    // the shared ledger covers brief/agent grabs that have no episode row
-    let open_ledger: Vec<(i64, String, i64)> = conn
-        .prepare("SELECT id, title, ts FROM grab_ledger WHERE state = 'grabbed'")
+    // the shared ledger covers brief/agent grabs that have no episode row —
+    // and rows carrying ep_ids are the durable episode linkage that survives
+    // an unfollow/refollow wiping grabbed_title
+    let running_norms: std::collections::HashSet<String> =
+        torrents.iter().filter(|t| t.progress < 0.999).map(|t| normalize(&t.name)).collect();
+    let running_hashes: std::collections::HashSet<String> =
+        torrents.iter().filter(|t| t.progress < 0.999).map(|t| t.hash.to_ascii_lowercase()).collect();
+    let open_ledger: Vec<(i64, String, i64, Option<String>, Option<String>)> = conn
+        .prepare("SELECT id, title, ts, info_hash, ep_ids FROM grab_ledger WHERE state = 'grabbed'")
         .ok()
         .map(|mut stmt| {
-            stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))
-                .map(|it| it.flatten().collect::<Vec<_>>())
-                .unwrap_or_default()
+            stmt.query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .map(|it| it.flatten().collect::<Vec<_>>())
+            .unwrap_or_default()
         })
         .unwrap_or_default();
-    for (id, title, ts) in open_ledger {
+    for (id, title, ts, info_hash, ep_ids_raw) in open_ledger {
         let norm = normalize(&title);
+        let linked = db::parse_ep_ids(ep_ids_raw.as_deref());
         // hash first — magnet grabs get renamed by qBt once metadata lands,
         // so the listing title and the torrent name often disagree
-        let hash_done = conn
-            .query_row("SELECT info_hash FROM grab_ledger WHERE id = ?1", [id], |r| {
-                r.get::<_, Option<String>>(0)
-            })
-            .ok()
-            .flatten()
-            .map(|h| done_hashes.contains(&h.to_ascii_lowercase()))
-            .unwrap_or(false);
+        let h = info_hash.map(|x| x.to_ascii_lowercase());
+        let hash_done = h.as_ref().map(|x| done_hashes.contains(x)).unwrap_or(false);
         if hash_done || done.contains(&norm) {
             let _ = conn.execute("UPDATE grab_ledger SET state = 'completed' WHERE id = ?1", [id]);
+            // by-id flip catches episodes whose grabbed_title linkage was lost
+            db::set_episodes_state_by_ids(&conn, &linked, "downloaded", None);
             if seen_norms.insert(norm) && ts >= recent_cutoff {
                 completed_display.push(title.chars().take(60).collect());
             }
+            continue;
+        }
+        // resync: the torrent is still running but a refollow reset its
+        // episodes to 'wanted' — put the truth back on the screen (and keep
+        // the scheduler from grabbing a duplicate)
+        let hash_running = h.as_ref().map(|x| running_hashes.contains(x)).unwrap_or(false);
+        if (hash_running || running_norms.contains(&norm)) && !linked.is_empty() {
+            db::set_episodes_state_by_ids(&conn, &linked, "grabbed", Some(&title));
         }
     }
 

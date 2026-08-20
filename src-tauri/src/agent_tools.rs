@@ -339,6 +339,7 @@ async fn grab_release(state: &AppState, ctx: &mut RunCtx, args: &Value) -> Value
                 &stored.title,
                 stored.info_hash.as_deref(),
                 stored.size,
+                &[],
             );
             db::log_activity(
                 &conn,

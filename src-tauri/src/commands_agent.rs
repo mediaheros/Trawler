@@ -364,7 +364,7 @@ pub async fn proposal_resolve(state: State<'_, AppState>, id: i64, approve: bool
     let conn = state.db.lock().await;
     conn.execute("UPDATE proposals SET status = 'approved' WHERE id = ?1", [id])
         .map_err(db::db_err)?;
-    db::ledger_insert(&conn, &content_key, brief_id, &title, info_hash.as_deref(), size);
+    db::ledger_insert(&conn, &content_key, brief_id, &title, info_hash.as_deref(), size, &[]);
     db::log_activity(&conn, "agent", None, &format!("Approved proposal: {title}"));
     Ok(format!("Grabbed {title}"))
 }

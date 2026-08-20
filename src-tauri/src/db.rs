@@ -137,6 +137,9 @@ pub fn open() -> Result<Connection> {
         [],
     );
     let _ = conn.execute("ALTER TABLE shows ADD COLUMN search_alias TEXT", []);
+    // which episodes a grab belongs to, as a JSON id array — durable linkage
+    // that survives unfollow/refollow (grabbed_title matching does not)
+    let _ = conn.execute("ALTER TABLE grab_ledger ADD COLUMN ep_ids TEXT", []);
     let _ = conn.execute(
         "ALTER TABLE shows ADD COLUMN alias_status TEXT",
         [],
@@ -164,16 +167,57 @@ pub fn ledger_insert(
     title: &str,
     info_hash: Option<&str>,
     size: i64,
+    ep_ids: &[i64],
 ) {
+    let eps_json = if ep_ids.is_empty() {
+        None
+    } else {
+        serde_json::to_string(ep_ids).ok()
+    };
     let _ = conn.execute(
-        "INSERT INTO grab_ledger (content_key, brief_id, title, info_hash, size, state, ts)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'grabbed', ?6)",
-        rusqlite::params![content_key, brief_id, title, info_hash, size, now()],
+        "INSERT INTO grab_ledger (content_key, brief_id, title, info_hash, size, state, ts, ep_ids)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'grabbed', ?6, ?7)",
+        rusqlite::params![content_key, brief_id, title, info_hash, size, now(), eps_json],
     );
 }
 
 /// Everything already grabbed or completed for this content: (title, size).
 /// The upgrade scout uses this to see what quality the user already has.
+/// Parse a ledger row's ep_ids JSON into ids (empty when absent/invalid).
+pub fn parse_ep_ids(raw: Option<&str>) -> Vec<i64> {
+    raw.and_then(|r| serde_json::from_str::<Vec<i64>>(r).ok()).unwrap_or_default()
+}
+
+/// Flip a grab's linked episodes to a new state by id — the linkage that
+/// keeps working after unfollow/refollow wipes grabbed_title.
+pub fn set_episodes_state_by_ids(conn: &Connection, ids: &[i64], state: &str, grabbed_title: Option<&str>) {
+    for id in ids {
+        match (state, grabbed_title) {
+            ("downloaded", _) => {
+                let _ = conn.execute(
+                    "UPDATE episodes SET state = 'downloaded' WHERE tvmaze_ep_id = ?1 AND state != 'ignored'",
+                    [id],
+                );
+            }
+            ("grabbed", Some(t)) => {
+                let _ = conn.execute(
+                    "UPDATE episodes SET state = 'grabbed', grabbed_title = ?2, grabbed_at = COALESCE(grabbed_at, ?3)
+                     WHERE tvmaze_ep_id = ?1 AND state = 'wanted'",
+                    rusqlite::params![id, t, now()],
+                );
+            }
+            ("wanted", _) => {
+                let _ = conn.execute(
+                    "UPDATE episodes SET state = 'wanted', grabbed_title = NULL, grabbed_at = NULL, last_searched_at = 0
+                     WHERE tvmaze_ep_id = ?1 AND state = 'grabbed'",
+                    [id],
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
 pub fn ledger_entries(conn: &Connection, content_key: &str) -> Vec<(String, i64)> {
     conn.prepare(
         "SELECT title, size FROM grab_ledger WHERE content_key = ?1 AND state IN ('grabbed','completed')",
@@ -502,4 +546,18 @@ pub fn list_activity(conn: &Connection, limit: i64) -> Result<Vec<ActivityRow>> 
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(db_err)?;
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_ep_ids;
+
+    #[test]
+    fn ep_ids_roundtrip_and_junk() {
+        assert_eq!(parse_ep_ids(Some("[1,2,3]")), vec![1, 2, 3]);
+        assert_eq!(parse_ep_ids(Some("[]")), Vec::<i64>::new());
+        assert_eq!(parse_ep_ids(None), Vec::<i64>::new());
+        assert_eq!(parse_ep_ids(Some("not json")), Vec::<i64>::new());
+        assert_eq!(parse_ep_ids(Some("{\"a\":1}")), Vec::<i64>::new());
+    }
 }

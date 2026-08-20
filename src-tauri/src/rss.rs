@@ -294,7 +294,7 @@ pub async fn sweep(app: &AppHandle) -> Result<SweepStats> {
                 episode_grabs += 1;
                 let conn = state.db.lock().await;
                 db::mark_grabbed(&conn, &[ep_id], &cand.release.title);
-                db::ledger_insert(&conn, &ck, None, &cand.release.title, cand.release.info_hash.as_deref(), cand.release.size);
+                db::ledger_insert(&conn, &ck, None, &cand.release.title, cand.release.info_hash.as_deref(), cand.release.size, &[ep_id]);
                 db::log_activity(
                     &conn,
                     "rss",
@@ -369,7 +369,7 @@ pub async fn sweep(app: &AppHandle) -> Result<SweepStats> {
                     *gb_this_sweep.get_mut(&brief_id).unwrap() += size_gb;
                     brief_grabs += 1;
                     let conn = state.db.lock().await;
-                    db::ledger_insert(&conn, &ck, Some(brief_id), &cand.release.title, cand.release.info_hash.as_deref(), cand.release.size);
+                    db::ledger_insert(&conn, &ck, Some(brief_id), &cand.release.title, cand.release.info_hash.as_deref(), cand.release.size, &[]);
                     db::log_activity(
                         &conn,
                         "rss",

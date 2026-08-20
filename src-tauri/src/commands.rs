@@ -570,20 +570,26 @@ pub async fn torrent_action(
         let norm_name = normalize(&name);
         let h = hash.to_lowercase();
         // retire ledger rows for this torrent — hash first, title fallback
-        let rows: Vec<(i64, String, Option<String>)> = conn
-            .prepare("SELECT id, title, info_hash FROM grab_ledger WHERE state IN ('grabbed','completed')")
+        let rows: Vec<(i64, String, Option<String>, Option<String>)> = conn
+            .prepare("SELECT id, title, info_hash, ep_ids FROM grab_ledger WHERE state IN ('grabbed','completed')")
             .ok()
             .map(|mut stmt| {
-                stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
                     .map(|it| it.flatten().collect::<Vec<_>>())
                     .unwrap_or_default()
             })
             .unwrap_or_default();
         let mut freed: Vec<String> = vec![];
-        for (id, title, info_hash) in rows {
+        for (id, title, info_hash, ep_ids_raw) in rows {
             let hash_match = info_hash.map(|x| x.eq_ignore_ascii_case(&h)).unwrap_or(false);
             if hash_match || normalize(&title) == norm_name {
                 let _ = conn.execute("UPDATE grab_ledger SET state = 'removed' WHERE id = ?1", [id]);
+                crate::db::set_episodes_state_by_ids(
+                    &conn,
+                    &crate::db::parse_ep_ids(ep_ids_raw.as_deref()),
+                    "wanted",
+                    None,
+                );
                 freed.push(title);
             }
         }
