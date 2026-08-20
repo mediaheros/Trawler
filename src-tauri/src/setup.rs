@@ -54,7 +54,7 @@ fn qbt_ini_path() -> PathBuf {
 pub struct SetupStatus {
     /// ok | running_no_webui | installed_stopped | missing
     pub qbit: String,
-    /// ok | managed_stopped | missing
+    /// ok | needs_key | managed_stopped | missing
     pub prowlarr: String,
     /// ok | unreachable
     pub agent: String,
@@ -94,7 +94,9 @@ pub async fn status(state: &AppState) -> SetupStatus {
         "missing"
     };
 
-    // Prowlarr
+    // Prowlarr. /ping is UNAUTHENTICATED — a green ping alone must never
+    // report "connected", or every authenticated call afterwards fails
+    // while the wizard shows an all-clear.
     let prowlarr_ping = state
         .http
         .get(format!("{}/ping", cfg.prowlarr_url.trim_end_matches('/')))
@@ -103,23 +105,44 @@ pub async fn status(state: &AppState) -> SetupStatus {
         .await
         .map(|r| r.status().is_success())
         .unwrap_or(false);
+
+    // self-heal a managed install whose key never made it into our config
+    let mut api_key = cfg.prowlarr_api_key.clone();
+    if prowlarr_ping && api_key.is_empty() && cfg.prowlarr_url.contains("127.0.0.1:9696") {
+        if let Some(found) = read_prowlarr_api_key() {
+            let mut w = state.config.write().await;
+            w.prowlarr_api_key = found.clone();
+            let _ = crate::config::save(&w);
+            api_key = found;
+        }
+    }
+
+    let mut prowlarr_has_indexers = false;
     let prowlarr = if prowlarr_ping {
-        "ok"
+        if api_key.is_empty() {
+            "needs_key"
+        } else {
+            let client = crate::prowlarr::ProwlarrClient {
+                http: &state.http,
+                base: cfg.prowlarr_url.clone(),
+                api_key,
+            };
+            match client.indexers().await {
+                Ok(v) => {
+                    prowlarr_has_indexers = !v.is_empty();
+                    "ok"
+                }
+                // the key is present but Prowlarr rejects it
+                Err(crate::error::AppError::Prowlarr { status: 401, .. }) => "needs_key",
+                // transient hiccup: still connected, just no indexer info yet
+                Err(_) => "ok",
+            }
+        }
     } else if managed_prowlarr_exe().exists() {
         "managed_stopped"
     } else {
         "missing"
     };
-
-    let mut prowlarr_has_indexers = false;
-    if prowlarr_ping && !cfg.prowlarr_api_key.is_empty() {
-        let client = crate::prowlarr::ProwlarrClient {
-            http: &state.http,
-            base: cfg.prowlarr_url.clone(),
-            api_key: cfg.prowlarr_api_key.clone(),
-        };
-        prowlarr_has_indexers = client.indexers().await.map(|v| !v.is_empty()).unwrap_or(false);
-    }
 
     let agent = if cfg.agent_enabled {
         let ok = crate::llm::LlmClient::new(&cfg.agent_base_url, &cfg.agent_model)

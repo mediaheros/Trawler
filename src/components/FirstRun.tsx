@@ -22,6 +22,7 @@ export default function FirstRun({ onDone }: { onDone: () => void }) {
   const [progress, setProgress] = useState<number | null>(null);
   const [logLine, setLogLine] = useState<string | null>(null);
   const [addedIndexers, setAddedIndexers] = useState<string[] | null>(null);
+  const [keyDraft, setKeyDraft] = useState("");
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const poll = useCallback(async () => {
@@ -125,6 +126,7 @@ export default function FirstRun({ onDone }: { onDone: () => void }) {
               status === null ? "Checking…"
               : status.prowlarr === "ok"
                 ? status.prowlarrHasIndexers ? "Running, connected, indexers ready" : "Running and connected — no indexers yet"
+              : status.prowlarr === "needs_key" ? "Running, but Trawler can't log in — paste its API key below"
               : status.prowlarr === "managed_stopped" ? "Installed by Trawler, currently stopped"
               : "Not installed"
             }
@@ -141,8 +143,47 @@ export default function FirstRun({ onDone }: { onDone: () => void }) {
                 <Play size={13} /> Start Prowlarr
               </Button>
             )}
+            {status?.prowlarr === "needs_key" && (
+              <div className="flex w-full flex-wrap items-center gap-2">
+                <input
+                  value={keyDraft}
+                  onChange={(e) => setKeyDraft(e.target.value)}
+                  placeholder="Prowlarr API key"
+                  spellCheck={false}
+                  className="min-w-[220px] flex-1 rounded-(--radius-btn) border border-line2 bg-bg0/60 px-2.5 py-1.5 font-mono text-[11.5px] text-ink outline-none placeholder:text-faint focus:border-accent/50"
+                />
+                <Button
+                  variant="primary"
+                  busy={busy === "prowlarr-key"}
+                  disabled={!keyDraft.trim()}
+                  onClick={() => run("prowlarr-key", () => api.setupSaveProwlarrKey(keyDraft), "Connected to Prowlarr")}
+                  className="text-[12px]"
+                >
+                  Connect
+                </Button>
+                <span className="w-full text-[10.5px] text-faint">
+                  Prowlarr → Settings → General → Security → API Key
+                </span>
+              </div>
+            )}
             {status?.prowlarr === "ok" && !status.prowlarrHasIndexers && (
-              <Button variant="primary" busy={busy === "indexers"} onClick={() => run("indexers", async () => setAddedIndexers(await api.setupStarterIndexers()))} className="text-[12px]">
+              <Button
+                variant="primary"
+                busy={busy === "indexers"}
+                onClick={() =>
+                  run("indexers", async () => {
+                    const names = await api.setupStarterIndexers();
+                    setAddedIndexers(names);
+                    toast(
+                      names.length > 0
+                        ? `Added ${names.length} indexer${names.length === 1 ? "" : "s"}`
+                        : "Nothing new to add — Prowlarr already has these",
+                      "ok",
+                    );
+                  })
+                }
+                className="text-[12px]"
+              >
                 <Plus size={13} /> Add starter indexers
               </Button>
             )}

@@ -9,5 +9,8 @@
 /og.png
   Cache-Control: public, max-age=604800
 
-# NOTE: /dl/latest.json is a _redirects rule (processed before headers);
-# nothing else lives under /dl any more — installers come from GitHub releases
+/dl/latest.json
+  Cache-Control: no-cache
+
+/dl/Trawler_*
+  Cache-Control: public, max-age=31536000, immutable

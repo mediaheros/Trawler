@@ -97,7 +97,7 @@ export interface ShowPreview {
 
 export interface SetupStatus {
   qbit: "ok" | "running_no_webui" | "installed_stopped" | "missing";
-  prowlarr: "ok" | "managed_stopped" | "missing";
+  prowlarr: "ok" | "needs_key" | "managed_stopped" | "missing";
   agent: "ok" | "unreachable";
   prowlarrHasIndexers: boolean;
 }
@@ -447,6 +447,7 @@ export const api = {
   setupInstallQbit: () => call<void>("setup_install_qbit"),
   setupConfigureQbit: () => call<void>("setup_configure_qbit"),
   setupStarterIndexers: () => call<string[]>("setup_starter_indexers"),
+  setupSaveProwlarrKey: (key: string) => call<void>("setup_save_prowlarr_key", { key }),
   setupFinish: () => call<void>("setup_finish"),
   calendarRange: (start: string, end: string) =>
     call<CalendarItem[]>("calendar_range", { start, end }),
@@ -900,6 +901,8 @@ async function mock(cmd: string, args?: Record<string, unknown>): Promise<unknow
     case "setup_configure_qbit":
       await sleep(900);
       mockSetup.qbit = "ok";
+      return;
+    case "setup_save_prowlarr_key":
       return;
     case "setup_starter_indexers":
       await sleep(1500);

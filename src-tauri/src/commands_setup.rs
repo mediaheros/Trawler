@@ -49,18 +49,68 @@ pub async fn setup_configure_qbit() -> Result<()> {
 }
 
 /// Add a starter set of reliable public indexers (verified in Prowlarr's catalog).
+/// One catalog fetch for all of them; if NOTHING can be added the real error
+/// surfaces instead of a silent empty success.
 #[tauri::command]
 pub async fn setup_starter_indexers(state: State<'_, AppState>) -> Result<Vec<String>> {
     const STARTERS: [&str; 6] =
         ["YTS", "The Pirate Bay", "LimeTorrents", "Knaben", "ExtraTorrent.st", "TorrentsCSV"];
+
+    let cfg = state.config.read().await.clone();
+    if cfg.prowlarr_api_key.is_empty() {
+        return Err(AppError::Other(
+            "Trawler has no Prowlarr API key yet — paste it on the Prowlarr card first".into(),
+        ));
+    }
+    let client = crate::prowlarr::ProwlarrClient {
+        http: &state.http,
+        base: cfg.prowlarr_url.clone(),
+        api_key: cfg.prowlarr_api_key.clone(),
+    };
+    // the catalog is ~2 MB — fetch it once, not once per indexer
+    let defs = client.schema().await?;
+
     let mut added = vec![];
+    let mut last_err: Option<AppError> = None;
     for name in STARTERS {
-        match crate::commands::add_indexer(state.clone(), name.to_string()).await {
-            Ok(n) => added.push(n),
-            Err(_) => continue, // already present or currently unreachable — fine
+        let Some(def) = defs
+            .iter()
+            .find(|d| d.get("name").and_then(|v| v.as_str()) == Some(name))
+        else {
+            continue; // renamed/removed from Prowlarr's catalog — skip quietly
+        };
+        let mut def = def.clone();
+        def["enable"] = serde_json::Value::Bool(true);
+        def["appProfileId"] = serde_json::Value::from(1);
+        match client.add_indexer_raw(&def).await {
+            Ok(ok) => added.push(
+                ok.get("name").and_then(|v| v.as_str()).unwrap_or(name).to_string(),
+            ),
+            // an individual failure is fine (already present, site down) —
+            // but remember it in case they ALL fail
+            Err(e) => last_err = Some(e),
+        }
+    }
+    if added.is_empty() {
+        if let Some(e) = last_err {
+            return Err(AppError::Other(format!("no indexers could be added: {e}")));
         }
     }
     Ok(added)
+}
+
+/// Save the Prowlarr API key from the wizard (for people who already run
+/// their own Prowlarr rather than a Trawler-managed one).
+#[tauri::command]
+pub async fn setup_save_prowlarr_key(state: State<'_, AppState>, key: String) -> Result<()> {
+    let key = key.trim().to_string();
+    if key.is_empty() {
+        return Err(AppError::Other("that key is empty".into()));
+    }
+    let mut cfg = state.config.write().await;
+    cfg.prowlarr_api_key = key;
+    crate::config::save(&cfg)?;
+    Ok(())
 }
 
 #[tauri::command]

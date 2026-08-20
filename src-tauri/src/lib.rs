@@ -183,6 +183,7 @@ pub fn run() {
             commands_setup::setup_install_qbit,
             commands_setup::setup_configure_qbit,
             commands_setup::setup_starter_indexers,
+            commands_setup::setup_save_prowlarr_key,
             commands_setup::setup_finish,
             commands_setup::rss_sweep_now,
             commands_discover::calendar_range,
