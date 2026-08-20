@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState } from "react";
-import { Check, Loader2, Plus, RefreshCw, Tv } from "lucide-react";
-import { api, type DiscoverEntry, type DiscoverRows } from "../lib/api";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Check, Loader2, Plus, RefreshCw, Tv, Search as SearchIcon, X } from "lucide-react";
+import { api, type DiscoverEntry, type DiscoverRows, type TvmazeResult } from "../lib/api";
 import { useStore } from "../store";
 import { Button, cx } from "./ui";
 import ShowPreview from "./ShowPreview";
@@ -10,6 +10,33 @@ export default function DiscoverView() {
   const [error, setError] = useState<string | null>(null);
   const [previewId, setPreviewId] = useState<number | null>(null);
   const closePreview = useCallback(() => setPreviewId(null), []);
+  // search beyond the featured panes: any show TVmaze knows, not just
+  // what happens to be airing this week
+  const [query, setQuery] = useState("");
+  const [found, setFound] = useState<TvmazeResult[] | "loading" | null>(null);
+  const searchSeq = useRef(0);
+
+  useEffect(() => {
+    const q = query.trim();
+    if (!q) {
+      searchSeq.current++;
+      setFound(null);
+      return;
+    }
+    const mine = ++searchSeq.current;
+    setFound("loading");
+    const t = setTimeout(() => {
+      api
+        .searchTvmaze(q)
+        .then((r) => {
+          if (mine === searchSeq.current) setFound(r);
+        })
+        .catch(() => {
+          if (mine === searchSeq.current) setFound([]);
+        });
+    }, 350);
+    return () => clearTimeout(t);
+  }, [query]);
 
   const load = useCallback((force = false) => {
     setError(null);
@@ -56,15 +83,111 @@ export default function DiscoverView() {
 
   return (
     <div className="min-h-0 flex-1 space-y-7 overflow-y-auto px-6 pb-6">
-      <Row title="Airing tonight" sub="what the world is watching today" entries={rows.tonight} showTime onPreview={setPreviewId} />
-      <Row title="New & returning" sub="premieres in the next seven days" entries={rows.premieres} onPreview={setPreviewId} />
-      <Row title="Popular this week" sub="the biggest shows airing right now" entries={rows.popular} onPreview={setPreviewId} />
-      <p className="pb-2 text-center text-[10.5px] text-faint">
-        Schedule and artwork from TVmaze · refreshed every few hours
-      </p>
+      <DiscoverSearch query={query} setQuery={setQuery} />
+      {found !== null ? (
+        <SearchResults found={found} query={query} onPreview={setPreviewId} />
+      ) : (
+        <>
+          <Row title="Airing tonight" sub="what the world is watching today" entries={rows.tonight} showTime onPreview={setPreviewId} />
+          <Row title="New & returning" sub="premieres in the next seven days" entries={rows.premieres} onPreview={setPreviewId} />
+          <Row title="Popular this week" sub="the biggest shows airing right now" entries={rows.popular} onPreview={setPreviewId} />
+          <p className="pb-2 text-center text-[10.5px] text-faint">
+            Schedule and artwork from TVmaze · refreshed every few hours
+          </p>
+        </>
+      )}
       {previewId !== null && (
         <ShowPreview tvmazeId={previewId} onClose={closePreview} />
       )}
+    </div>
+  );
+}
+
+function DiscoverSearch({ query, setQuery }: { query: string; setQuery: (q: string) => void }) {
+  return (
+    <div className="relative max-w-[420px]">
+      <SearchIcon size={14} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-faint" />
+      <input
+        value={query}
+        onChange={(e) => setQuery(e.target.value)}
+        placeholder="Find any show — airing or not…"
+        className="w-full rounded-xl border border-line2 bg-bg1 py-2 pl-9 pr-8 text-[12.5px] text-ink placeholder:text-faint transition-colors focus:border-accent/50"
+        spellCheck={false}
+      />
+      {query && (
+        <button
+          type="button"
+          onClick={() => setQuery("")}
+          className="absolute right-2 top-1/2 -translate-y-1/2 cursor-pointer rounded p-0.5 text-faint hover:text-ink"
+          title="Back to featured"
+        >
+          <X size={13} />
+        </button>
+      )}
+    </div>
+  );
+}
+
+function SearchResults({
+  found,
+  query,
+  onPreview,
+}: {
+  found: TvmazeResult[] | "loading";
+  query: string;
+  onPreview: (id: number) => void;
+}) {
+  if (found === "loading") {
+    return (
+      <div className="flex flex-wrap gap-3">
+        {Array.from({ length: 6 }).map((_, i) => (
+          <div key={i} className="skeleton aspect-[2/3] w-[132px] rounded-xl" />
+        ))}
+      </div>
+    );
+  }
+  if (found.length === 0) {
+    return (
+      <div className="py-8 text-center text-[12px] text-faint">
+        TVmaze doesn't know a show called "{query.trim()}" — try another spelling.
+      </div>
+    );
+  }
+  return (
+    <div>
+      <div className="mb-3 text-[11.5px] text-faint">
+        {found.length} show{found.length === 1 ? "" : "s"} · click one to preview and follow
+      </div>
+      <div className="flex flex-wrap gap-3">
+        {found.map((r) => (
+          <button
+            key={r.id}
+            type="button"
+            onClick={() => onPreview(r.id)}
+            className="group w-[132px] cursor-pointer text-left"
+          >
+            <div className="relative aspect-[2/3] overflow-hidden rounded-xl border border-line bg-bg2 transition-all group-hover:border-accent/50 group-hover:shadow-[0_8px_30px_-10px_rgba(0,0,0,0.8)]">
+              {r.poster ? (
+                <img src={r.poster} alt="" loading="lazy" className="h-full w-full object-cover" />
+              ) : (
+                <div className="flex h-full items-center justify-center px-2 text-center text-[11px] text-faint">
+                  {r.name}
+                </div>
+              )}
+              {r.followed && (
+                <span className="absolute right-1.5 top-1.5 rounded-md bg-bg0/80 px-1.5 py-0.5 text-[9.5px] font-semibold text-accent backdrop-blur">
+                  Following
+                </span>
+              )}
+            </div>
+            <div className="mt-1.5 truncate text-[11.5px] font-medium text-ink">{r.name}</div>
+            <div className="truncate text-[10.5px] text-faint">
+              {r.premiered ? r.premiered.slice(0, 4) : ""}
+              {r.network ? ` · ${r.network}` : ""}
+            </div>
+          </button>
+        ))}
+      </div>
     </div>
   );
 }
