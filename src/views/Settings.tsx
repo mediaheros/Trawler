@@ -19,6 +19,7 @@ import {
 import { api, inTauri, type Config, type NotifyTestOutcome, type QualityProfile } from "../lib/api";
 import { sameProfile } from "../lib/format";
 import { checkForUpdate, currentVersion } from "../lib/updater";
+import { isMac } from "../lib/platform";
 import { useStore } from "../store";
 import { Button, Chip, Field, NumInput, TextInput, cx } from "../components/ui";
 import IndexerManager from "../components/IndexerManager";
@@ -104,7 +105,10 @@ export default function SettingsView() {
       <div className="px-6 pt-5 pb-3">
         <h1 className="text-[16px] font-semibold tracking-tight">Settings</h1>
         <p className="mt-0.5 text-[12px] text-faint">
-          Stored locally in <span className="font-mono text-[11px]">%APPDATA%\trawler\config.json</span>
+          Stored locally in{" "}
+          <span className="font-mono text-[11px]">
+            {isMac ? "~/Library/Application Support/trawler/config.json" : "%APPDATA%\\trawler\\config.json"}
+          </span>
         </p>
       </div>
 
@@ -189,10 +193,10 @@ export default function SettingsView() {
               </label>
             </div>
             <Field label="Movies save path" hint="Blank = qBittorrent default">
-              <TextInput mono value={draft.savePathMovies} onChange={(v) => set({ savePathMovies: v })} placeholder="D:\Media\Movies" />
+              <TextInput mono value={draft.savePathMovies} onChange={(v) => set({ savePathMovies: v })} placeholder={isMac ? "/Volumes/Media/Movies" : "D:\\Media\\Movies"} />
             </Field>
             <Field label="TV save path" hint="Blank = qBittorrent default">
-              <TextInput mono value={draft.savePathTv} onChange={(v) => set({ savePathTv: v })} placeholder="D:\Media\TV" />
+              <TextInput mono value={draft.savePathTv} onChange={(v) => set({ savePathTv: v })} placeholder={isMac ? "/Volumes/Media/TV" : "D:\\Media\\TV"} />
             </Field>
             <Field
               label="Seeding after download"
@@ -377,7 +381,7 @@ export default function SettingsView() {
         )}
 
         {tab === "notifications" && (<>
-        <Card title="Windows" sub="Native toasts from the app itself">
+        <Card title={isMac ? "macOS" : "Windows"} sub="Native notifications from the app itself">
           <label className="flex cursor-pointer items-center gap-2 text-[12.5px] text-dim">
             <input
               type="checkbox"
@@ -385,7 +389,7 @@ export default function SettingsView() {
               onChange={(e) => set({ notifyOnGrab: e.target.checked })}
               className="size-3.5 accent-(--color-accent)"
             />
-            Windows notification when something is grabbed
+            System notification when something is grabbed
           </label>
         </Card>
 
@@ -672,7 +676,7 @@ function AutostartToggle() {
     try {
       await api.setAutostart(want);
       setEnabled(want);
-      toast(want ? "Trawler will start with Windows" : "Autostart disabled", "ok");
+      toast(want ? (isMac ? "Trawler will start at login" : "Trawler will start with Windows") : "Autostart disabled", "ok");
     } catch (e) {
       toast(String(e), "bad");
     }
@@ -693,7 +697,7 @@ function AutostartToggle() {
         onChange={(e) => flip(e.target.checked)}
         className="size-3.5 accent-(--color-accent)"
       />
-      Start with Windows
+      {isMac ? "Start at login" : "Start with Windows"}
     </label>
   );
 }
