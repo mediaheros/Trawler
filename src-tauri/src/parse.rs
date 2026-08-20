@@ -113,6 +113,9 @@ pub fn parse(title: &str) -> ParsedRelease {
     // Season / episode. Try SxxEyy first, then NxM, then bare season markers.
     let bytes = u.as_bytes();
     let mut i = 0;
+    // where the matched season marker ends — everything after it is release
+    // tags, where supplemental markers (EXTRAS, …) actually mean something
+    let mut marker_end: Option<usize> = None;
     while i < bytes.len() {
         // 'S' must start a word — otherwise "DTS5.1" reads as season 5
         let word_start = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
@@ -129,6 +132,7 @@ pub fn parse(title: &str) -> ParsedRelease {
             let season: i32 = u[i + 1..j].parse().unwrap_or(-1);
             if season >= 0 && p.season.is_none() {
                 p.season = Some(season);
+                marker_end.get_or_insert(j);
                 // allow one separator between season and episode: S01E05,
                 // S01.E05 (dot became space), S01 E05, S01xE05, S01-E05
                 let mut e = j;
@@ -140,12 +144,22 @@ pub fn parse(title: &str) -> ParsedRelease {
                     e += 1;
                 }
                 if e < bytes.len() && bytes[e] == b'E' {
-                    let mut k = e + 1;
-                    while k < bytes.len() && bytes[k].is_ascii_digit() && k - e <= 3 {
+                    // "EP05" anime marker: an optional P sits between E and
+                    // the digits — only when a digit actually follows
+                    let digits_start = if e + 2 < bytes.len()
+                        && bytes[e + 1] == b'P'
+                        && bytes[e + 2].is_ascii_digit()
+                    {
+                        e + 2
+                    } else {
+                        e + 1
+                    };
+                    let mut k = digits_start;
+                    while k < bytes.len() && bytes[k].is_ascii_digit() && k - digits_start <= 3 {
                         k += 1;
                     }
-                    if k > e + 1 {
-                        p.episode = u[e + 1..k].parse().ok();
+                    if k > digits_start {
+                        p.episode = u[digits_start..k].parse().ok();
                     }
                 }
             }
@@ -153,22 +167,38 @@ pub fn parse(title: &str) -> ParsedRelease {
         i += 1;
     }
     if p.season.is_none() {
-        // "3x07" pattern
+        // "3x07" / "26x04" pattern — long-runners use multi-digit seasons.
+        // The season cap and the right-hand boundary keep "1920x1080"
+        // resolution strings from parsing as season 1920.
         let chars: Vec<char> = u.chars().collect();
-        for w in 0..chars.len().saturating_sub(3) {
-            if chars[w].is_ascii_digit()
-                && chars[w + 1] == 'X'
-                && chars[w + 2].is_ascii_digit()
-                && (w == 0 || !chars[w - 1].is_ascii_alphanumeric())
+        for w in 0..chars.len() {
+            if !chars[w].is_ascii_digit() || !(w == 0 || !chars[w - 1].is_ascii_alphanumeric()) {
+                continue;
+            }
+            let mut s_end = w;
+            while s_end < chars.len() && chars[s_end].is_ascii_digit() {
+                s_end += 1;
+            }
+            if s_end >= chars.len()
+                || chars[s_end] != 'X'
+                || s_end + 1 >= chars.len()
+                || !chars[s_end + 1].is_ascii_digit()
             {
-                p.season = chars[w].to_digit(10).map(|d| d as i32);
-                let mut ep = String::new();
-                let mut k = w + 2;
-                while k < chars.len() && chars[k].is_ascii_digit() {
-                    ep.push(chars[k]);
-                    k += 1;
-                }
-                p.episode = ep.parse().ok();
+                continue;
+            }
+            let season: i32 = chars[w..s_end].iter().collect::<String>().parse().unwrap_or(-1);
+            let mut k = s_end + 1;
+            while k < chars.len() && chars[k].is_ascii_digit() {
+                k += 1;
+            }
+            let right_boundary = k >= chars.len() || !chars[k].is_ascii_alphanumeric();
+            if season > 0 && season < 100 && right_boundary {
+                p.season = Some(season);
+                p.episode = chars[s_end + 1..k].iter().collect::<String>().parse().ok();
+                // k is a char index — convert to the byte offset the tail
+                // slice needs, or a multibyte prefix panics mid-character
+                let byte_end: usize = chars[..k].iter().map(|c| c.len_utf8()).sum();
+                marker_end.get_or_insert(byte_end);
                 break;
             }
         }
@@ -177,13 +207,23 @@ pub fn parse(title: &str) -> ParsedRelease {
     // used to be enough — which turned single episodes with unusual episode
     // markers into "packs" that stamped whole seasons as grabbed. Bare-season
     // titles ("Show S02 1080p WEB") only count when quality tags corroborate
-    // that this is a real release listing.
-    p.season_pack = u.contains("COMPLETE")
-        || u.contains("SEASON PACK")
-        || u.contains("FULL SEASON")
-        || (p.season.is_some()
-            && p.episode.is_none()
-            && (p.resolution.is_some() || p.source.is_some()));
+    // that this is a real release listing — and supplemental releases
+    // (extras, specials) are never packs, whatever tags they carry. The
+    // supplemental check scans only the tags AFTER the season marker: a show
+    // named "Special Ops" must not lose its packs to its own name.
+    let supplemental = {
+        let tail = &u[marker_end.unwrap_or(0)..];
+        tail.split(|c: char| !c.is_ascii_alphanumeric()).any(|tok| {
+            matches!(tok, "EXTRAS" | "SPECIAL" | "SPECIALS" | "OMAKE" | "BONUS")
+        })
+    };
+    p.season_pack = !supplemental
+        && (u.contains("COMPLETE")
+            || u.contains("SEASON PACK")
+            || u.contains("FULL SEASON")
+            || (p.season.is_some()
+                && p.episode.is_none()
+                && (p.resolution.is_some() || p.source.is_some())));
 
     // Year: standalone 19xx/20xx
     let chars: Vec<char> = norm.chars().collect();
@@ -349,5 +389,76 @@ mod tests {
         let b = parse("[Erai-raws] Frieren - 12 [1080p][Multiple Subtitle]");
         assert_eq!(a.clean_title, "Frieren - 12");
         assert_eq!(a.clean_title, b.clean_title);
+    }
+
+    // ---- shakedown regression tests ----
+
+    #[test]
+    fn ep_prefixed_episodes_parse_as_episodes_not_packs() {
+        let p = parse("Show.S01EP05.1080p.WEB-DL.x264-GRP");
+        assert_eq!((p.season, p.episode), (Some(1), Some(5)), "EP05 is episode 5");
+        assert!(!p.season_pack, "a single episode must never classify as a season pack");
+    }
+
+    #[test]
+    fn unpadded_single_digit_episodes_still_parse() {
+        let p = parse("Show.S01E5.720p.WEB-DL.x264-GRP");
+        assert_eq!((p.season, p.episode), (Some(1), Some(5)));
+        assert!(!p.season_pack);
+    }
+
+    #[test]
+    fn supplemental_releases_are_not_season_packs() {
+        for title in [
+            "Show.S01-EXTRAS.1080p.WEB-DL.x264-GRP",
+            "Show.S02.SPECIAL.1080p.BluRay.x264-GRP",
+            "Show.S01.OMAKE.720p.WEB-DL.x264-GRP",
+        ] {
+            let p = parse(title);
+            assert!(p.episode.is_none());
+            assert!(!p.season_pack, "{title} must not stamp a whole season as grabbed");
+        }
+    }
+
+    #[test]
+    fn show_names_do_not_suppress_their_own_packs() {
+        // the supplemental check must scan only tags after the season marker,
+        // never the show name
+        let a = parse("Special Ops Lioness S02 COMPLETE 1080p BluRay x265-RARBG");
+        assert!(a.season_pack, "the show's name must not cost it its packs");
+        let b = parse("Extras S01 COMPLETE DVDRip XviD-GROUP");
+        assert!(b.season_pack);
+    }
+
+    #[test]
+    fn multi_digit_nxm_seasons_parse() {
+        let p = parse("Show.26x04.720p.WEB-DL.x264-GRP");
+        assert_eq!((p.season, p.episode), (Some(26), Some(4)));
+        let p = parse("Show.10x05.1080p.WEB-DL.x264-GRP");
+        assert_eq!((p.season, p.episode), (Some(10), Some(5)));
+    }
+
+    #[test]
+    fn resolution_strings_do_not_parse_as_nxm_seasons() {
+        let p = parse("Movie.2023.1920x1080.Documentary-GROUP");
+        assert_eq!((p.season, p.episode), (None, None), "1920x1080 is a resolution, not S1920E1080");
+    }
+
+    #[test]
+    fn multibyte_titles_with_nxm_markers_do_not_panic() {
+        // char-index vs byte-offset confusion here has killed the app on
+        // Turkish titles before (panic = abort in release) — see file header
+        let p = parse("ıııııııııı 3x07 1080p");
+        assert_eq!((p.season, p.episode), (Some(3), Some(7)));
+        let p2 = parse("Kızılcık Şerbeti 4x12.HDTV");
+        assert_eq!((p2.season, p2.episode), (Some(4), Some(12)));
+    }
+
+    #[test]
+    fn genuine_packs_still_classify_as_packs() {
+        let a = parse("Show.S02.Complete.1080p.BluRay.x265-RARBG");
+        assert!(a.season_pack);
+        let b = parse("Show.S02.1080p.WEB-DL.x264-GRP");
+        assert!(b.season_pack, "bare season with quality corroboration is a pack");
     }
 }

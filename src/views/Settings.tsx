@@ -545,16 +545,15 @@ export default function SettingsView() {
       {/* pinned action bar */}
       <div className="border-t border-line bg-bg1/60 px-6 py-3">
         <div className="flex max-w-[680px] items-center gap-2.5">
-          {tab === "indexers" || tab === "logs" ? (
-            <span className="text-[11.5px] text-faint">
-              {tab === "indexers"
-                ? "Indexer changes talk to Prowlarr directly and apply instantly — nothing to save here."
-                : "The console is read-only — nothing to save."}
-            </span>
-          ) : (
           <Button variant="primary" disabled={!dirty} onClick={() => saveConfig(draft)}>
             Save changes
           </Button>
+          {(tab === "indexers" || tab === "logs") && (
+            <span className="text-[11.5px] text-faint">
+              {tab === "indexers"
+                ? "Indexer changes talk to Prowlarr directly and apply instantly."
+                : "The console is read-only."}
+            </span>
           )}
           {tab === "connections" && (
             <Button onClick={runTest} busy={testing}>

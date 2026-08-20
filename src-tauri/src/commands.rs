@@ -373,6 +373,17 @@ pub async fn perform_search(
             "all indexers failed — is Prowlarr healthy?".into(),
         ));
     }
+    // All attempted indexers timed out with nothing to show → an indexer
+    // health problem, not "no results" — surfacing it as an empty success
+    // sends the user hunting for a query that was never the problem.
+    if !indexer_outcomes.is_empty()
+        && raw.is_empty()
+        && indexer_outcomes.iter().all(|o| o.timed_out)
+    {
+        return Err(AppError::Other(
+            "every indexer timed out — check their health in Settings → Indexers".into(),
+        ));
+    }
 
     let total = raw.len();
 
@@ -478,44 +489,54 @@ pub async fn grab(
     size: Option<i64>,
     ep_ids: Option<Vec<i64>>,
 ) -> Result<GrabResult> {
-    let cfg = state.config.read().await.clone();
-    let save_path = match kind.as_str() {
-        "movie" => cfg.save_path_movies.clone(),
-        "tv" => cfg.save_path_tv.clone(),
-        _ => String::new(),
+    let save_path = {
+        let cfg = state.config.read().await.clone();
+        let save_path = match kind.as_str() {
+            "movie" => cfg.save_path_movies.clone(),
+            "tv" => cfg.save_path_tv.clone(),
+            _ => String::new(),
+        };
+        if save_path.is_empty() { None } else { Some(save_path) }
     };
-    let save_path = if save_path.is_empty() { None } else { Some(save_path) };
-    let result = perform_grab(state.inner(), &title, magnet_url, download_url, save_path).await?;
-    // manual grabs join the ledger too: they count as "already have" for the
-    // scout and the scheduler, and they survive unfollow/refollow like any
-    // other grab instead of living on a fragile title string
-    {
-        let conn = state.db.lock().await;
-        let ck = crate::briefs::content_key(&title);
-        crate::db::ledger_insert(
-            &conn,
-            &ck,
-            None,
-            &title,
-            info_hash.as_deref(),
-            size.unwrap_or(0),
-            &ep_ids.unwrap_or_default(),
-        );
-    }
-    Ok(result)
+    // Manual grabs go through the same claim-then-dispatch as every other
+    // path: the ledger row is written even if this caller goes away, and a
+    // linked episode is stamped grabbed server-side.
+    let outcome = crate::grab::dispatch(
+        state.inner(),
+        crate::grab::GrabOrder {
+            title: title.clone(),
+            magnet_url,
+            download_url,
+            save_path,
+            info_hash,
+            size: size.unwrap_or(0),
+        },
+        None,
+        ep_ids.unwrap_or_default(),
+    )
+    .await?;
+    let detail = match outcome {
+        crate::grab::GrabOutcome::Grabbed => format!("Sent to qBittorrent: {title}"),
+        crate::grab::GrabOutcome::AlreadyClaimed => {
+            "Already being grabbed right now — one moment".to_string()
+        }
+        crate::grab::GrabOutcome::AlreadyHad => {
+            "Already in your library — recorded earlier".to_string()
+        }
+    };
+    Ok(GrabResult { ok: true, detail })
 }
 
-/// Core grab, shared by the UI command and the follow scheduler.
-pub async fn perform_grab(
-    state: &AppState,
-    title: &str,
-    magnet_url: Option<String>,
-    download_url: Option<String>,
-    save_path: Option<String>,
-) -> Result<GrabResult> {
-    let cfg = state.config.read().await.clone();
-    let q = qbit(&state.http, &cfg);
-    let save_path = save_path.unwrap_or_default();
+/// The qBittorrent add itself, factored out so `grab::dispatch` can run it
+/// on a task that survives caller cancellation. No ledger writes here —
+/// recording belongs to the dispatcher, next to the add.
+pub async fn perform_grab_core(
+    http: &reqwest::Client,
+    cfg: &Config,
+    order: &crate::grab::GrabOrder,
+) -> Result<()> {
+    let q = qbit(http, cfg);
+    let save_path = order.save_path.clone().unwrap_or_default();
 
     if !cfg.qbit_category.is_empty() {
         // Best effort — a failure here shouldn't block the grab.
@@ -524,10 +545,10 @@ pub async fn perform_grab(
 
     // Prefer the magnet; otherwise pull the .torrent through Prowlarr so
     // passkey-bearing URLs never leave this machine's Prowlarr instance.
-    let (magnet, torrent_bytes) = match (&magnet_url, &download_url) {
+    let (magnet, torrent_bytes) = match (&order.magnet_url, &order.download_url) {
         (Some(m), _) if !m.is_empty() => (Some(m.clone()), None),
         (_, Some(d)) if !d.is_empty() => {
-            let client = prowlarr(&state.http, &cfg)?;
+            let client = prowlarr(http, cfg)?;
             let (bytes, maybe_magnet) = client.fetch_torrent(d).await?;
             match maybe_magnet {
                 Some(m) => (Some(m), None),
@@ -545,7 +566,7 @@ pub async fn perform_grab(
     q.add(AddTorrent {
         magnet,
         torrent_bytes,
-        torrent_name: title,
+        torrent_name: &order.title,
         save_path: if save_path.is_empty() { None } else { Some(save_path) },
         category: if cfg.qbit_category.is_empty() { None } else { Some(cfg.qbit_category.clone()) },
         paused: cfg.add_paused,
@@ -553,7 +574,7 @@ pub async fn perform_grab(
     })
     .await?;
 
-    Ok(GrabResult { ok: true, detail: format!("Sent to qBittorrent: {title}") })
+    Ok(())
 }
 
 // ---------- downloads ----------
@@ -733,6 +754,9 @@ pub async fn follow_show(
     backfill: bool,
     seasons: Option<Vec<i64>>,
 ) -> Result<crate::db::ShowRow> {
+    // an empty selection is a one-way trap once persisted ("[]" gates every
+    // episode to ignored and COALESCE can't clear it) — treat it as "all"
+    let seasons = seasons.filter(|s| !s.is_empty());
     crate::follows::follow(&state, tvmaze_id, backfill, seasons).await
 }
 

@@ -15,6 +15,9 @@ pub fn open() -> Result<Connection> {
         std::fs::create_dir_all(dir)?;
     }
     let conn = Connection::open(&path).map_err(db_err)?;
+    // background tasks open their own connections (see open_existing);
+    // WAL serializes writers — the timeout makes them wait, not error
+    conn.busy_timeout(std::time::Duration::from_secs(5)).map_err(db_err)?;
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
          PRAGMA foreign_keys = ON;
@@ -196,6 +199,22 @@ pub fn open() -> Result<Connection> {
         "ALTER TABLE shows ADD COLUMN alias_status TEXT",
         [],
     );
+    let _ = conn.execute(
+        "ALTER TABLE shows ADD COLUMN seasons_json TEXT",
+        [],
+    );
+    Ok(conn)
+}
+
+/// A second connection for short-lived background writes (grab recording).
+/// The app's main connection owns schema setup — this one must not migrate.
+pub fn open_existing() -> Result<Connection> {
+    let path = crate::config::config_path()
+        .parent()
+        .map(|d| d.join("trawler.db"))
+        .ok_or_else(|| AppError::Other("cannot resolve data dir".into()))?;
+    let conn = Connection::open(&path).map_err(db_err)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5)).map_err(db_err)?;
     Ok(conn)
 }
 
@@ -220,22 +239,45 @@ pub fn ledger_insert(
     info_hash: Option<&str>,
     size: i64,
     ep_ids: &[i64],
-) {
+) -> Result<()> {
     let eps_json = if ep_ids.is_empty() {
         None
     } else {
         serde_json::to_string(ep_ids).ok()
     };
-    let _ = conn.execute(
+    conn.execute(
         "INSERT INTO grab_ledger (content_key, brief_id, title, info_hash, size, state, ts, ep_ids)
          VALUES (?1, ?2, ?3, ?4, ?5, 'grabbed', ?6, ?7)",
         rusqlite::params![content_key, brief_id, title, info_hash, size, now(), eps_json],
-    );
+    )
+    .map(|_| ())
+    .map_err(db_err)
 }
 
 /// Parse a ledger row's ep_ids JSON into ids (empty when absent/invalid).
 pub fn parse_ep_ids(raw: Option<&str>) -> Vec<i64> {
     raw.and_then(|r| serde_json::from_str::<Vec<i64>>(r).ok()).unwrap_or_default()
+}
+
+/// Keep chat history bounded — every turn (and every tool result's JSON)
+/// is persisted, and nothing else ever prunes it. Reads cap at 400 rows;
+/// old ones are pure dead weight in the DB.
+pub fn prune_chat(conn: &Connection) {
+    let _ = conn.execute(
+        "DELETE FROM chat_messages WHERE id <= (
+           SELECT id FROM chat_messages ORDER BY id DESC LIMIT 1 OFFSET 2000
+         )",
+        [],
+    );
+}
+
+/// Dismissed proposal cards accumulate forever otherwise — the 7-day window
+/// matches the re-proposal cooldown they gate.
+pub fn prune_dismissed_proposals(conn: &Connection) {
+    let _ = conn.execute(
+        "DELETE FROM proposals WHERE status = 'dismissed' AND last_seen < ?1",
+        [now() - 7 * 86_400],
+    );
 }
 
 /// Flip a grab's linked episodes to a new state by id — the linkage that
@@ -374,14 +416,30 @@ pub fn proposal_upsert(
     reason: &str,
 ) -> bool {
     let n = now();
+    prune_dismissed_proposals(conn);
     let updated = conn
         .execute(
+            // include cards mid-approval ('grabbing', fresh): they must
+            // refresh in place, not fork a duplicate pending card
             "UPDATE proposals SET last_seen = ?1, reason = ?2, result_json = ?3
-             WHERE content_key = ?4 AND status = 'pending'",
-            rusqlite::params![n, reason, result_json, content_key],
+             WHERE content_key = ?4
+               AND (status = 'pending' OR (status = 'grabbing' AND last_seen > ?5))",
+            rusqlite::params![n, reason, result_json, content_key, n - 5 * 60],
         )
         .unwrap_or(0);
     if updated == 0 {
+        // a stale 'grabbing' row (crash mid-approval) must be revived in
+        // place, not forked into a second card for the same content
+        let revived = conn
+            .execute(
+                "UPDATE proposals SET status = 'pending', last_seen = ?1, reason = ?2, result_json = ?3
+                 WHERE content_key = ?4 AND status = 'grabbing'",
+                rusqlite::params![n, reason, result_json, content_key],
+            )
+            .unwrap_or(0);
+        if revived > 0 {
+            return true;
+        }
         // a recently dismissed card must not resurrect on every sweep
         let recently_dismissed = conn
             .query_row(
@@ -408,25 +466,37 @@ pub fn proposal_upsert(
 }
 
 /// Throttle bookkeeping so unfindable episodes don't hammer indexers.
+/// One transaction — a crash mid-batch must not half-stamp a season.
 pub fn stamp_searched(conn: &Connection, ep_ids: &[i64]) {
     let ts = now();
+    let tx = match conn.unchecked_transaction() {
+        Ok(t) => t,
+        Err(_) => return,
+    };
     for id in ep_ids {
-        let _ = conn.execute(
+        let _ = tx.execute(
             "UPDATE episodes SET last_searched_at = ?1 WHERE tvmaze_ep_id = ?2",
             rusqlite::params![ts, id],
         );
     }
+    let _ = tx.commit();
 }
 
-pub fn mark_grabbed(conn: &Connection, ep_ids: &[i64], release_title: &str) {
+/// Stamp episodes a grab satisfied. Guarded on state = 'wanted' so a stale
+/// manual grab can't flip an episode the user has since marked downloaded
+/// or ignored back to grabbed — never fight the user.
+pub fn mark_grabbed(conn: &Connection, ep_ids: &[i64], release_title: &str) -> Result<()> {
     let ts = now();
+    let tx = conn.unchecked_transaction().map_err(db_err)?;
     for id in ep_ids {
-        let _ = conn.execute(
+        tx.execute(
             "UPDATE episodes SET state = 'grabbed', grabbed_title = ?1, grabbed_at = ?2
-             WHERE tvmaze_ep_id = ?3",
+             WHERE tvmaze_ep_id = ?3 AND state = 'wanted'",
             rusqlite::params![release_title, ts, id],
-        );
+        )
+        .map_err(db_err)?;
     }
+    tx.commit().map_err(db_err)
 }
 
 // ---------- app meta (tiny K/V: last scout pass, migration flags) ----------

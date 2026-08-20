@@ -355,8 +355,19 @@ export function TextInput({
 export function ToastStack() {
   const toasts = useStore((s) => s.toasts);
   const dismiss = useStore((s) => s.dismissToast);
+  // the update card sits at the same corner — stack toasts above it instead
+  // of covering its buttons. Mirror the banner's own visibility rule so a
+  // dismissed card doesn't leave toasts floating over empty space.
+  const updatePending = useStore(
+    (s) => s.pendingUpdate !== null && s.updateDismissedVersion !== s.pendingUpdate.version,
+  );
   return (
-    <div className="pointer-events-none fixed bottom-4 right-4 z-50 flex w-[340px] flex-col gap-2">
+    <div
+      className={cx(
+        "pointer-events-none fixed right-4 z-50 flex w-[340px] flex-col gap-2 transition-[bottom] duration-300",
+        updatePending ? "bottom-[10rem]" : "bottom-4",
+      )}
+    >
       {toasts.map((t) => (
         <button
           type="button"

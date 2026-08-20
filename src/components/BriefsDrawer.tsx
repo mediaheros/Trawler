@@ -15,7 +15,10 @@ import { useStore } from "../store";
 import { Button, Chip, CloseBtn, Field, NumInput, TextInput, cx } from "./ui";
 
 export default function BriefsDrawer({ onClose }: { onClose: () => void }) {
-  const { briefs, loadBriefs, toast } = useStore();
+  // per-field selectors: whole-store subscription re-renders on every toast
+  const briefs = useStore((s) => s.briefs);
+  const loadBriefs = useStore((s) => s.loadBriefs);
+  const toast = useStore((s) => s.toast);
   const [editing, setEditing] = useState<BriefRow | "new" | null>(null);
   const [running, setRunning] = useState<number | null>(null);
 

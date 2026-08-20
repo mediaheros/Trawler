@@ -24,12 +24,18 @@ pub struct ChatRow {
     pub tool_payload: Option<String>,
 }
 
+/// newest 400, then back into chronological order — the transcript maps in
+/// array order and appends new turns at the end (the DESC-only version used
+/// to render history newest-first against the real backend; the mock hid it)
+const CHAT_HISTORY_SQL: &str = "SELECT * FROM (
+   SELECT id, ts, role, content, tool_name, tool_payload
+   FROM chat_messages ORDER BY id DESC LIMIT 400
+ ) ORDER BY id ASC";
+
 #[tauri::command]
 pub async fn agent_history(state: State<'_, AppState>) -> Result<Vec<ChatRow>> {
     let conn = state.db.lock().await;
-    let mut stmt = conn
-        .prepare("SELECT id, ts, role, content, tool_name, tool_payload FROM chat_messages ORDER BY id DESC LIMIT 400")
-        .map_err(db::db_err)?;
+    let mut stmt = conn.prepare(CHAT_HISTORY_SQL).map_err(db::db_err)?;
     let rows = stmt
         .query_map([], |r| {
             Ok(ChatRow {
@@ -54,6 +60,34 @@ pub async fn agent_clear(state: State<'_, AppState>) -> Result<()> {
     Ok(())
 }
 
+/// Persist the user message and load recent conversational context. Split
+/// out of agent_send so every pre-spawn failure can reset agent_chat_busy —
+/// the spawned task owns the final reset, and a leak before it exists would
+/// disable chat until restart.
+async fn persist_and_history(state: &AppState, text: &str) -> Result<Vec<(String, String)>> {
+    let conn = state.db.lock().await;
+    conn.execute(
+        "INSERT INTO chat_messages (ts, role, content) VALUES (?1, 'user', ?2)",
+        rusqlite::params![db::now(), text],
+    )
+    .map_err(db::db_err)?;
+    db::prune_chat(&conn);
+    let mut stmt = conn
+        .prepare(
+            "SELECT role, content FROM chat_messages
+             WHERE role IN ('user','assistant') AND content IS NOT NULL
+             ORDER BY id DESC LIMIT 16",
+        )
+        .map_err(db::db_err)?;
+    let mut rows: Vec<(String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(db::db_err)?
+        .flatten()
+        .collect();
+    rows.reverse();
+    Ok(rows)
+}
+
 /// Send a chat message. Returns immediately; progress streams via agent-step events.
 #[tauri::command]
 pub async fn agent_send(app: tauri::AppHandle, state: State<'_, AppState>, text: String) -> Result<String> {
@@ -72,28 +106,15 @@ pub async fn agent_send(app: tauri::AppHandle, state: State<'_, AppState>, text:
         return Err(AppError::Other("empty message".into()));
     }
 
-    // persist the user message + build recent conversational context
-    let history: Vec<(String, String)> = {
-        let conn = state.db.lock().await;
-        conn.execute(
-            "INSERT INTO chat_messages (ts, role, content) VALUES (?1, 'user', ?2)",
-            rusqlite::params![db::now(), text],
-        )
-        .map_err(db::db_err)?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT role, content FROM chat_messages
-                 WHERE role IN ('user','assistant') AND content IS NOT NULL
-                 ORDER BY id DESC LIMIT 16",
-            )
-            .map_err(db::db_err)?;
-        let mut rows: Vec<(String, String)> = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-            .map_err(db::db_err)?
-            .flatten()
-            .collect();
-        rows.reverse();
-        rows
+    // persist the user message + build recent conversational context; any
+    // failure here must hand the busy flag back — the reset below only runs
+    // once the spawned task exists
+    let history = match persist_and_history(state.inner(), &text).await {
+        Ok(h) => h,
+        Err(e) => {
+            state.agent_chat_busy.store(false, Ordering::SeqCst);
+            return Err(e);
+        }
     };
 
     let mut messages = vec![ChatMsg::system(crate::agent_run::chat_system_prompt())];
@@ -112,13 +133,15 @@ pub async fn agent_send(app: tauri::AppHandle, state: State<'_, AppState>, text:
         let state = tauri::Manager::state::<AppState>(&app2);
         let mut ctx = RunCtx::new(RunOrigin::Chat, None, true);
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(300),
+            // one slow LLM call may take the full 300s per-request timeout —
+            // give the run headroom beyond a single call
+            std::time::Duration::from_secs(360),
             crate::agent_run::run(&app2, &mut ctx, messages, &run_id, true),
         )
         .await;
         if let Err(_) | Ok(Err(_)) = &result {
             let msg = match result {
-                Err(_) => "the run exceeded its 5-minute deadline".to_string(),
+                Err(_) => "the run exceeded its 6-minute deadline".to_string(),
                 Ok(Err(e)) => e.to_string(),
                 _ => unreachable!(),
             };
@@ -253,13 +276,22 @@ pub async fn brief_run_now(app: tauri::AppHandle, state: State<'_, AppState>, id
     }
     tauri::async_runtime::spawn(async move {
         let state = tauri::Manager::state::<AppState>(&app);
+        // drop guard, same as the tick loop: a panic in run_brief must not
+        // wedge brief_tick_busy and silently stop every brief for the session
+        struct Busy<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for Busy<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _busy = Busy(&state.brief_tick_busy);
         let result = briefs::run_brief(&app, &brief).await;
-        state.brief_tick_busy.store(false, std::sync::atomic::Ordering::SeqCst);
         let conn = state.db.lock().await;
         match result {
             Ok(report) => {
                 let _ = conn.execute(
-                    "UPDATE briefs SET last_run_at = ?1, last_report = ?2, fail_streak = 0 WHERE id = ?3",
+                    "UPDATE briefs SET last_run_at = ?1, last_report = ?2, fail_streak = 0,
+                       paused_reason = NULL WHERE id = ?3",
                     rusqlite::params![db::now(), report, brief.id],
                 );
             }
@@ -298,11 +330,16 @@ pub async fn proposals_list(state: State<'_, AppState>) -> Result<Vec<ProposalRo
         .prepare(
             "SELECT p.id, p.brief_id, b.name, p.content_key, p.result_json, p.reason, p.status, p.first_seen, p.last_seen
              FROM proposals p LEFT JOIN briefs b ON b.id = p.brief_id
-             WHERE p.status = 'pending' ORDER BY p.last_seen DESC LIMIT 50",
+             WHERE p.status = 'pending'
+                OR (p.status = 'grabbing' AND p.last_seen < ?1)
+             ORDER BY p.last_seen DESC LIMIT 50",
         )
         .map_err(db::db_err)?;
+    // an approval left mid-flight by a crash shows up as pending again after
+    // this grace period instead of vanishing from the inbox forever
+    let stale_grabbing_cutoff = db::now() - 5 * 60;
     let rows = stmt
-        .query_map([], |r| {
+        .query_map([stale_grabbing_cutoff], |r| {
             Ok(ProposalRow {
                 id: r.get(0)?,
                 brief_id: r.get(1)?,
@@ -310,7 +347,7 @@ pub async fn proposals_list(state: State<'_, AppState>) -> Result<Vec<ProposalRo
                 content_key: r.get(3)?,
                 result: serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or(Value::Null),
                 reason: r.get(5)?,
-                status: r.get(6)?,
+                status: if r.get::<_, String>(6)? == "grabbing" { "pending".into() } else { r.get(6)? },
                 first_seen: r.get(7)?,
                 last_seen: r.get(8)?,
             })
@@ -323,12 +360,13 @@ pub async fn proposals_list(state: State<'_, AppState>) -> Result<Vec<ProposalRo
 
 #[tauri::command]
 pub async fn proposal_resolve(state: State<'_, AppState>, id: i64, approve: bool) -> Result<String> {
-    let (content_key, result_json, brief_id) = {
+    let (result_json, brief_id) = {
         let conn = state.db.lock().await;
         conn.query_row(
-            "SELECT content_key, result_json, brief_id FROM proposals WHERE id = ?1 AND status = 'pending'",
-            [id],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<i64>>(2)?)),
+            "SELECT result_json, brief_id FROM proposals
+             WHERE id = ?1 AND (status = 'pending' OR (status = 'grabbing' AND last_seen < ?2))",
+            rusqlite::params![id, db::now() - 5 * 60],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?)),
         )
         .map_err(|_| AppError::Other("proposal not found or already resolved".into()))?
     };
@@ -336,9 +374,11 @@ pub async fn proposal_resolve(state: State<'_, AppState>, id: i64, approve: bool
     if !approve {
         let conn = state.db.lock().await;
         // refresh last_seen so the re-proposal cooldown counts from the
-        // dismissal, not from when the card was filed
+        // dismissal, not from when the card was filed; the pending-or-stale
+        // guard keeps a dismiss racing an approval from stomping its claim
         conn.execute(
-            "UPDATE proposals SET status = 'dismissed', last_seen = ?2 WHERE id = ?1",
+            "UPDATE proposals SET status = 'dismissed', last_seen = ?2
+             WHERE id = ?1 AND (status = 'pending' OR (status = 'grabbing' AND last_seen < ?2))",
             rusqlite::params![id, db::now()],
         )
         .map_err(db::db_err)?;
@@ -359,12 +399,102 @@ pub async fn proposal_resolve(state: State<'_, AppState>, id: i64, approve: bool
         .filter(|s| !s.is_empty())
         .map(String::from);
 
-    crate::commands::perform_grab(state.inner(), &title, magnet, download, save_path).await?;
+    // Claim the card before the slow grab: two rapid approvals must not both
+    // pass the pending check and double-add the torrent. While claimed the
+    // card leaves the inbox; a crash mid-flight resurfaces it after the
+    // 5-minute grace (see proposals_list).
+    let claimed = {
+        let conn = state.db.lock().await;
+        conn.execute(
+            "UPDATE proposals SET status = 'grabbing', last_seen = ?2
+             WHERE id = ?1 AND (status = 'pending' OR (status = 'grabbing' AND last_seen < ?2))",
+            rusqlite::params![id, db::now()],
+        )
+        .map(|n| n == 1)
+        .map_err(db::db_err)?
+    };
+    if !claimed {
+        return Err(AppError::Other("proposal not found or already resolved".into()));
+    }
+
+    let outcome = crate::grab::dispatch(
+        state.inner(),
+        crate::grab::GrabOrder {
+            title: title.clone(),
+            magnet_url: magnet,
+            download_url: download,
+            save_path,
+            info_hash,
+            size,
+        },
+        brief_id,
+        vec![],
+    )
+    .await;
 
     let conn = state.db.lock().await;
-    conn.execute("UPDATE proposals SET status = 'approved' WHERE id = ?1", [id])
-        .map_err(db::db_err)?;
-    db::ledger_insert(&conn, &content_key, brief_id, &title, info_hash.as_deref(), size, &[]);
-    db::log_activity(&conn, "agent", None, &format!("Approved proposal: {title}"));
-    Ok(format!("Grabbed {title}"))
+    match outcome {
+        Ok(crate::grab::GrabOutcome::Grabbed) => {
+            conn.execute("UPDATE proposals SET status = 'approved' WHERE id = ?1", [id])
+                .map_err(db::db_err)?;
+            db::log_activity(&conn, "agent", None, &format!("Approved proposal: {title}"));
+            Ok(format!("Grabbed {title}"))
+        }
+        // another path already has this content in flight — the card settles
+        // with that grab; don't claim it as this approval's doing
+        Ok(crate::grab::GrabOutcome::AlreadyClaimed) => {
+            conn.execute("UPDATE proposals SET status = 'approved' WHERE id = ?1", [id])
+                .map_err(db::db_err)?;
+            db::log_activity(&conn, "agent", None, &format!("Approved proposal: {title} (another grab was already in flight)"));
+            Ok(format!("Another Trawler path is already grabbing {title}"))
+        }
+        Ok(crate::grab::GrabOutcome::AlreadyHad) => {
+            conn.execute("UPDATE proposals SET status = 'approved' WHERE id = ?1", [id])
+                .map_err(db::db_err)?;
+            db::log_activity(&conn, "agent", None, &format!("Approved proposal: {title} (already in library)"));
+            Ok(format!("Already in your library: {title}"))
+        }
+        Err(e) => {
+            // the grab failed — put the card back so the user can retry
+            conn.execute(
+                "UPDATE proposals SET status = 'pending', last_seen = ?2 WHERE id = ?1",
+                rusqlite::params![id, db::now()],
+            )
+            .map_err(db::db_err)?;
+            Err(e)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_history_is_chronological_within_the_newest_window() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE chat_messages (
+               id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, role TEXT,
+               content TEXT, tool_name TEXT, tool_payload TEXT);",
+        )
+        .unwrap();
+        for i in 0..450 {
+            conn.execute(
+                "INSERT INTO chat_messages (ts, role, content) VALUES (?1, 'user', ?2)",
+                rusqlite::params![i, format!("m{i}")],
+            )
+            .unwrap();
+        }
+        let mut stmt = conn.prepare(CHAT_HISTORY_SQL).unwrap();
+        let ids: Vec<i64> = stmt
+            .query_map([], |r| r.get::<_, i64>(0))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(ids.len(), 400, "window keeps the newest 400");
+        assert_eq!(ids[0], 51, "oldest surviving row first");
+        assert_eq!(*ids.last().unwrap(), 450, "newest row last");
+        assert!(ids.windows(2).all(|w| w[0] < w[1]), "strictly ascending");
+    }
 }

@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use serde_json::{json, Value};
 
 use crate::briefs::{content_key, HuntPlan};
-use crate::commands::{perform_grab, perform_search};
+use crate::commands::perform_search;
 use crate::db;
 use crate::AppState;
 
@@ -329,33 +329,44 @@ async fn grab_release(state: &AppState, ctx: &mut RunCtx, args: &Value) -> Value
     }
 
     let reason = clean_text(args.get("reason").and_then(|v| v.as_str()).unwrap_or(""), 200);
-    match perform_grab(state, &stored.title, stored.magnet_url.clone(), stored.download_url.clone(), None).await {
-        Ok(_) => {
+    // the medic's freed episodes ride along: dispatch re-links them to the
+    // replacement grab, or they'd re-search forever and never complete
+    let medic_ep_ids = ctx.medic_ep_ids.clone();
+    let outcome = crate::grab::dispatch(
+        state,
+        crate::grab::GrabOrder {
+            title: stored.title.clone(),
+            magnet_url: stored.magnet_url.clone(),
+            download_url: stored.download_url.clone(),
+            save_path: None,
+            info_hash: stored.info_hash.clone(),
+            size: stored.size,
+        },
+        ctx.origin.brief_id(),
+        medic_ep_ids,
+    )
+    .await;
+    match outcome {
+        Ok(crate::grab::GrabOutcome::Grabbed) => {
             ctx.grabs_done += 1;
             ctx.gb_done += size_gb;
             ctx.grabbed_titles.push(stored.title.clone());
-            let conn = state.db.lock().await;
-            db::ledger_insert(
-                &conn,
-                &stored.content_key,
-                ctx.origin.brief_id(),
-                &stored.title,
-                stored.info_hash.as_deref(),
-                stored.size,
-                &ctx.medic_ep_ids,
-            );
-            if !ctx.medic_ep_ids.is_empty() {
-                // the dead grab freed these to wanted — the replacement owns
-                // them now, or they'd re-search forever and never complete
-                db::mark_grabbed(&conn, &ctx.medic_ep_ids, &stored.title);
+            {
+                let conn = state.db.lock().await;
+                db::log_activity(
+                    &conn,
+                    "agent",
+                    None,
+                    &format!("[{}] grabbed {} · {:.1} GB · {}", ctx.origin.label(), stored.title, size_gb, reason),
+                );
             }
-            db::log_activity(
-                &conn,
-                "agent",
-                None,
-                &format!("[{}] grabbed {} · {:.1} GB · {}", ctx.origin.label(), stored.title, size_gb, reason),
-            );
             json!({ "ok": true, "grabbed": stored.title, "grabsRemaining": ctx.max_grabs - ctx.grabs_done })
+        }
+        Ok(crate::grab::GrabOutcome::AlreadyClaimed) => {
+            err("another path is grabbing this content right now")
+        }
+        Ok(crate::grab::GrabOutcome::AlreadyHad) => {
+            err("already grabbed this content (possibly a different release of it)")
         }
         Err(e) => err(format!("grab failed: {e}")),
     }

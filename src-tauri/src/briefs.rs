@@ -360,8 +360,44 @@ pub async fn run_brief(app: &tauri::AppHandle, brief: &BriefRow) -> Result<Strin
         }
     }
 
-    let plan: HuntPlan = serde_json::from_str(&brief.plan_json).unwrap_or_default();
+    // A plan that fails to parse must NEVER degrade to the unconstrained
+    // default in auto mode — that's how a "1080p, ≤6GB" brief starts
+    // grabbing 200GB packs. Pause loudly instead (empty = never a plan).
+    let plan: HuntPlan = if brief.plan_json.trim().is_empty() {
+        Default::default()
+    } else {
+        match serde_json::from_str(&brief.plan_json) {
+            Ok(p) => p,
+            Err(e) => {
+                let reason = format!(
+                    "stored plan failed to parse ({e}) — re-save the brief to regenerate it"
+                );
+                let conn = state.db.lock().await;
+                let _ = conn.execute(
+                    "UPDATE briefs SET enabled = 0, paused_reason = ?1 WHERE id = ?2",
+                    rusqlite::params![reason, brief.id],
+                );
+                crate::db::log_activity(&conn, "error", None, &format!("[brief: {}] {reason}", brief.name));
+                return Err(AppError::Other(reason));
+            }
+        }
+    };
     let propose_only = brief.mode != "auto";
+    // Auto mode with an empty include list would run constraint-free — the
+    // RSS arm already refuses such briefs (see the sweep's plan filter);
+    // a manual run must not be the loophole.
+    if !propose_only && plan.include.is_empty() {
+        let reason =
+            "auto mode needs a compiled plan with at least one include term — re-save the brief"
+                .to_string();
+        let conn = state.db.lock().await;
+        let _ = conn.execute(
+            "UPDATE briefs SET enabled = 0, paused_reason = ?1 WHERE id = ?2",
+            rusqlite::params![reason, brief.id],
+        );
+        crate::db::log_activity(&conn, "error", None, &format!("[brief: {}] {reason}", brief.name));
+        return Err(AppError::Other(reason));
+    }
     let memory = {
         let conn = state.db.lock().await;
         crate::db::memory_digest(&conn, brief.id)
@@ -389,11 +425,14 @@ pub async fn run_brief(app: &tauri::AppHandle, brief: &BriefRow) -> Result<Strin
     let run_id = format!("brief-{}-{}", brief.id, crate::db::now());
 
     let outcome = tokio::time::timeout(
-        std::time::Duration::from_secs(240),
+        // a single LLM call may take up to 300s (llm.rs client timeout) —
+        // the run deadline must exceed one slow call or slow models fail
+        // forever and the fail-streak cool-off kicks in on non-failures
+        std::time::Duration::from_secs(360),
         crate::agent_run::run(app, &mut ctx, messages, &run_id, false),
     )
     .await
-    .map_err(|_| AppError::Other("brief run exceeded its 4-minute deadline".into()))??;
+    .map_err(|_| AppError::Other("brief run exceeded its 6-minute deadline".into()))??;
 
     let conn = state.db.lock().await;
     crate::db::log_activity(

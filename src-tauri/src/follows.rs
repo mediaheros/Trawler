@@ -99,14 +99,18 @@ pub fn upsert_show(
     seasons: Option<&[i64]>,
     is_new_follow: bool,
 ) -> Result<()> {
+    // The season selection must survive refreshes — NULL means "all seasons"
+    // and never overwrites a stored selection (refreshes pass None).
+    let seasons_json = seasons.map(|s| serde_json::to_string(s).unwrap_or_else(|_| "null".into()));
     conn.execute(
         "INSERT INTO shows (tvmaze_id, name, status, poster_url, premiered, ended, network,
-                            imdb_id, followed_at, refreshed_at, backfill)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10)
+                            imdb_id, followed_at, refreshed_at, backfill, seasons_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11)
          ON CONFLICT(tvmaze_id) DO UPDATE SET
            name = excluded.name, status = excluded.status, poster_url = excluded.poster_url,
            premiered = excluded.premiered, ended = excluded.ended, network = excluded.network,
-           imdb_id = excluded.imdb_id, refreshed_at = excluded.refreshed_at",
+           imdb_id = excluded.imdb_id, refreshed_at = excluded.refreshed_at,
+           seasons_json = COALESCE(excluded.seasons_json, shows.seasons_json)",
         rusqlite::params![
             show.id,
             show.name,
@@ -118,6 +122,7 @@ pub fn upsert_show(
             show.externals.as_ref().and_then(|e| e.imdb.clone()),
             db::now(),
             backfill as i64,
+            seasons_json,
         ],
     )
     .map_err(db::db_err)?;
@@ -141,12 +146,15 @@ pub fn upsert_show(
         let season_selected = seasons.map(|s| s.contains(&ep.season)).unwrap_or(true);
         let has_aired = aired(&ep.airstamp);
 
-        // State for NEW rows. New episodes appearing after the follow (a running
-        // show's next season) are always wanted once they air.
-        let initial_state = if !has_aired {
+        // State for NEW rows. The season selection is the gate: episodes of
+        // an unselected season never become wanted, whether they aired
+        // before the follow or air after it.
+        let initial_state = if !season_selected {
+            "ignored"
+        } else if !has_aired {
             "upcoming"
         } else if is_new_follow {
-            if backfill && season_selected { "wanted" } else { "ignored" }
+            if backfill { "wanted" } else { "ignored" }
         } else {
             "wanted"
         };
@@ -157,7 +165,7 @@ pub fn upsert_show(
              ON CONFLICT(tvmaze_ep_id) DO UPDATE SET
                title = excluded.title, airstamp = excluded.airstamp,
                state = CASE
-                 WHEN episodes.state = 'upcoming' AND excluded.state != 'upcoming' THEN 'wanted'
+                 WHEN episodes.state = 'upcoming' AND excluded.state = 'wanted' THEN 'wanted'
                  ELSE episodes.state
                END",
             rusqlite::params![
@@ -200,7 +208,18 @@ pub async fn follow(
 pub async fn refresh_show(state: &AppState, tvmaze_id: i64) -> Result<()> {
     let show = tvmaze::show_with_episodes(&state.http, tvmaze_id).await?;
     let conn = state.db.lock().await;
-    upsert_show(&conn, &show, true, None, false)?;
+    // honor the stored season selection — a refresh must never widen what
+    // the user chose to follow
+    let seasons: Option<Vec<i64>> = conn
+        .query_row(
+            "SELECT seasons_json FROM shows WHERE tvmaze_id = ?1",
+            [tvmaze_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+        .and_then(|j| serde_json::from_str(&j).ok());
+    upsert_show(&conn, &show, true, seasons.as_deref(), false)?;
     Ok(())
 }
 
@@ -235,5 +254,99 @@ mod tests {
         assert!(profile_allows(&profile, &ok, 5_000_000_000, 10));
         assert_eq!(codec_boost(&profile, &ok), 8.0);
         assert_eq!(codec_boost(&profile, &unknown), 0.0);
+    }
+
+    // ---- season-selection gating tests ----
+
+    fn mem() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE shows (
+                 tvmaze_id INTEGER PRIMARY KEY, name TEXT NOT NULL, status TEXT NOT NULL,
+                 poster_url TEXT, premiered TEXT, ended TEXT, network TEXT, imdb_id TEXT,
+                 followed_at INTEGER NOT NULL, refreshed_at INTEGER NOT NULL DEFAULT 0,
+                 backfill INTEGER, seasons_json TEXT
+               );
+               CREATE TABLE episodes (
+                 tvmaze_ep_id INTEGER PRIMARY KEY, show_id INTEGER NOT NULL,
+                 season INTEGER NOT NULL, number INTEGER NOT NULL,
+                 title TEXT, airstamp TEXT, state TEXT NOT NULL DEFAULT 'wanted'
+               );",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn mk_show(eps: &[(i64, i64, Option<i64>, &str)]) -> crate::tvmaze::TvmShow {
+        crate::tvmaze::TvmShow {
+            id: 1,
+            name: "Test Show".into(),
+            status: "Running".into(),
+            premiered: None, ended: None, genres: vec![],
+            network: None, web_channel: None, image: None, externals: None,
+            summary: None,
+            embedded: Some(crate::tvmaze::TvmEmbedded {
+                episodes: eps.iter().map(|&(id, season, number, airstamp)| crate::tvmaze::TvmEpisode {
+                    id, season, number, name: None,
+                    airstamp: Some(airstamp.into()), ep_type: Some("regular".into()),
+                }).collect(),
+            }),
+        }
+    }
+
+    fn states(conn: &rusqlite::Connection) -> Vec<(i64, String)> {
+        conn.prepare("SELECT tvmaze_ep_id, state FROM episodes ORDER BY tvmaze_ep_id").unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
+            .flatten().collect()
+    }
+
+    #[test]
+    fn season_selection_gates_new_follow_rows() {
+        let conn = mem();
+        let past = "2020-01-01T00:00:00+00:00";
+        let future = "2999-01-01T00:00:00+00:00";
+        let show = mk_show(&[
+            (10, 1, Some(1), past),   // S1 aired
+            (11, 1, Some(2), future), // S1 unaired
+            (12, 2, Some(1), past),   // S2 aired
+            (13, 2, Some(2), future), // S2 unaired
+        ]);
+        upsert_show(&conn, &show, true, Some(&[1]), true).unwrap();
+        assert_eq!(states(&conn), vec![
+            (10, "wanted".to_string()),
+            (11, "upcoming".to_string()),
+            (12, "ignored".to_string()),
+            (13, "ignored".to_string()),
+        ], "unselected seasons are ignored whether aired or not");
+
+        // the selection persists
+        let stored: Option<String> = conn.query_row(
+            "SELECT seasons_json FROM shows WHERE tvmaze_id = ?1", [1], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(stored.as_deref(), Some("[1]"));
+    }
+
+    #[test]
+    fn refresh_promotes_only_selected_seasons() {
+        let conn = mem();
+        let future = "2999-01-01T00:00:00+00:00";
+        let now_aired = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S+00:00").to_string();
+        let show = mk_show(&[
+            (10, 1, Some(1), &future),    // S1, still future at follow time
+            (11, 2, Some(1), &now_aired), // S2, aired
+        ]);
+        upsert_show(&conn, &show, true, Some(&[1]), true).unwrap();
+        // time passes; refresh with the SAME episodes, S1 now aired too
+        let show2 = mk_show(&[
+            (10, 1, Some(1), &now_aired),
+            (11, 2, Some(1), &now_aired),
+        ]);
+        upsert_show(&conn, &show2, true, Some(&[1]), false).unwrap();
+        let mut s = states(&conn);
+        s.sort_by_key(|(id, _)| *id);
+        assert_eq!(s, vec![
+            (10, "wanted".to_string()),
+            (11, "ignored".to_string()),
+        ], "selected season promotes on refresh; unselected stays ignored");
     }
 }

@@ -7,11 +7,17 @@ import { Button, cx } from "./ui";
 const LEVELS = ["all", "info", "warn", "error"] as const;
 type LevelFilter = (typeof LEVELS)[number];
 
+// stable unique ids assigned at ingest: content-based keys collide on
+// identical same-second lines, and index-based keys shift with the
+// 500-row window and remount the whole list on every flush
+let logSeq = 0;
+type ConsoleEntry = LogEntry & { seq: number };
+
 /** Live diagnostic console: what the app is actually doing, copyable in one
  *  click as a support bundle. The answer to "it's hanging". */
 export default function LogConsole() {
   const toast = useStore((s) => s.toast);
-  const [entries, setEntries] = useState<LogEntry[]>([]);
+  const [entries, setEntries] = useState<ConsoleEntry[]>([]);
   const [level, setLevel] = useState<LevelFilter>("all");
   const [paused, setPaused] = useState(false);
   const [copying, setCopying] = useState(false);
@@ -24,7 +30,10 @@ export default function LogConsole() {
   // log lines must not mean a 2000-element copy per line
   const inbox = useRef<LogEntry[]>([]);
   useEffect(() => {
-    void api.logsRecent().then(setEntries).catch(() => {});
+    void api
+      .logsRecent()
+      .then((rows) => setEntries(rows.map((e) => ({ ...e, seq: logSeq++ }))))
+      .catch(() => {});
     let raf = 0;
     const flush = () => {
       raf = 0;
@@ -32,7 +41,7 @@ export default function LogConsole() {
       const batch = inbox.current;
       inbox.current = [];
       setEntries((prev) => {
-        const next = [...prev, ...batch];
+        const next = [...prev, ...batch.map((e) => ({ ...e, seq: logSeq++ }))];
         return next.length > 2000 ? next.slice(next.length - 2000) : next;
       });
     };
@@ -54,7 +63,7 @@ export default function LogConsole() {
       const batch = inbox.current;
       inbox.current = [];
       setEntries((prev) => {
-        const next = [...prev, ...batch];
+        const next = [...prev, ...batch.map((e) => ({ ...e, seq: logSeq++ }))];
         return next.length > 2000 ? next.slice(next.length - 2000) : next;
       });
     }
@@ -131,7 +140,7 @@ export default function LogConsole() {
           <div className="px-1 py-2 text-faint">Nothing logged yet at this level.</div>
         ) : (
           visible.map((e) => (
-            <div key={`${e.ts}-${e.area}-${e.message.length}-${e.message.slice(0, 24)}`} className="flex gap-2 whitespace-pre-wrap break-all px-1">
+            <div key={e.seq} className="flex gap-2 whitespace-pre-wrap break-all px-1">
               <span className="shrink-0 text-faint">{fmtTime(e.ts)}</span>
               <span
                 className={cx(

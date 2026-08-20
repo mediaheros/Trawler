@@ -4,7 +4,7 @@ use chrono::Utc;
 use serde::Serialize;
 use tauri::Manager;
 
-use crate::commands::{normalize, perform_grab, perform_search, EnrichedRelease};
+use crate::commands::{normalize, perform_search, EnrichedRelease};
 use crate::config::QualityProfile;
 use crate::db::{self, EpisodeRow, ShowRow};
 use crate::error::Result;
@@ -230,20 +230,23 @@ async fn execute_plan(app: &tauri::AppHandle, state: &AppState, plan: &PlannedGr
         if cfg.save_path_tv.is_empty() { None } else { Some(cfg.save_path_tv.clone()) }
     });
 
-    let result = perform_grab(
+    let outcome = crate::grab::dispatch(
         state,
-        &plan.title,
-        plan.magnet_url.clone(),
-        plan.download_url.clone(),
-        save_path,
+        crate::grab::GrabOrder {
+            title: plan.title.clone(),
+            magnet_url: plan.magnet_url.clone(),
+            download_url: plan.download_url.clone(),
+            save_path,
+            info_hash: magnet_hash(plan.magnet_url.as_deref()),
+            size: plan.size,
+        },
+        None,
+        fresh_ep_ids,
     )
     .await;
 
-    let conn = state.db.lock().await;
-    match result {
-        Ok(_) => {
-            db::mark_grabbed(&conn, &fresh_ep_ids, &plan.title);
-            db::ledger_insert(&conn, &ck, None, &plan.title, magnet_hash(plan.magnet_url.as_deref()).as_deref(), plan.size, &fresh_ep_ids);
+    match outcome {
+        Ok(crate::grab::GrabOutcome::Grabbed) => {
             let what = if plan.is_pack {
                 format!("{} S{:02} season pack", plan.show_name, plan.season)
             } else {
@@ -255,7 +258,9 @@ async fn execute_plan(app: &tauri::AppHandle, state: &AppState, plan: &PlannedGr
                 plan.indexer.as_deref().map(|i| format!(" · {i}")).unwrap_or_default(),
                 plan.title.chars().take(70).collect::<String>(),
             );
+            let conn = state.db.lock().await;
             db::log_activity(&conn, "grab", Some(plan.show_id), &msg);
+            drop(conn);
             crate::applog::info("scheduler", msg.clone());
             if cfg.notify_on_grab {
                 use tauri_plugin_notification::NotificationExt;
@@ -274,9 +279,14 @@ async fn execute_plan(app: &tauri::AppHandle, state: &AppState, plan: &PlannedGr
             );
             true
         }
+        // Another path grabbed (or is grabbing) this content — the ledger
+        // covers the episodes, so this plan counts as handled.
+        Ok(_) => false,
         Err(e) => {
             let msg = format!("Failed to grab {} S{:02}: {e}", plan.show_name, plan.season);
+            let conn = state.db.lock().await;
             db::log_activity(&conn, "error", Some(plan.show_id), &msg);
+            drop(conn);
             crate::applog::error("scheduler", msg.clone());
             false
         }
@@ -451,7 +461,9 @@ async fn medic_pass(app: &tauri::AppHandle, state: &AppState, dead: Vec<DeadGrab
         ];
         let run_id = format!("medic-{}", db::now());
         let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(180),
+            // beyond one full LLM call (llm.rs allows 300s per request) so a
+            // slow-but-working model can complete a medic run
+            std::time::Duration::from_secs(360),
             crate::agent_run::run(app, &mut ctx, messages, &run_id, false),
         )
         .await;
@@ -539,8 +551,11 @@ async fn completion_pass(app: &tauri::AppHandle, state: &AppState) -> Vec<DeadGr
         username: cfg.qbit_username.clone(),
         password: cfg.qbit_password.clone(),
     };
-    let category = if cfg.qbit_category.is_empty() { None } else { Some(cfg.qbit_category.as_str()) };
-    let torrents = match q.list(category).await {
+    // This pass matches OUR ledger rows against qBittorrent, so it lists the
+    // FULL torrent set, not the category view: a torrent the user
+    // recategorized must still count as present, or every open grab looks
+    // "deleted" and Trawler re-grabs it in a loop.
+    let torrents = match q.list(None).await {
         Ok(t) => t,
         Err(_) => return vec![],
     };

@@ -25,12 +25,22 @@ const SUGGESTIONS = [
 ];
 
 export default function AgentView() {
-  const {
-    chat, chatLoaded, loadChat, agentBusy, liveSteps, agentThinking,
-    sendToAgent, clearChat, initAgentEvents,
-    proposals, loadProposals, resolveProposal, loadBriefs,
-    config,
-  } = useStore();
+  // per-field selectors: whole-store subscription re-rendered this tree on
+  // every streamed agent event AND every store write anywhere
+  const chat = useStore((s) => s.chat);
+  const chatLoaded = useStore((s) => s.chatLoaded);
+  const loadChat = useStore((s) => s.loadChat);
+  const agentBusy = useStore((s) => s.agentBusy);
+  const liveSteps = useStore((s) => s.liveSteps);
+  const agentThinking = useStore((s) => s.agentThinking);
+  const sendToAgent = useStore((s) => s.sendToAgent);
+  const clearChat = useStore((s) => s.clearChat);
+  const initAgentEvents = useStore((s) => s.initAgentEvents);
+  const proposals = useStore((s) => s.proposals);
+  const loadProposals = useStore((s) => s.loadProposals);
+  const resolveProposal = useStore((s) => s.resolveProposal);
+  const loadBriefs = useStore((s) => s.loadBriefs);
+  const config = useStore((s) => s.config);
   const [input, setInput] = useState("");
   const [briefsOpen, setBriefsOpen] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);

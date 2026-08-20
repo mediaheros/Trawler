@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use tauri::{AppHandle, Manager};
 
 use crate::briefs::{content_key, BriefRow, HuntPlan};
-use crate::commands::{normalize, perform_grab, score};
+use crate::commands::{normalize, score};
 use crate::config::QualityProfile;
 use crate::db;
 use crate::error::Result;
@@ -47,13 +47,65 @@ fn title_has_all(title_tokens: &HashSet<&str>, tokens: &[String]) -> bool {
 /// Newly aired episodes must become wanted the moment they air, not on the
 /// next 20-hourly metadata refresh. Airstamps are RFC3339 with +00:00 offsets
 /// (TVmaze convention), so lexicographic comparison against a UTC now works.
+/// A show followed with a season selection only promotes ITS seasons — the
+/// whole point of "Season 1 only" is not grabbing Season 2 later.
 pub fn promote_aired(conn: &Connection) {
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+    // restricted follows: show id -> the only seasons allowed to promote
+    let restricted: Vec<(i64, Vec<i64>)> = conn
+        .prepare("SELECT tvmaze_id, seasons_json FROM shows WHERE seasons_json IS NOT NULL")
+        .ok()
+        .map(|mut stmt| {
+            stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+                .map(|it| {
+                    it.flatten()
+                        .filter_map(|(id, json)| {
+                            serde_json::from_str::<Vec<i64>>(&json).ok().map(|s| (id, s))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+
+    if restricted.is_empty() {
+        let _ = conn.execute(
+            "UPDATE episodes SET state = 'wanted'
+             WHERE state = 'upcoming' AND airstamp IS NOT NULL AND airstamp <= ?1",
+            [&now],
+        );
+        return;
+    }
+
+    // unrestricted shows promote wholesale
+    let ids: Vec<String> = restricted.iter().map(|(id, _)| id.to_string()).collect();
     let _ = conn.execute(
-        "UPDATE episodes SET state = 'wanted'
-         WHERE state = 'upcoming' AND airstamp IS NOT NULL AND airstamp <= ?1",
-        [now],
+        &format!(
+            "UPDATE episodes SET state = 'wanted'
+             WHERE state = 'upcoming' AND airstamp IS NOT NULL AND airstamp <= ?1
+               AND show_id NOT IN ({})",
+            ids.join(",")
+        ),
+        [&now],
     );
+    // restricted shows promote only their selected seasons
+    for (show_id, seasons) in &restricted {
+        if seasons.is_empty() {
+            continue;
+        }
+        let placeholders = seasons.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let mut params: Vec<rusqlite::types::Value> =
+            vec![now.clone().into(), (*show_id).into()];
+        params.extend(seasons.iter().map(|s| rusqlite::types::Value::from(*s)));
+        let _ = conn.execute(
+            &format!(
+                "UPDATE episodes SET state = 'wanted'
+                 WHERE state = 'upcoming' AND airstamp IS NOT NULL AND airstamp <= ?1
+                   AND show_id = ?2 AND season IN ({placeholders})"
+            ),
+            rusqlite::params_from_iter(params),
+        );
+    }
 }
 
 fn load_show_wants(conn: &Connection, default_profile: &QualityProfile) -> Vec<ShowWants> {
@@ -259,7 +311,17 @@ pub async fn sweep(app: &AppHandle) -> Result<SweepStats> {
 
     // ---- act on episode matches ----
     let mut episode_grabs = 0usize;
+    // same discipline as the scheduler cycle: a freshly imported catalog of
+    // wanted episodes must not turn one sweep into dozens of grabs onto a
+    // nearly-full disk
+    const MAX_EPISODE_GRABS_PER_SWEEP: usize = 8;
     for ((show_id, ep_id), cand) in ep_candidates {
+        if episode_grabs >= MAX_EPISODE_GRABS_PER_SWEEP {
+            break;
+        }
+        if !free_disk_ok {
+            break;
+        }
         let ck = content_key(&cand.release.title);
         // re-check freshness under the lock: another path may have satisfied
         // this episode while we were fetching
@@ -289,24 +351,38 @@ pub async fn sweep(app: &AppHandle) -> Result<SweepStats> {
         let save_path = w_save_path.or_else(|| {
             if cfg.save_path_tv.is_empty() { None } else { Some(cfg.save_path_tv.clone()) }
         });
-        match perform_grab(state, &cand.release.title, cand.release.magnet_url.clone(), cand.release.download_url.clone(), save_path).await {
-            Ok(_) => {
+        let outcome = crate::grab::dispatch(
+            state,
+            crate::grab::GrabOrder {
+                title: cand.release.title.clone(),
+                magnet_url: cand.release.magnet_url.clone(),
+                download_url: cand.release.download_url.clone(),
+                save_path,
+                info_hash: cand.release.info_hash.clone(),
+                size: cand.release.size,
+            },
+            None,
+            vec![ep_id],
+        )
+        .await;
+        match outcome {
+            Ok(crate::grab::GrabOutcome::Grabbed) => {
                 episode_grabs += 1;
-                let conn = state.db.lock().await;
-                db::mark_grabbed(&conn, &[ep_id], &cand.release.title);
-                db::ledger_insert(&conn, &ck, None, &cand.release.title, cand.release.info_hash.as_deref(), cand.release.size, &[ep_id]);
-                db::log_activity(
-                    &conn,
-                    "rss",
-                    Some(show_id),
-                    &format!(
-                        "RSS grabbed {} S{:02}E{:02} minutes after release · {}",
-                        show_name,
-                        cand.parsed.season.unwrap_or(0),
-                        cand.parsed.episode.unwrap_or(0),
-                        cand.release.title.chars().take(60).collect::<String>()
-                    ),
-                );
+                {
+                    let conn = state.db.lock().await;
+                    db::log_activity(
+                        &conn,
+                        "rss",
+                        Some(show_id),
+                        &format!(
+                            "RSS grabbed {} S{:02}E{:02} minutes after release · {}",
+                            show_name,
+                            cand.parsed.season.unwrap_or(0),
+                            cand.parsed.episode.unwrap_or(0),
+                            cand.release.title.chars().take(60).collect::<String>()
+                        ),
+                    );
+                }
                 crate::notify::dispatch(
                     app,
                     crate::notify::Kind::Grab,
@@ -323,6 +399,8 @@ pub async fn sweep(app: &AppHandle) -> Result<SweepStats> {
                     ),
                 );
             }
+            // satisfied or claimed by another path — the ledger covers it
+            Ok(_) => {}
             Err(e) => {
                 let conn = state.db.lock().await;
                 db::log_activity(&conn, "error", Some(show_id), &format!("RSS grab failed: {e}"));
@@ -363,19 +441,34 @@ pub async fn sweep(app: &AppHandle) -> Result<SweepStats> {
             if !daily_ok {
                 continue;
             }
-            match perform_grab(state, &cand.release.title, cand.release.magnet_url.clone(), cand.release.download_url.clone(), None).await {
-                Ok(_) => {
+            let outcome = crate::grab::dispatch(
+                state,
+                crate::grab::GrabOrder {
+                    title: cand.release.title.clone(),
+                    magnet_url: cand.release.magnet_url.clone(),
+                    download_url: cand.release.download_url.clone(),
+                    save_path: None,
+                    info_hash: cand.release.info_hash.clone(),
+                    size: cand.release.size,
+                },
+                Some(brief_id),
+                vec![],
+            )
+            .await;
+            match outcome {
+                Ok(crate::grab::GrabOutcome::Grabbed) => {
                     *used += 1;
                     *gb_this_sweep.get_mut(&brief_id).unwrap() += size_gb;
                     brief_grabs += 1;
-                    let conn = state.db.lock().await;
-                    db::ledger_insert(&conn, &ck, Some(brief_id), &cand.release.title, cand.release.info_hash.as_deref(), cand.release.size, &[]);
-                    db::log_activity(
-                        &conn,
-                        "rss",
-                        None,
-                        &format!("[brief: {}] RSS grabbed {}", brief.name, cand.release.title.chars().take(60).collect::<String>()),
-                    );
+                    {
+                        let conn = state.db.lock().await;
+                        db::log_activity(
+                            &conn,
+                            "rss",
+                            None,
+                            &format!("[brief: {}] RSS grabbed {}", brief.name, cand.release.title.chars().take(60).collect::<String>()),
+                        );
+                    }
                     if cfg.notify_on_grab {
                         use tauri_plugin_notification::NotificationExt;
                         let _ = app.notification().builder().title(format!("Trawler brief: {}", brief.name)).body("Grabbed a fresh release").show();
@@ -391,6 +484,8 @@ pub async fn sweep(app: &AppHandle) -> Result<SweepStats> {
                         ),
                     );
                 }
+                // satisfied or claimed by another path — nothing to bill
+                Ok(_) => {}
                 Err(e) => {
                     let conn = state.db.lock().await;
                     db::log_activity(&conn, "error", None, &format!("[brief: {}] RSS grab failed: {e}", brief.name));
@@ -456,6 +551,71 @@ pub async fn rss_loop(app: AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal schema mirroring the columns promote_aired touches.
+    fn mem() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE shows (tvmaze_id INTEGER PRIMARY KEY, seasons_json TEXT);
+             CREATE TABLE episodes (
+               tvmaze_ep_id INTEGER PRIMARY KEY, show_id INTEGER NOT NULL,
+               season INTEGER NOT NULL, number INTEGER NOT NULL,
+               title TEXT, airstamp TEXT, state TEXT NOT NULL DEFAULT 'wanted'
+             );",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn state_of(conn: &Connection, ep: i64) -> String {
+        conn.query_row("SELECT state FROM episodes WHERE tvmaze_ep_id = ?1", [ep], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn promote_aired_flips_aired_upcoming_for_unrestricted_shows() {
+        let conn = mem();
+        conn.execute("INSERT INTO shows (tvmaze_id) VALUES (1)", []).unwrap();
+        let past = "2020-01-01T00:00:00+00:00";
+        let future = "2999-01-01T00:00:00+00:00";
+        conn.execute(
+            "INSERT INTO episodes (tvmaze_ep_id, show_id, season, number, airstamp, state) VALUES
+             (10, 1, 1, 1, ?1, 'upcoming'), (11, 1, 1, 2, ?2, 'upcoming')",
+            rusqlite::params![past, future],
+        )
+        .unwrap();
+        promote_aired(&conn);
+        assert_eq!(state_of(&conn, 10), "wanted", "aired upcoming promotes");
+        assert_eq!(state_of(&conn, 11), "upcoming", "unaired stays upcoming");
+    }
+
+    #[test]
+    fn promote_aired_respects_season_selections() {
+        let conn = mem();
+        // show 1 followed with "Season 1 only"; show 2 unrestricted
+        conn.execute(
+            "INSERT INTO shows (tvmaze_id, seasons_json) VALUES (1, '[1]'), (2, NULL)",
+            [],
+        )
+        .unwrap();
+        let past = "2020-01-01T00:00:00+00:00";
+        conn.execute(
+            "INSERT INTO episodes (tvmaze_ep_id, show_id, season, number, airstamp, state) VALUES
+             (10, 1, 1, 5, ?1, 'upcoming'),
+             (11, 1, 2, 1, ?1, 'upcoming'),
+             (12, 2, 3, 1, ?1, 'upcoming')",
+            [past],
+        )
+        .unwrap();
+        promote_aired(&conn);
+        assert_eq!(state_of(&conn, 10), "wanted", "selected season promotes");
+        assert_eq!(
+            state_of(&conn, 11),
+            "upcoming",
+            "unselected season must never promote — that's the whole point of the selection"
+        );
+        assert_eq!(state_of(&conn, 12), "wanted", "unrestricted show unaffected");
+    }
 
     fn tokset(s: &str) -> String {
         normalize(s)

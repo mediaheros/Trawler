@@ -24,7 +24,12 @@ import { useStore } from "../store";
 import { Button, CloseBtn, IconBtn, StatusPill, cx } from "./ui";
 
 export default function ShowDetail({ show, onClose }: { show: ShowRow; onClose: () => void }) {
-  const { unfollowShow, findReleaseForEpisode, toast, loadShows } = useStore();
+  // per-field selectors: this modal re-renders on the 15s shows poll anyway —
+  // a whole-store subscription would add every keystroke and toast to that
+  const unfollowShow = useStore((s) => s.unfollowShow);
+  const findReleaseForEpisode = useStore((s) => s.findReleaseForEpisode);
+  const toast = useStore((s) => s.toast);
+  const loadShows = useStore((s) => s.loadShows);
   const [episodes, setEpisodes] = useState<EpisodeRow[] | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [confirmUnfollow, setConfirmUnfollow] = useState(false);

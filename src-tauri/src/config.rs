@@ -193,12 +193,19 @@ pub fn load() -> Config {
 }
 
 pub fn save(cfg: &Config) -> Result<()> {
+    // two concurrent saves must not interleave writes to one tmp file —
+    // the rename would make the corruption permanent
+    static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = SAVE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
     let path = config_path();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    // atomic: a crash mid-write must not truncate the user's settings
-    let tmp = path.with_extension("json.tmp");
+    // atomic: a crash mid-write must not truncate the user's settings. The
+    // tmp name carries the pid so a crashed save can't collide with a later
+    // one (a stale tmp is litter, never corruption).
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
     {
         let json = serde_json::to_string_pretty(cfg)?;
         let mut f = std::fs::File::create(&tmp)?;

@@ -66,7 +66,7 @@ pub async fn scout_loop(app: tauri::AppHandle) {
         };
         if enabled && due {
             match run_pass(&app).await {
-                Ok(n) => {
+                Ok(Some(n)) => {
                     let state = app.state::<AppState>();
                     let conn = state.db.lock().await;
                     db::meta_set(&conn, META_KEY, &db::now().to_string());
@@ -74,7 +74,9 @@ pub async fn scout_loop(app: tauri::AppHandle) {
                         crate::applog::info("scout",format!("upgrade scout: {n} proposal(s) filed"));
                     }
                 }
-                // meta NOT stamped: the 6h tick retries instead of burning a week
+                // skipped (busy/prepare failed): the clock stays, the next
+                // 6h tick retries instead of burning the week
+                Ok(None) => {}
                 Err(e) => crate::applog::warn("scout",format!("upgrade scout pass failed: {e}")),
             }
         }
@@ -83,13 +85,21 @@ pub async fn scout_loop(app: tauri::AppHandle) {
 }
 
 /// Manual trigger (Settings): run one pass now; a completed pass resets the
-/// weekly clock like a scheduled one.
+/// weekly clock like a scheduled one. A skipped pass (another one in
+/// flight) resets nothing and says so.
 pub async fn scan_now(app: &tauri::AppHandle) -> crate::error::Result<usize> {
     let n = run_pass(app).await?;
-    let state = app.state::<AppState>();
-    let conn = state.db.lock().await;
-    db::meta_set(&conn, META_KEY, &db::now().to_string());
-    Ok(n)
+    match n {
+        Some(n) => {
+            let state = app.state::<AppState>();
+            let conn = state.db.lock().await;
+            db::meta_set(&conn, META_KEY, &db::now().to_string());
+            Ok(n)
+        }
+        None => Err(crate::error::AppError::Other(
+            "another scan is already in flight — try again in a moment".into(),
+        )),
+    }
 }
 
 /// Has the user already dismissed an upgrade card for this content?
@@ -116,13 +126,15 @@ fn already_have(conn: &rusqlite::Connection, ck: &str) -> (i32, i64) {
     (rank, size)
 }
 
-/// One weekly pass. Returns the number of NEW proposals filed.
-async fn run_pass(app: &tauri::AppHandle) -> crate::error::Result<usize> {
+/// One weekly pass. `Ok(None)` means the pass was SKIPPED (another one in
+/// flight, or the candidate query failed) — the weekly clock must not be
+/// consumed for it. `Ok(Some(n))` is a completed pass with n new proposals.
+async fn run_pass(app: &tauri::AppHandle) -> crate::error::Result<Option<usize>> {
     let state_guard = app.state::<AppState>();
     let state: &AppState = state_guard.inner();
     // a manual scan and the weekly pass must not run at once
     if state.scout_busy.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        return Ok(0);
+        return Ok(None);
     }
     struct Guard<'a>(&'a std::sync::atomic::AtomicBool);
     impl Drop for Guard<'_> {
@@ -146,7 +158,7 @@ async fn run_pass(app: &tauri::AppHandle) -> crate::error::Result<usize> {
              ORDER BY e.grabbed_at DESC",
         ) {
             Ok(s) => s,
-            Err(_) => return Ok(0),
+            Err(_) => return Ok(None),
         };
         let rows: Vec<(String, Option<String>, Option<String>, i64, i64, String)> = stmt
             .query_map([db::now() - window_secs], |r| {
@@ -202,7 +214,7 @@ async fn run_pass(app: &tauri::AppHandle) -> crate::error::Result<usize> {
             .collect()
     };
     if candidates.is_empty() {
-        return Ok(0);
+        return Ok(Some(0));
     }
 
     let mut new_proposals = 0usize;
@@ -252,7 +264,10 @@ async fn run_pass(app: &tauri::AppHandle) -> crate::error::Result<usize> {
         let size_cap: i64 = if orig_size > 0 {
             (orig_size.saturating_mul(4)).max(3_000_000_000)
         } else {
-            i64::MAX
+            // no baseline at all (size unknown at grab time) — an absolute
+            // ceiling instead of "unlimited", so the remux trap stays caught:
+            // generous for a 4K episode upgrade, far under remux-pack sizes
+            12_000_000_000
         };
         let better = results
             .releases
@@ -352,7 +367,7 @@ async fn run_pass(app: &tauri::AppHandle) -> crate::error::Result<usize> {
             "Waiting for your approval in the Agent view".into(),
         );
     }
-    Ok(new_proposals)
+    Ok(Some(new_proposals))
 }
 
 #[cfg(test)]

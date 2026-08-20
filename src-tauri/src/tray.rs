@@ -22,8 +22,15 @@ pub fn init(app: &App) -> tauri::Result<()> {
     let quit = MenuItem::with_id(app, "quit", "Quit Trawler", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&open, &check, &sep, &quit])?;
 
+    // a missing icon resource must degrade to a tray-less run, not abort
+    // startup inside setup
+    let Some(icon) = app.default_window_icon() else {
+        crate::applog::warn("app", "default window icon missing — running without a tray".to_string());
+        return Ok(());
+    };
+
     TrayIconBuilder::with_id("main")
-        .icon(app.default_window_icon().expect("app icon").clone())
+        .icon(icon.clone())
         .tooltip("Trawler")
         .menu(&menu)
         // macOS status items open their menu on left-click — that's the norm;

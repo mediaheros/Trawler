@@ -187,14 +187,16 @@ fn process_running(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Ask a process to stop, per-platform. Windows taskkill /F is immediate;
-/// unix sends SIGTERM first so the target can save state — callers that must
-/// win escalate with kill_process_force after a grace period.
+/// Ask a process to stop, per-platform, POLITELY — the target gets to flush
+/// its state (qBittorrent only writes qBittorrent.ini on a clean exit, so a
+/// force-kill here silently reverts the user's preferences). Callers that
+/// must win escalate with kill_process_force after a grace period.
 pub(crate) fn kill_process(name: &str) {
     #[cfg(windows)]
     {
+        // no /F: posts WM_CLOSE so the app can save, instead of terminating
         let mut kill = std::process::Command::new("taskkill");
-        kill.args(["/IM", name, "/F"]);
+        kill.args(["/IM", name]);
         use std::os::windows::process::CommandExt;
         kill.creation_flags(0x0800_0000);
         let _ = kill.output();
@@ -207,11 +209,14 @@ pub(crate) fn kill_process(name: &str) {
 }
 
 /// The no-really version: SIGKILL on unix, same taskkill /F on Windows.
-#[allow(dead_code)]
 pub(crate) fn kill_process_force(name: &str) {
     #[cfg(windows)]
     {
-        kill_process(name);
+        let mut kill = std::process::Command::new("taskkill");
+        kill.args(["/IM", name, "/F"]);
+        use std::os::windows::process::CommandExt;
+        kill.creation_flags(0x0800_0000);
+        let _ = kill.output();
     }
     #[cfg(not(windows))]
     {
@@ -313,6 +318,11 @@ pub async fn status(state: &AppState) -> SetupStatus {
 fn spawn_detached(exe: &PathBuf, args: &[String]) -> Result<()> {
     let mut cmd = std::process::Command::new(exe);
     cmd.args(args);
+    // children must not inherit our stdout/stderr — a chatty child writing
+    // into a pipe nobody drains (Trawler launched by a launcher) blocks
+    // forever, and a terminal launch gets log spam
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -447,17 +457,30 @@ pub fn start_managed_prowlarr() -> Result<()> {
     spawn_detached(&exe, &[format!("-data={}", data.display())])
 }
 
+/// Does the process answering on :9696 authenticate with OUR seeded API
+/// key? The unauthenticated ping proves only that SOMETHING is there.
+async fn prowlarr_is_ours(state: &AppState, key: &str) -> bool {
+    state
+        .http
+        .get("http://127.0.0.1:9696/api/v1/system/status")
+        .header("X-Api-Key", key)
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
+}
+
 async fn wait_for_prowlarr(state: &AppState, secs: u64) -> bool {
+    // Only the seeded API key proves OUR instance came up — a foreign
+    // Prowlarr the user runs themselves answers the ping too, while our
+    // freshly spawned instance dies unable to bind the port.
+    let key = match read_prowlarr_api_key() {
+        Some(k) => k,
+        None => return false,
+    };
     for _ in 0..secs {
-        let ok = state
-            .http
-            .get("http://127.0.0.1:9696/ping")
-            .timeout(std::time::Duration::from_secs(2))
-            .send()
-            .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false);
-        if ok {
+        if prowlarr_is_ours(state, &key).await {
             return true;
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -615,8 +638,48 @@ pub async fn install_prowlarr(app: &AppHandle) -> Result<String> {
         }
     }
 
-    // extraction + signing succeeded — swap the staged tree into place
-    let _ = std::fs::remove_dir_all(&final_target);
+    // extraction + signing succeeded — stop any running instance of OURS
+    // before swapping its files (Windows locks a running exe; unix keeps the
+    // old process serving from unlinked inodes while the new one can't
+    // bind). The seeded key proves the process on :9696 is ours — a foreign
+    // Prowlarr the user runs themselves is never killed.
+    if managed_prowlarr_exe().exists() {
+        if let Some(key) = read_prowlarr_api_key() {
+            if prowlarr_is_ours(state, &key).await {
+                emit(app, "prowlarr", "log", json!({ "message": "Stopping the running Prowlarr…" }));
+                // the managed Prowlarr is a detached console process with no
+                // windows — the polite close can't reach it, so wait briefly
+                // then force. The key is re-verified before forcing so it is
+                // only ever aimed at a process proven to be ours.
+                kill_process("Prowlarr");
+                for _ in 0..8 {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    if !prowlarr_is_ours(state, &key).await {
+                        break;
+                    }
+                }
+                if prowlarr_is_ours(state, &key).await {
+                    kill_process_force("Prowlarr");
+                    for _ in 0..12 {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        if !prowlarr_is_ours(state, &key).await {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // swap the staged tree into place — a swap failure must be loud and
+    // leave no silently half-deleted install behind
+    if let Err(e) = std::fs::remove_dir_all(&final_target) {
+        if final_target.exists() {
+            return Err(AppError::Other(format!(
+                "couldn't replace the existing Prowlarr — its files look in use; close Prowlarr and retry ({e})"
+            )));
+        }
+    }
     std::fs::rename(&target, &final_target)?;
     std::mem::forget(staging_guard);
 
@@ -815,6 +878,11 @@ pub fn remove_flaresolverr_local() -> Result<()> {
     {
         kill_process("flaresolverr.exe");
         std::thread::sleep(std::time::Duration::from_millis(800));
+        if process_running("flaresolverr.exe") {
+            // windowless process — the polite close rarely lands; escalate
+            kill_process_force("flaresolverr.exe");
+            std::thread::sleep(std::time::Duration::from_millis(800));
+        }
         if let Some(dir) = managed_flaresolverr_exe().parent().map(PathBuf::from) {
             if dir.exists() {
                 std::fs::remove_dir_all(&dir)

@@ -11,6 +11,7 @@ mod config;
 mod db;
 mod error;
 mod follows;
+mod grab;
 mod llm;
 mod notify;
 mod parse;
@@ -42,6 +43,8 @@ pub struct AppState {
     pub scout_busy: AtomicBool,
     /// one FlareSolverr install/setup at a time
     pub flaresolverr_busy: AtomicBool,
+    /// content keys with a grab in flight (see grab::dispatch)
+    pub grab_claims: std::sync::Arc<grab::GrabClaims>,
     /// (fetched_at, payload) for the discovery rows
     pub discover_cache: Mutex<Option<(i64, serde_json::Value)>>,
 }
@@ -67,6 +70,7 @@ pub fn run() {
         rss_busy: AtomicBool::new(false),
         scout_busy: AtomicBool::new(false),
         flaresolverr_busy: AtomicBool::new(false),
+        grab_claims: std::sync::Arc::new(grab::GrabClaims::default()),
         discover_cache: Mutex::new(None),
     };
 
@@ -126,9 +130,24 @@ pub fn run() {
                     {
                         let state = brief_handle.state::<AppState>();
                         if !state.brief_tick_busy.swap(true, Ordering::SeqCst) {
-                            briefs::tick(&brief_handle).await;
-                            let state = brief_handle.state::<AppState>();
-                            state.brief_tick_busy.store(false, Ordering::SeqCst);
+                            // drop guard + inner spawn: a panicking tick must
+                            // neither wedge the flag nor kill this loop. In
+                            // dev builds the guard releases during unwind and
+                            // the loop continues; release builds abort on
+                            // panic, so the process dies and the flag resets
+                            // with it — either way it can't wedge silently.
+                            struct Busy<'a>(&'a std::sync::atomic::AtomicBool);
+                            impl Drop for Busy<'_> {
+                                fn drop(&mut self) {
+                                    self.0.store(false, Ordering::SeqCst);
+                                }
+                            }
+                            let _busy = Busy(&state.brief_tick_busy);
+                            let h = brief_handle.clone();
+                            let tick = tauri::async_runtime::spawn(async move { briefs::tick(&h).await });
+                            if let Err(e) = tick.await {
+                                applog::error("briefs", format!("brief tick died: {e} — continuing next minute"));
+                            }
                         }
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(60)).await;
@@ -146,7 +165,10 @@ pub fn run() {
                     .try_read()
                     .map(|c| c.close_to_tray)
                     .unwrap_or(true);
-                if close_to_tray {
+                // hiding into a tray that doesn't exist (icon resource
+                // missing) would leave an unopenable zombie — close for real
+                let has_tray = window.app_handle().tray_by_id("main").is_some();
+                if close_to_tray && has_tray {
                     let _ = window.hide();
                     api.prevent_close();
                 }

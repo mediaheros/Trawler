@@ -126,6 +126,34 @@ let toastSeq = 1;
 /** Monotonic search id — a newer search always supersedes an older in-flight one. */
 let searchSeq = 0;
 let agentEventsInitialized = false;
+// chat message ids must never collide — two events in one millisecond
+// would produce duplicate React keys in the transcript
+let chatSeq = 1;
+// if a chat run dies without emitting done/error (process killed), this
+// unlocks the composer instead of disabling it until restart
+let agentWatchdog: ReturnType<typeof setTimeout> | null = null;
+
+function armAgentWatchdog() {
+  if (agentWatchdog !== null) clearTimeout(agentWatchdog);
+  // backend run deadline is 6 minutes — slack for overhead, then recover
+  agentWatchdog = setTimeout(() => {
+    if (useStore.getState().agentBusy) {
+      useStore.setState((s) => ({
+        agentBusy: false,
+        agentThinking: false,
+        liveSteps: s.liveSteps.map((x) => ({ ...x, running: false })),
+      }));
+      useStore.getState().toast("the agent run went silent — composer unlocked", "bad");
+    }
+  }, 8 * 60_000);
+}
+
+function clearAgentWatchdog() {
+  if (agentWatchdog !== null) {
+    clearTimeout(agentWatchdog);
+    agentWatchdog = null;
+  }
+}
 
 function friendlyToolName(tool?: string): string {
   switch (tool) {
@@ -268,15 +296,16 @@ export const useStore = create<Store>((set, get) => ({
       const res = await api.grab(r, linked);
       set((s) => ({ grabState: { ...s.grabState, [key]: "done" } }));
       get().toast(res.detail, "ok");
-      // If this grab was initiated from an episode row and the release matches
-      // that episode (or is its season pack), record it on the show.
-      const link = get().episodeLink;
-      if (link && r.parsed.season === link.ep.season) {
-        const episodeMatch = r.parsed.episode === link.ep.number;
+      // The pre-await snapshot decides the stamping: typing in the search
+      // box mid-grab nulls episodeLink, and the ledger would say "have"
+      // while the episode shows wanted forever. (The backend stamps linked
+      // episodes too now — this is belt and braces.)
+      if (link0 && r.parsed.season === link0.ep.season) {
+        const episodeMatch = r.parsed.episode === link0.ep.number;
         const packMatch = r.parsed.seasonPack;
         if (episodeMatch || packMatch) {
           try {
-            await api.setEpisodeState(link.ep.tvmazeEpId, "grabbed", r.title);
+            await api.setEpisodeState(link0.ep.tvmazeEpId, "grabbed", r.title);
             set({ episodeLink: null });
             void get().loadShows();
           } catch {
@@ -356,7 +385,12 @@ export const useStore = create<Store>((set, get) => ({
   chatLoaded: false,
   loadChat: async () => {
     try {
-      set({ chat: await api.agentHistory(), chatLoaded: true });
+      const rows = await api.agentHistory();
+      // DB ids are small AUTOINCREMENT integers — the local id counter
+      // must start above them or React keys (and the send-rollback
+      // filter) collide with persisted history rows
+      if (rows.length) chatSeq = Math.max(chatSeq, Math.max(...rows.map((r) => r.id)) + 1);
+      set({ chat: rows, chatLoaded: true });
     } catch (e) {
       get().toast(String(e), "bad");
     }
@@ -368,18 +402,22 @@ export const useStore = create<Store>((set, get) => ({
     if (!text.trim() || get().agentBusy) return;
     set({ agentBusy: true, liveSteps: [], agentThinking: true });
     // optimistic: show the user's message instantly
-    const optimisticId = Date.now();
+    const optimisticId = chatSeq++;
     set((s) => ({
       chat: [
         ...s.chat,
-        { id: optimisticId, ts: optimisticId / 1000, role: "user", content: text, toolName: null, toolPayload: null },
+        { id: optimisticId, ts: Date.now() / 1000, role: "user", content: text, toolName: null, toolPayload: null },
       ],
     }));
     try {
       await api.agentSend(text);
+      // the backend spawn owns the run from here; if it ever dies without
+      // a terminal event, the watchdog recovers the composer
+      armAgentWatchdog();
     } catch (e) {
       // roll the phantom message back so the transcript matches what the
       // backend actually stored (a rejected send stored nothing)
+      clearAgentWatchdog();
       set((s) => ({
         chat: s.chat.filter((c) => c.id !== optimisticId),
         liveSteps: [],
@@ -439,11 +477,12 @@ export const useStore = create<Store>((set, get) => ({
             agentThinking: false,
             chat: [
               ...st.chat,
-              { id: Date.now(), ts: Date.now() / 1000, role: "assistant", content: s.payload.text ?? "", toolName: null, toolPayload: null },
+              { id: chatSeq++, ts: Date.now() / 1000, role: "assistant", content: s.payload.text ?? "", toolName: null, toolPayload: null },
             ],
           }));
           break;
         case "error":
+          clearAgentWatchdog();
           set((st) => ({
             agentBusy: false,
             agentThinking: false,
@@ -452,6 +491,7 @@ export const useStore = create<Store>((set, get) => ({
           get().toast(s.payload.message ?? "agent error", "bad");
           break;
         case "done":
+          clearAgentWatchdog();
           set({ agentBusy: false, agentThinking: false });
           void get().loadProposals();
           break;

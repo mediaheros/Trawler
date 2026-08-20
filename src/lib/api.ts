@@ -591,6 +591,9 @@ const mockReleases: Release[] = [
   mk("Dune.Part.Two.2024.2160p.UHD.BluRay.REMUX.DV.HDR10.TrueHD.Atmos.7.1-FraMeSToR", 78.2e9, 267, 45, "TorrentLeech", "movie", { resolution: "2160p", source: "Remux", hdr: "DV", audio: "Atmos", year: 2024, cleanTitle: "Dune Part Two", group: "FraMeSToR" }),
   mk("Dune Part Two (2024) 1080p WEBRip x264 AAC-YTS", 2.1e9, 1834, 210, "YTS", "movie", { resolution: "1080p", source: "WEBRip", codec: "x264", audio: "AAC", year: 2024, cleanTitle: "Dune Part Two", group: "YTS" }, 4, ["1337x", "TorrentGalaxy", "LimeTorrents"]),
 ];
+// exercise the real relevance flow in browser dev: a weak-match row hidden
+// behind "show N weak matches", exactly like the backend marks them
+mockReleases[3].relevant = false;
 
 function mk(title: string, size: number, seeders: number, leechers: number, indexer: string, kind: Release["kind"], p: Partial<ParsedRelease>, dupeCount = 1, alsoOn: string[] = []): Release {
   n += 1;
@@ -792,9 +795,11 @@ async function mock(cmd: string, args?: Record<string, unknown>): Promise<unknow
           (kind === "all" || (kind === "movies" ? r.kind === "movie" : r.kind === "tv")) &&
           r.parsed.cleanTitle.toLowerCase().includes(q.split(" ")[0] ?? ""),
       );
+      // no fallback to the full catalog: an empty result must render the
+      // real "no releases matched" empty state in browser dev too
       return {
-        releases: rel.length ? rel : mockReleases,
-        totalBeforeDedupe: 23,
+        releases: rel,
+        totalBeforeDedupe: rel.length,
         indexers: [
           { id: 1, name: "TorrentLeech", count: 9, ok: true, timedOut: false, elapsedMs: 412 },
           { id: 2, name: "1337x", count: 8, ok: true, timedOut: false, elapsedMs: 630 },

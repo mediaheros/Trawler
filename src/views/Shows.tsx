@@ -13,14 +13,21 @@ import DiscoverView from "../components/DiscoverView";
 type ShowsMode = "library" | "calendar" | "discover";
 
 export default function ShowsView() {
-  const { shows, showsLoaded, loadShows, selectedShow, selectShow, activity, loadActivity } =
-    useStore();
+  // per-field selectors: a whole-store subscription re-renders this tree on
+  // every keystroke and toast (AddShow documents the same trap)
+  const shows = useStore((s) => s.shows);
+  const showsLoaded = useStore((s) => s.showsLoaded);
+  const loadShows = useStore((s) => s.loadShows);
+  const selectedShow = useStore((s) => s.selectedShow);
+  const selectShow = useStore((s) => s.selectShow);
+  const activity = useStore((s) => s.activity);
+  const loadActivity = useStore((s) => s.loadActivity);
+  const toast = useStore((s) => s.toast);
   const [adding, setAdding] = useState(false);
   const [importing, setImporting] = useState(false);
   const [showActivity, setShowActivity] = useState(false);
   const [checking, setChecking] = useState(false);
   const [mode, setMode] = useState<ShowsMode>("library");
-  const toast = useStore((s) => s.toast);
 
   const checkNow = async () => {
     setChecking(true);

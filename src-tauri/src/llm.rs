@@ -75,6 +75,9 @@ pub struct LlmClient {
     http: reqwest::Client,
     pub base_url: String,
     pub model: String,
+    /// monotonic id source for shimmed tool-call ids — unique across the
+    /// whole conversation, not just one response
+    call_seq: std::sync::atomic::AtomicUsize,
 }
 
 impl LlmClient {
@@ -83,7 +86,12 @@ impl LlmClient {
             .timeout(std::time::Duration::from_secs(300))
             .build()
             .expect("llm http client");
-        Self { http, base_url: base_url.trim_end_matches('/').to_string(), model: model.to_string() }
+        Self {
+            http,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            model: model.to_string(),
+            call_seq: std::sync::atomic::AtomicUsize::new(0),
+        }
     }
 
     pub async fn chat(&self, messages: &[ChatMsg], tools: Option<&Value>) -> Result<ChatMsg> {
@@ -122,11 +130,14 @@ impl LlmClient {
             .map(|c| c.message)
             .ok_or_else(|| AppError::Other("agent model returned no choices".into()))?;
         // Ollama's shim sometimes omits tool-call ids; give each a unique one
-        // so parallel calls can't collide when results are matched back
+        // so parallel calls can't collide when results are matched back —
+        // unique across ALL responses in the conversation, since strict
+        // OpenAI-compatible backends match results by id
         if let Some(calls) = msg.tool_calls.as_mut() {
-            for (i, call) in calls.iter_mut().enumerate() {
+            for call in calls.iter_mut() {
                 if call.id.is_empty() {
-                    call.id = format!("call_{i}");
+                    let n = self.call_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    call.id = format!("call_{n}");
                 }
             }
         }

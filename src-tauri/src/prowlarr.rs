@@ -114,7 +114,14 @@ impl<'a> ProwlarrClient<'a> {
         for i in indexer_ids {
             req = req.query(&[("indexerIds", i.to_string())]);
         }
-        let resp = req.send().await?;
+        let resp = req
+            // the shared client's 60s ceiling is right for API calls, but a
+            // search fans out to every enabled indexer — slow ones routinely
+            // push the aggregate past it while Prowlarr still returns
+            // partial results worth having
+            .timeout(std::time::Duration::from_secs(120))
+            .send()
+            .await?;
         Ok(Self::check(resp).await?.json().await?)
     }
 
