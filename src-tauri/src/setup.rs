@@ -648,6 +648,7 @@ pub async fn install_prowlarr(app: &AppHandle) -> Result<String> {
 #[cfg(windows)]
 pub fn excluded_port_ranges() -> Vec<(u16, u16)> {
     let mut out = vec![];
+    let mut any_ok = false;
     for proto in ["udp", "tcp"] {
         let mut cmd = std::process::Command::new("netsh");
         cmd.args(["interface", "ipv4", "show", "excludedportrange", &format!("protocol={proto}")]);
@@ -656,6 +657,9 @@ pub fn excluded_port_ranges() -> Vec<(u16, u16)> {
             cmd.creation_flags(0x0800_0000);
         }
         if let Ok(o) = cmd.output() {
+            if o.status.success() {
+                any_ok = true;
+            }
             for line in String::from_utf8_lossy(&o.stdout).lines() {
                 let nums: Vec<u16> = line
                     .split_whitespace()
@@ -667,6 +671,11 @@ pub fn excluded_port_ranges() -> Vec<(u16, u16)> {
             }
         }
     }
+    // this function exists to PREVENT fail-open — an empty answer from a
+    // working netsh is plausible, but a failed netsh must be loud
+    if !any_ok {
+        crate::applog::warn("setup", "couldn't read Windows' reserved port ranges — falling back to bind-probing only");
+    }
     out
 }
 
@@ -675,19 +684,27 @@ pub fn excluded_port_ranges() -> Vec<(u16, u16)> {
     vec![]
 }
 
-/// A listen port that is actually bindable: outside every reserved range,
-/// out of the ephemeral zone, deterministic-ish per machine.
+/// A listen port that is actually bindable: outside every reserved range AND
+/// proven by binding both TCP and UDP on it — the direct test catches the
+/// WSAEACCES reservations netsh describes plus plain port-in-use, on every
+/// platform. Blocking (netsh + socket binds): call via spawn_blocking.
 pub fn pick_safe_listen_port() -> u16 {
     let excluded = excluded_port_ranges();
-    let ok = |p: u16| !excluded.iter().any(|(a, b)| p >= *a && p <= *b);
-    // spread candidates across the classic BT range and below the ephemeral
-    // zone where winnat reservations cluster
+    let outside_reserved = |p: u16| !excluded.iter().any(|(a, b)| p >= *a && p <= *b);
+    let bindable = |p: u16| {
+        std::net::TcpListener::bind(("0.0.0.0", p)).is_ok()
+            && std::net::UdpSocket::bind(("0.0.0.0", p)).is_ok()
+    };
     let mut seed = [0u8; 2];
-    let _ = getrandom::getrandom(&mut seed);
+    if getrandom::getrandom(&mut seed).is_err() {
+        // never let all machines collapse onto one port
+        let t = crate::db::now() as u16;
+        seed = t.to_le_bytes();
+    }
     let base = 20000 + (u16::from_le_bytes(seed) % 20000);
     for offset in 0..2000u16 {
         let p = 20000 + ((base - 20000 + offset * 7) % 20000);
-        if ok(p) {
+        if outside_reserved(p) && bindable(p) {
             return p;
         }
     }
@@ -700,12 +717,25 @@ pub fn qbt_log_tail(lines: usize) -> Option<String> {
     #[cfg(windows)]
     let path = dirs::data_local_dir()?.join("qBittorrent").join("logs").join("qbittorrent.log");
     #[cfg(target_os = "macos")]
-    let path = dirs::home_dir()?
-        .join("Library/Application Support/qBittorrent/logs/qbittorrent.log");
+    let path = {
+        // settings live in ~/.config (verified against 5.2.3) — probe both
+        // plausible log homes rather than asserting one
+        let h = dirs::home_dir()?;
+        let a = h.join(".config/qBittorrent/logs/qbittorrent.log");
+        let b = h.join("Library/Application Support/qBittorrent/logs/qbittorrent.log");
+        if a.exists() { a } else { b }
+    };
     #[cfg(all(not(windows), not(target_os = "macos")))]
     let path = dirs::data_local_dir()?.join("qBittorrent").join("logs").join("qbittorrent.log");
-    let text = std::fs::read_to_string(path).ok()?;
-    let all: Vec<&str> = text.lines().collect();
+    // qBt's log grows to megabytes — read only the final chunk
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(&path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let start_at = len.saturating_sub(64 * 1024);
+    let _ = f.seek(SeekFrom::Start(start_at));
+    let mut buf = String::new();
+    let _ = f.read_to_string(&mut buf);
+    let all: Vec<&str> = buf.lines().collect();
     let start = all.len().saturating_sub(lines);
     Some(all[start..].join("\n"))
 }
@@ -1095,12 +1125,6 @@ pub fn ensure_qbt_ini_port(ini: &str, credentials: Option<(&str, &str)>, fresh: 
         (r"WebUI\Port".into(), port.to_string()),
         (r"WebUI\LocalHostAuth".into(), "false".into()),
     ];
-    if fresh {
-        // fresh install: pick a BitTorrent listen port that dodges Windows'
-        // reserved ranges — a random port inside one means a silently dead
-        // session and "0 seeds on everything"
-        wanted.push((r"BitTorrent\Session\Port".into(), pick_safe_listen_port().to_string()));
-    }
     // never clobber a password the user already has
     if !ini.contains(r"WebUI\Password_PBKDF2") {
         if let Some((user, blob)) = credentials {

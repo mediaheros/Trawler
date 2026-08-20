@@ -146,6 +146,22 @@ impl<'a> QbitClient<'a> {
         unreachable!()
     }
 
+    /// Current preferences (listen_port etc.), authed.
+    pub async fn preferences(&self) -> Result<serde_json::Value> {
+        Ok(self.get_authed("/api/v2/app/preferences", &[]).await?.json().await?)
+    }
+
+    /// Set preferences through the authed path — Referer/CSRF, login retry,
+    /// and real error bodies, none of which a raw reqwest POST carries.
+    pub async fn set_preferences(&self, prefs: &serde_json::Value) -> Result<()> {
+        self.post_authed(
+            "/api/v2/app/setPreferences",
+            &[("json", prefs.to_string())],
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Raw maindata (server_state carries connection/DHT health).
     pub async fn sync_maindata(&self) -> Result<serde_json::Value> {
         Ok(self

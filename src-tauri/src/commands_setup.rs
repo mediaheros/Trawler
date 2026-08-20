@@ -58,6 +58,27 @@ pub async fn setup_configure_qbit(state: State<'_, AppState>) -> Result<()> {
     for _ in 0..30 {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         if q.version().await.is_ok() {
+            // dodge Windows' reserved port ranges while we're here: qBt's own
+            // random choice can land inside one (silent WSAEACCES, 0 seeds
+            // forever — seen live). Setting it via the API lets qBittorrent
+            // persist it into the right place on every platform.
+            let cur = q
+                .preferences()
+                .await
+                .ok()
+                .and_then(|p| p.get("listen_port").and_then(|v| v.as_u64()))
+                .unwrap_or(0) as u16;
+            let reserved = tokio::task::spawn_blocking(crate::setup::excluded_port_ranges)
+                .await
+                .unwrap_or_default();
+            if cur == 0 || reserved.iter().any(|(a, b)| cur >= *a && cur <= *b) {
+                let port = tokio::task::spawn_blocking(crate::setup::pick_safe_listen_port)
+                    .await
+                    .unwrap_or(28645);
+                if q.set_preferences(&serde_json::json!({ "listen_port": port })).await.is_ok() {
+                    crate::applog::info("setup", format!("qbit: listen port {cur} was unusable — set to {port}"));
+                }
+            }
             return Ok(());
         }
     }

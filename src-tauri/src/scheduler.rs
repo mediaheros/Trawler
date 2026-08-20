@@ -256,7 +256,7 @@ async fn execute_plan(app: &tauri::AppHandle, state: &AppState, plan: &PlannedGr
                 plan.title.chars().take(70).collect::<String>(),
             );
             db::log_activity(&conn, "grab", Some(plan.show_id), &msg);
-            crate::applog::info("scheduler",format!("{msg}"));
+            crate::applog::info("scheduler", msg.clone());
             if cfg.notify_on_grab {
                 use tauri_plugin_notification::NotificationExt;
                 let _ = app.notification().builder().title("Trawler grabbed").body(&what).show();
@@ -277,7 +277,7 @@ async fn execute_plan(app: &tauri::AppHandle, state: &AppState, plan: &PlannedGr
         Err(e) => {
             let msg = format!("Failed to grab {} S{:02}: {e}", plan.show_name, plan.season);
             db::log_activity(&conn, "error", Some(plan.show_id), &msg);
-            crate::applog::info("scheduler",format!("{msg}"));
+            crate::applog::error("scheduler", msg.clone());
             false
         }
     }
@@ -465,7 +465,7 @@ async fn medic_pass(app: &tauri::AppHandle, state: &AppState, dead: Vec<DeadGrab
                     ctx.grabbed_titles.first().cloned().unwrap_or_default()
                 );
                 db::log_activity(&conn, "agent", None, &msg);
-                crate::applog::info("scheduler",format!("{msg}"));
+                crate::applog::info("scheduler", msg.clone());
                 if cfg.notify_on_grab {
                     use tauri_plugin_notification::NotificationExt;
                     let _ = app
@@ -544,42 +544,73 @@ async fn completion_pass(app: &tauri::AppHandle, state: &AppState) -> Vec<DeadGr
         Ok(t) => t,
         Err(_) => return vec![],
     };
-    // swarm doctor: a session that reports "disconnected" has no working
-    // sockets at all — on Windows the classic cause is the listen port
-    // landing in a reserved range (WSAEACCES on every bind). Detect it and
-    // fix it by moving the port, instead of letting every torrent sit at
-    // "0 seeds" until someone SSHes in with a debugger.
+    // Swarm doctor: only when the session is disconnected AND the current
+    // listen port is provably inside a Windows-reserved range — that's a
+    // diagnosis, not a guess. Rate-limited hard: a laptop that's merely
+    // offline must never get its port churned or its activity feed spammed.
     if let Ok(md) = q.sync_maindata().await {
         let status = md
             .pointer("/server_state/connection_status")
             .and_then(|v| v.as_str())
             .unwrap_or("");
         if status == "disconnected" {
-            let new_port = crate::setup::pick_safe_listen_port();
-            let body = format!("{{\"listen_port\": {new_port}}}");
-            let moved = state
-                .http
-                .post(format!("{}/api/v2/app/setPreferences", cfg.qbit_url.trim_end_matches('/')))
-                .form(&[("json", body)])
-                .send()
+            let now = db::now();
+            let (streak, last_move, attempts) = {
+                let conn = state.db.lock().await;
+                let streak: i64 = db::meta_get(&conn, "doctor_disc_streak")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0)
+                    + 1;
+                db::meta_set(&conn, "doctor_disc_streak", &streak.to_string());
+                (
+                    streak,
+                    db::meta_get(&conn, "doctor_last_move").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0),
+                    db::meta_get(&conn, "doctor_attempts").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0),
+                )
+            };
+            let cur_port = q
+                .preferences()
                 .await
-                .map(|r| r.status().is_success())
-                .unwrap_or(false);
-            if moved {
+                .ok()
+                .and_then(|p| p.get("listen_port").and_then(|v| v.as_u64()))
+                .unwrap_or(0) as u16;
+            let reserved = tokio::task::spawn_blocking(crate::setup::excluded_port_ranges)
+                .await
+                .unwrap_or_default();
+            let port_is_the_problem =
+                cur_port > 0 && reserved.iter().any(|(a, b)| cur_port >= *a && cur_port <= *b);
+            if port_is_the_problem && streak >= 2 && now - last_move > 6 * 3600 && attempts < 3 {
+                let new_port = tokio::task::spawn_blocking(crate::setup::pick_safe_listen_port)
+                    .await
+                    .unwrap_or(28645);
+                match q.set_preferences(&serde_json::json!({ "listen_port": new_port })).await {
+                    Ok(()) => {
+                        crate::applog::warn(
+                            "qbit",
+                            format!("listen port {cur_port} sits in a Windows-reserved range — moved to {new_port}"),
+                        );
+                        let conn = state.db.lock().await;
+                        db::meta_set(&conn, "doctor_last_move", &now.to_string());
+                        db::meta_set(&conn, "doctor_attempts", &(attempts + 1).to_string());
+                        db::log_activity(
+                            &conn,
+                            "system",
+                            None,
+                            &format!("qBittorrent's network port {cur_port} was blocked by Windows — Trawler moved it to {new_port}"),
+                        );
+                    }
+                    Err(e) => crate::applog::error("qbit", format!("port move failed: {e}")),
+                }
+            } else if !port_is_the_problem && streak == 2 {
+                // say it once per outage, not per cycle
                 crate::applog::warn(
                     "qbit",
-                    format!("session was disconnected (no working sockets) — moved the listen port to {new_port}"),
+                    "session is disconnected but the listen port looks fine — likely offline/VPN; not touching anything",
                 );
-                let conn = state.db.lock().await;
-                db::log_activity(
-                    &conn,
-                    "system",
-                    None,
-                    &format!("qBittorrent couldn't open its network port — Trawler moved it to {new_port} and the session should recover"),
-                );
-            } else {
-                crate::applog::error("qbit", "session is disconnected and the port move failed — check Settings → Logs");
             }
+        } else {
+            let conn = state.db.lock().await;
+            db::meta_set(&conn, "doctor_disc_streak", "0");
         }
     }
     let mut done: std::collections::HashSet<String> = torrents
@@ -854,7 +885,7 @@ async fn run_cycle_inner(app: &tauri::AppHandle, state: &AppState) -> Result<usi
         }
     };
     if !disk_ok {
-        crate::applog::info("scheduler",format!("free disk below the floor — no grabs this cycle"));
+        crate::applog::warn("scheduler", "free disk below the floor — no grabs this cycle");
     }
     crate::applog::info(
         "scheduler",

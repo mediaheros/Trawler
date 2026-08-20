@@ -329,7 +329,7 @@ pub async fn perform_search(
                     releases,
                 ),
                 Ok(Err(e)) => {
-                    crate::applog::warn("app",format!("indexer {} failed: {e}", idx.name));
+                    crate::applog::warn("prowlarr", format!("indexer {} failed: {e}", idx.name));
                     (
                         IndexerOutcome {
                             id: idx.id,
@@ -375,7 +375,6 @@ pub async fn perform_search(
     }
 
     let total = raw.len();
-    crate::applog::info("app",format!("search {query:?} kind={kind} -> {total} raw results"));
 
     // Fold duplicates, keeping the copy with the most seeders as the face of the group.
     let mut groups: HashMap<String, EnrichedRelease> = HashMap::new();
@@ -951,13 +950,37 @@ pub async fn logs_support_bundle(state: State<'_, AppState>) -> Result<String> {
         }
         Err(e) => out.push_str(&format!("qBittorrent: unreachable ({e})\n")),
     }
+    // the single most useful datum from the saga that motivated all this:
+    // the listen port, and whether Windows has quietly reserved it
+    if let Ok(p) = q.preferences().await {
+        let port = p.get("listen_port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+        let reserved = tokio::task::spawn_blocking(crate::setup::excluded_port_ranges)
+            .await
+            .unwrap_or_default();
+        let blocked = reserved.iter().any(|(a, b)| port >= *a && port <= *b);
+        out.push_str(&format!(
+            "listen_port: {port}{}\n",
+            if blocked { " ← INSIDE a Windows-reserved range (this is your problem)" } else { "" }
+        ));
+    }
+    let fmt_ts = |ts: i64| {
+        chrono::DateTime::from_timestamp(ts, 0)
+            .map(|d| d.format("%H:%M:%S").to_string())
+            .unwrap_or_else(|| ts.to_string())
+    };
+    let all = crate::applog::recent();
+    let start = all.len().saturating_sub(400);
     out.push_str("\n--- Trawler log ---\n");
-    for e in crate::applog::recent() {
-        out.push_str(&format!("{} [{}] {}: {}\n", e.ts, e.level, e.area, e.message));
+    if start > 0 {
+        out.push_str(&format!("… {start} earlier entries trimmed …\n"));
+    }
+    for e in &all[start..] {
+        out.push_str(&format!("{} [{}] {}: {}\n", fmt_ts(e.ts), e.level, e.area, e.message));
     }
     if let Some(tail) = crate::setup::qbt_log_tail(60) {
-        out.push_str("\n--- qBittorrent log (last 60 lines) ---\n");
-        out.push_str(&tail);
+        // qBt logs tracker announce URLs — passkeys ride in those. Scrub.
+        out.push_str("\n--- qBittorrent log (last 60 lines, scrubbed) ---\n");
+        out.push_str(&crate::applog::scrub(&tail));
     }
     Ok(out)
 }
