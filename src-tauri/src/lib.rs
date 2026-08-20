@@ -39,6 +39,8 @@ pub struct AppState {
     pub rss_busy: AtomicBool,
     /// one upgrade-scout pass at a time
     pub scout_busy: AtomicBool,
+    /// one FlareSolverr install/setup at a time
+    pub flaresolverr_busy: AtomicBool,
     /// (fetched_at, payload) for the discovery rows
     pub discover_cache: Mutex<Option<(i64, serde_json::Value)>>,
 }
@@ -63,6 +65,7 @@ pub fn run() {
         brief_tick_busy: AtomicBool::new(false),
         rss_busy: AtomicBool::new(false),
         scout_busy: AtomicBool::new(false),
+        flaresolverr_busy: AtomicBool::new(false),
         discover_cache: Mutex::new(None),
     };
 
@@ -98,6 +101,13 @@ pub fn run() {
                     if !up {
                         let _ = setup::start_managed_prowlarr();
                     }
+                }
+                // FlareSolverr is opt-in; but once opted in, it should come
+                // back after a reboot without the user thinking about it
+                if setup::managed_flaresolverr_exe().exists()
+                    && !setup::flaresolverr_running(&state).await
+                {
+                    let _ = setup::start_flaresolverr();
                 }
             });
             let handle = app.handle().clone();
@@ -186,6 +196,9 @@ pub fn run() {
             commands_setup::setup_install_qbit,
             commands_setup::setup_configure_qbit,
             commands_setup::setup_starter_indexers,
+            commands_setup::flaresolverr_status,
+            commands_setup::setup_flaresolverr,
+            commands_setup::disable_flaresolverr,
             commands_setup::setup_save_prowlarr_key,
             commands_setup::setup_finish,
             commands_setup::rss_sweep_now,

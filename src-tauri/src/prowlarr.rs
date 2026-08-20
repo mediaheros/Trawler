@@ -173,6 +173,163 @@ impl<'a> ProwlarrClient<'a> {
         Ok(())
     }
 
+    /// All tags known to Prowlarr.
+    pub async fn tags(&self) -> Result<Vec<serde_json::Value>> {
+        let resp = self
+            .http
+            .get(format!("{}/api/v1/tag", self.base))
+            .header("X-Api-Key", &self.api_key)
+            .send()
+            .await?;
+        Ok(Self::check(resp).await?.json().await?)
+    }
+
+    /// Find a tag by label or create it; returns its id.
+    pub async fn ensure_tag(&self, label: &str) -> Result<i64> {
+        let tags = self.tags().await?;
+        if let Some(id) = tags
+            .iter()
+            .find(|t| t.get("label").and_then(|v| v.as_str()) == Some(label))
+            .and_then(|t| t.get("id").and_then(|v| v.as_i64()))
+        {
+            return Ok(id);
+        }
+        let resp = self
+            .http
+            .post(format!("{}/api/v1/tag", self.base))
+            .header("X-Api-Key", &self.api_key)
+            .json(&serde_json::json!({ "label": label }))
+            .send()
+            .await?;
+        let created: serde_json::Value = Self::check(resp).await?.json().await?;
+        created
+            .get("id")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| AppError::Other("Prowlarr returned a tag without an id".into()))
+    }
+
+    /// Indexer proxies configured in Prowlarr.
+    pub async fn indexer_proxies(&self) -> Result<Vec<serde_json::Value>> {
+        let resp = self
+            .http
+            .get(format!("{}/api/v1/indexerproxy", self.base))
+            .header("X-Api-Key", &self.api_key)
+            .send()
+            .await?;
+        Ok(Self::check(resp).await?.json().await?)
+    }
+
+    /// Is any FlareSolverr proxy registered (ours or the user's own)?
+    pub async fn flaresolverr_proxy_exists(&self) -> Result<bool> {
+        Ok(self
+            .indexer_proxies()
+            .await?
+            .iter()
+            .any(|p| p.get("implementation").and_then(|v| v.as_str()) == Some("FlareSolverr")))
+    }
+
+    /// Register FlareSolverr as an indexer proxy, applied to indexers carrying
+    /// tag_id. If the user already has their own FlareSolverr proxy, merge our
+    /// tag into it instead of leaving a tag that matches nothing.
+    pub async fn ensure_flaresolverr_proxy(&self, tag_id: i64) -> Result<()> {
+        let existing = self.indexer_proxies().await?;
+        if let Some(p) = existing
+            .iter()
+            .find(|p| p.get("implementation").and_then(|v| v.as_str()) == Some("FlareSolverr"))
+        {
+            let mut p = p.clone();
+            let mut tags: Vec<i64> = p
+                .get("tags")
+                .and_then(|t| t.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
+                .unwrap_or_default();
+            if tags.contains(&tag_id) {
+                return Ok(());
+            }
+            tags.push(tag_id);
+            p["tags"] = serde_json::json!(tags);
+            let id = p.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+            let resp = self
+                .http
+                .put(format!("{}/api/v1/indexerproxy/{id}", self.base))
+                .header("X-Api-Key", &self.api_key)
+                .json(&p)
+                .send()
+                .await?;
+            Self::check(resp).await?;
+            return Ok(());
+        }
+        let resp = self
+            .http
+            .get(format!("{}/api/v1/indexerproxy/schema", self.base))
+            .header("X-Api-Key", &self.api_key)
+            .send()
+            .await?;
+        let schema: Vec<serde_json::Value> = Self::check(resp).await?.json().await?;
+        let mut def = schema
+            .into_iter()
+            .find(|d| d.get("implementation").and_then(|v| v.as_str()) == Some("FlareSolverr"))
+            .ok_or_else(|| AppError::Other("this Prowlarr doesn't offer a FlareSolverr proxy".into()))?;
+        def["name"] = serde_json::Value::from("FlareSolverr (Trawler)");
+        def["tags"] = serde_json::json!([tag_id]);
+        // pin the host: FlareSolverr binds IPv4, and "localhost" can resolve
+        // to ::1 first on some machines — don't trust the schema default
+        if let Some(fields) = def.get_mut("fields").and_then(|f| f.as_array_mut()) {
+            for f in fields {
+                match f.get("name").and_then(|n| n.as_str()) {
+                    Some("host") => f["value"] = serde_json::Value::from("http://127.0.0.1:8191/"),
+                    Some("requestTimeout") => f["value"] = serde_json::Value::from(60),
+                    _ => {}
+                }
+            }
+        }
+        let resp = self
+            .http
+            .post(format!("{}/api/v1/indexerproxy", self.base))
+            .header("X-Api-Key", &self.api_key)
+            .json(&def)
+            .send()
+            .await?;
+        Self::check(resp)
+            .await
+            .map_err(|e| AppError::Other(format!("couldn't register FlareSolverr in Prowlarr: {e}")))?;
+        Ok(())
+    }
+
+    /// Undo the unlock: delete our proxy and the flaresolverr tag (Prowlarr
+    /// clears the tag off indexers itself). The user's own proxies are kept.
+    pub async fn remove_flaresolverr(&self) -> Result<()> {
+        for p in self.indexer_proxies().await? {
+            if p.get("implementation").and_then(|v| v.as_str()) == Some("FlareSolverr")
+                && p.get("name").and_then(|v| v.as_str()) == Some("FlareSolverr (Trawler)")
+            {
+                if let Some(id) = p.get("id").and_then(|v| v.as_i64()) {
+                    let resp = self
+                        .http
+                        .delete(format!("{}/api/v1/indexerproxy/{id}", self.base))
+                        .header("X-Api-Key", &self.api_key)
+                        .send()
+                        .await?;
+                    Self::check(resp).await?;
+                }
+            }
+        }
+        for t in self.tags().await? {
+            if t.get("label").and_then(|v| v.as_str()) == Some("flaresolverr") {
+                if let Some(id) = t.get("id").and_then(|v| v.as_i64()) {
+                    let resp = self
+                        .http
+                        .delete(format!("{}/api/v1/tag/{id}", self.base))
+                        .header("X-Api-Key", &self.api_key)
+                        .send()
+                        .await?;
+                    Self::check(resp).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Fetch .torrent bytes through Prowlarr's proxy (keeps passkeys server-side).
     pub async fn fetch_torrent(&self, download_url: &str) -> Result<(Vec<u8>, Option<String>)> {
         // the download_url comes from indexer data — only hand Prowlarr's API

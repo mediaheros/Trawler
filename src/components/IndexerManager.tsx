@@ -1,12 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { ChevronDown, Loader2, Plus, RefreshCw, Trash2 } from "lucide-react";
-import { api, type Indexer, type IndexerDef } from "../lib/api";
+import { ChevronDown, Loader2, Plus, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
+import { api, onSetupStep, type FlaresolverrStatus, type Indexer, type IndexerDef } from "../lib/api";
 import { useStore } from "../store";
 import { Badge, Button, IconBtn, TextInput, cx } from "./ui";
 
 /** Verified against Prowlarr's catalog this session — healthy public defs. */
 const CURATED = [
-  "ExtraTorrent.st",
   "TorrentDownloads",
   "Torrent[CORE]",
   "TorrentsCSV",
@@ -63,7 +62,9 @@ export default function IndexerManager() {
     } catch (e) {
       const msg = String(e);
       toast(
-        msg.includes("CloudFlare") ? `${name} is Cloudflare-protected — needs FlareSolverr (not set up yet)` : msg,
+        msg.toLowerCase().includes("cloudflare")
+          ? `${name} is Cloudflare-protected — use the unlock card below to make it work`
+          : msg,
         "bad",
       );
     } finally {
@@ -177,10 +178,9 @@ export default function IndexerManager() {
             );
           })}
         </div>
-        <div className="mt-1.5 text-[11px] text-faint">
-          1337x and EZTV sit behind Cloudflare and need FlareSolverr — ask the agent to help set it up.
-        </div>
       </div>
+
+      <FlaresolverrCard onUnlocked={() => void load()} />
 
       {/* browse all */}
       <button
@@ -225,6 +225,119 @@ export default function IndexerManager() {
                 </div>
               ))
             )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Opt-in Cloudflare unlock. The stack never needs this to run — it only
+ *  adds 1337x/EZTV/ExtraTorrent for users who ask, via a managed FlareSolverr. */
+function FlaresolverrCard({ onUnlocked }: { onUnlocked: () => void }) {
+  const toast = useStore((st) => st.toast);
+  const [status, setStatus] = useState<FlaresolverrStatus | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [log, setLog] = useState<string | null>(null);
+  const [pct, setPct] = useState<number | null>(null);
+  const [confirmOff, setConfirmOff] = useState(false);
+
+  useEffect(() => {
+    void api.flaresolverrStatus().then(setStatus).catch(() => setStatus(null));
+  }, []);
+
+  // subscribe once on mount — Tauri's listen() registration is async, so a
+  // busy-keyed subscription misses the first "Finding the latest release…"
+  useEffect(() => {
+    return onSetupStep((step) => {
+      if (step.component !== "flaresolverr") return;
+      if (step.kind === "log" && step.payload.message) {
+        setLog(step.payload.message);
+        setPct(null);
+      }
+      if (step.kind === "progress" && step.payload.pct !== undefined) setPct(step.payload.pct);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const unlock = async () => {
+    setBusy(true);
+    setLog("Starting…");
+    setPct(null);
+    try {
+      const added = await api.setupFlaresolverr();
+      setStatus({ installed: true, running: true, proxied: true });
+      toast(
+        added.length
+          ? `Cloudflare indexers unlocked: ${added.join(", ")}`
+          : "FlareSolverr is set up — protected indexers will now work",
+        "ok",
+      );
+      onUnlocked();
+    } catch (e) {
+      toast(String(e), "bad");
+      void api.flaresolverrStatus().then(setStatus).catch(() => {});
+    } finally {
+      setBusy(false);
+      setLog(null);
+      setPct(null);
+    }
+  };
+
+  if (status?.proxied) {
+    return (
+      <div className="mt-2 flex items-center gap-1.5 text-[11px] text-faint">
+        <ShieldCheck size={12} className="text-ok" />
+        FlareSolverr is active — Cloudflare-protected indexers (1337x, EZTV…) work here.
+        <button
+          type="button"
+          className="ml-1 cursor-pointer text-faint underline decoration-line2 underline-offset-2 hover:text-bad"
+          onClick={async () => {
+            if (!confirmOff) {
+              setConfirmOff(true);
+              window.setTimeout(() => setConfirmOff(false), 3000);
+              return;
+            }
+            setConfirmOff(false);
+            try {
+              await api.disableFlaresolverr();
+              setStatus({ installed: false, running: false, proxied: false });
+              toast("FlareSolverr removed — protected indexers will stop working", "info");
+            } catch (e) {
+              toast(String(e), "bad");
+            }
+          }}
+        >
+          {confirmOff ? "really turn off?" : "turn off"}
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mt-3 rounded-(--radius-btn) border border-line bg-bg2/40 p-3">
+      <div className="flex items-center gap-2">
+        <ShieldCheck size={14} className="shrink-0 text-dim" />
+        <div className="min-w-0 flex-1">
+          <div className="text-[12px] font-medium">Some indexers sit behind Cloudflare</div>
+          <div className="text-[11px] leading-snug text-faint">
+            1337x, EZTV and friends block server requests. Optional fix: Trawler can run
+            FlareSolverr for you (~350 MB download — it bundles a browser) and route
+            protected indexers through it. Everything else works fine without this.
+          </div>
+        </div>
+        <Button onClick={() => void unlock()} busy={busy} className="shrink-0 px-2.5 py-1.5 text-[11.5px]">
+          {status?.installed ? "Finish setup" : "Unlock them"}
+        </Button>
+      </div>
+      {busy && (
+        <div className="mt-2">
+          <div className="text-[11px] text-dim">{pct !== null ? `${log ?? "Downloading…"} ${pct}%` : log}</div>
+          <div className="mt-1 h-[3px] overflow-hidden rounded-full bg-bg3">
+            <div
+              className={pct === null ? "progress-indeterminate h-full rounded-full bg-accent" : "h-full rounded-full bg-accent transition-[width] duration-300"}
+              style={pct === null ? undefined : { width: `${pct}%` }}
+            />
           </div>
         </div>
       )}

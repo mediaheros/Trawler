@@ -131,6 +131,171 @@ pub async fn setup_starter_indexers(state: State<'_, AppState>) -> Result<Vec<St
     Ok(added)
 }
 
+/// Cloudflare-protected indexers the unlock flow adds once FlareSolverr is
+/// live. Best-effort: Cloudflare's strictness fluctuates per site, so a name
+/// failing today is kept for the retry path rather than treated as fatal.
+const CF_STARTERS: &[&str] = &["1337x", "EZTV", "ExtraTorrent.st"];
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FlaresolverrStatus {
+    pub installed: bool,
+    pub running: bool,
+    pub proxied: bool,
+}
+
+#[tauri::command]
+pub async fn flaresolverr_status(state: State<'_, AppState>) -> Result<FlaresolverrStatus> {
+    let installed = setup::managed_flaresolverr_exe().exists();
+    let running = setup::flaresolverr_running(&state).await;
+    let proxied = if running {
+        let cfg = state.config.read().await.clone();
+        match crate::commands::prowlarr_pub(&state.http, &cfg) {
+            Ok(client) => client.flaresolverr_proxy_exists().await.unwrap_or(false),
+            Err(_) => false,
+        }
+    } else {
+        false
+    };
+    Ok(FlaresolverrStatus { installed, running, proxied })
+}
+
+/// The whole opt-in unlock: install FlareSolverr if needed, start it, register
+/// it in Prowlarr behind a "flaresolverr" tag, and add (or tag) the
+/// Cloudflare-locked starter indexers. Returns the names newly unlocked.
+#[tauri::command]
+pub async fn setup_flaresolverr(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<Vec<String>> {
+    use std::sync::atomic::Ordering;
+    if state.flaresolverr_busy.swap(true, Ordering::SeqCst) {
+        return Err(AppError::Other("FlareSolverr setup is already running".into()));
+    }
+    struct Busy<'a>(&'a std::sync::atomic::AtomicBool);
+    impl Drop for Busy<'_> {
+        fn drop(&mut self) {
+            self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let _busy = Busy(&state.flaresolverr_busy);
+
+    // Prowlarr must be reachable BEFORE we make anyone sit through 350 MB
+    let cfg = state.config.read().await.clone();
+    let client = crate::commands::prowlarr_pub(&state.http, &cfg)?;
+    client.ping().await.map_err(|e| {
+        AppError::Other(format!("Prowlarr isn't reachable, and the unlock needs it: {e}"))
+    })?;
+
+    // someone already running FlareSolverr (Docker, their own copy) skips the
+    // download entirely — :8191 answering with the real greeting is enough
+    if !setup::flaresolverr_running(&state).await {
+        if setup::managed_flaresolverr_exe().exists() {
+            let started = setup::start_flaresolverr().is_ok()
+                && setup::wait_for_flaresolverr(&state, 30).await;
+            if !started {
+                // wedged install (half-extracted, wrong arch, …) — replace it
+                setup::install_flaresolverr(&app).await?;
+            }
+        } else {
+            setup::install_flaresolverr(&app).await?;
+        }
+    }
+
+    let tag_id = client.ensure_tag("flaresolverr").await?;
+    client.ensure_flaresolverr_proxy(tag_id).await?;
+
+    // add the Cloudflare-locked starters — and TAG the ones already present,
+    // whether they came from an earlier run or the user's own Prowlarr
+    let installed_list = client.indexers().await?;
+    let defs = client.schema().await?;
+    let mut added = vec![];
+    let mut already = 0usize;
+    let mut last_err: Option<AppError> = None;
+    for name in CF_STARTERS {
+        if let Some(existing) = installed_list.iter().find(|i| i.name == *name) {
+            already += 1;
+            if let Ok(mut raw) = client.get_indexer_raw(existing.id).await {
+                let mut tags: Vec<i64> = raw
+                    .get("tags")
+                    .and_then(|t| t.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
+                    .unwrap_or_default();
+                if !tags.contains(&tag_id) {
+                    tags.push(tag_id);
+                    raw["tags"] = serde_json::json!(tags);
+                    let _ = client.update_indexer_raw(existing.id, &raw).await;
+                }
+            }
+            continue;
+        }
+        let Some(mut def) = defs
+            .iter()
+            .find(|d| d.get("name").and_then(|v| v.as_str()) == Some(*name))
+            .cloned()
+        else {
+            continue;
+        };
+        def["enable"] = serde_json::Value::Bool(true);
+        def["appProfileId"] = serde_json::Value::from(1);
+        def["tags"] = serde_json::json!([tag_id]);
+        match client.add_indexer_raw(&def).await {
+            Ok(_) => added.push((*name).to_string()),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    if added.is_empty() && already == 0 {
+        if let Some(e) = last_err {
+            return Err(AppError::Other(format!(
+                "FlareSolverr is running, but the protected indexers still refused: {e}"
+            )));
+        }
+    }
+    {
+        let conn = state.db.lock().await;
+        crate::db::log_activity(
+            &conn,
+            "system",
+            None,
+            &if added.is_empty() {
+                "FlareSolverr set up — protected indexers now route through it".to_string()
+            } else {
+                format!("FlareSolverr set up — unlocked {}", added.join(", "))
+            },
+        );
+    }
+    Ok(added)
+}
+
+/// The off-switch: opt-in must be reversible. Stops FlareSolverr, deletes the
+/// managed install, and removes our proxy + tag from Prowlarr (indexers stay).
+#[tauri::command]
+pub async fn disable_flaresolverr(state: State<'_, AppState>) -> Result<()> {
+    let cfg = state.config.read().await.clone();
+    if let Ok(client) = crate::commands::prowlarr_pub(&state.http, &cfg) {
+        let _ = client.remove_flaresolverr().await;
+    }
+    #[cfg(windows)]
+    {
+        let mut kill = std::process::Command::new("taskkill");
+        kill.args(["/IM", "flaresolverr.exe", "/F"]);
+        use std::os::windows::process::CommandExt;
+        kill.creation_flags(0x0800_0000);
+        let _ = kill.output();
+    }
+    let dir = setup::managed_flaresolverr_exe()
+        .parent()
+        .map(std::path::PathBuf::from);
+    if let Some(dir) = dir {
+        // give the process a beat to die before deleting its files
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        std::fs::remove_dir_all(&dir)
+            .map_err(|e| AppError::Other(format!("couldn't remove {}: {e}", dir.display())))?;
+    }
+    {
+        let conn = state.db.lock().await;
+        crate::db::log_activity(&conn, "system", None, "FlareSolverr turned off and removed");
+    }
+    Ok(())
+}
+
 /// Save the Prowlarr API key from the wizard (for people who already run
 /// their own Prowlarr rather than a Trawler-managed one).
 #[tauri::command]

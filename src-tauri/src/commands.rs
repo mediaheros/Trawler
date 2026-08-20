@@ -24,6 +24,14 @@ fn prowlarr<'a>(http: &'a reqwest::Client, cfg: &Config) -> Result<ProwlarrClien
     })
 }
 
+/// The Prowlarr client for other command modules (setup's unlock flow).
+pub(crate) fn prowlarr_pub<'a>(
+    http: &'a reqwest::Client,
+    cfg: &Config,
+) -> Result<crate::prowlarr::ProwlarrClient<'a>> {
+    prowlarr(http, cfg)
+}
+
 fn qbit<'a>(http: &'a reqwest::Client, cfg: &Config) -> QbitClient<'a> {
     QbitClient {
         http,
@@ -751,7 +759,24 @@ pub async fn add_indexer(state: State<'_, AppState>, name: String) -> Result<Str
         .ok_or_else(|| AppError::Other(format!("no definition named {name}")))?;
     def["enable"] = serde_json::Value::Bool(true);
     def["appProfileId"] = serde_json::Value::from(1);
-    let added = client.add_indexer_raw(&def).await?;
+    let added = match client.add_indexer_raw(&def).await {
+        Ok(a) => a,
+        Err(e) if format!("{e}").to_lowercase().contains("cloudflare") => {
+            // Cloudflare wall — retry through FlareSolverr ONLY when the user
+            // actually opted in (managed install present + proxy registered);
+            // adding an indexer must never mutate Prowlarr's global config
+            let opted_in = crate::setup::managed_flaresolverr_exe().exists()
+                && crate::setup::flaresolverr_running(&state).await
+                && client.flaresolverr_proxy_exists().await.unwrap_or(false);
+            if !opted_in {
+                return Err(e);
+            }
+            let tag_id = client.ensure_tag("flaresolverr").await?;
+            def["tags"] = serde_json::json!([tag_id]);
+            client.add_indexer_raw(&def).await?
+        }
+        Err(e) => return Err(e),
+    };
     Ok(added
         .get("name")
         .and_then(|v| v.as_str())

@@ -102,6 +102,12 @@ export interface SetupStatus {
   prowlarrHasIndexers: boolean;
 }
 
+export interface FlaresolverrStatus {
+  installed: boolean;
+  running: boolean;
+  proxied: boolean;
+}
+
 export interface SetupStep {
   component: string;
   kind: "progress" | "log" | "done" | "error";
@@ -447,6 +453,9 @@ export const api = {
   setupInstallQbit: () => call<void>("setup_install_qbit"),
   setupConfigureQbit: () => call<void>("setup_configure_qbit"),
   setupStarterIndexers: () => call<string[]>("setup_starter_indexers"),
+  flaresolverrStatus: () => call<FlaresolverrStatus>("flaresolverr_status"),
+  setupFlaresolverr: () => call<string[]>("setup_flaresolverr"),
+  disableFlaresolverr: () => call<void>("disable_flaresolverr"),
   setupSaveProwlarrKey: (key: string) => call<void>("setup_save_prowlarr_key", { key }),
   setupFinish: () => call<void>("setup_finish"),
   calendarRange: (start: string, end: string) =>
@@ -638,6 +647,7 @@ const mockEpisodes: EpisodeRow[] = Array.from({ length: 19 }, (_, i) => {
 
 const mockChat: ChatRow[] = [];
 
+const mockFs = { done: false };
 const mockSetup: SetupStatus = {
   qbit: "missing",
   prowlarr: "missing",
@@ -914,6 +924,22 @@ async function mock(cmd: string, args?: Record<string, unknown>): Promise<unknow
       return ["YTS", "The Pirate Bay", "LimeTorrents", "Knaben"];
     case "setup_finish":
       return;
+    case "flaresolverr_status":
+      return { installed: mockFs.done, running: mockFs.done, proxied: mockFs.done };
+    case "disable_flaresolverr":
+      mockFs.done = false;
+      return;
+    case "setup_flaresolverr":
+      emitMockSetup({ component: "flaresolverr", kind: "log", payload: { message: "Downloading FlareSolverr (~350 MB — it bundles a browser)…" } });
+      await sleep(900);
+      for (const pct of [20, 45, 70, 95]) {
+        emitMockSetup({ component: "flaresolverr", kind: "progress", payload: { pct } });
+        await sleep(350);
+      }
+      emitMockSetup({ component: "flaresolverr", kind: "log", payload: { message: "Starting FlareSolverr…" } });
+      await sleep(700);
+      mockFs.done = true;
+      return ["1337x", "EZTV", "ExtraTorrent.st"];
     case "calendar_range": {
       const start = new Date(String(args?.start)).getTime();
       const end = new Date(String(args?.end)).getTime();

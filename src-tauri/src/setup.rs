@@ -347,14 +347,18 @@ pub async fn install_prowlarr(app: &AppHandle) -> Result<String> {
     let state: &AppState = state_guard.inner();
 
     emit(app, "prowlarr", "log", json!({ "message": "Finding the latest release…" }));
-    let release: Value = state
+    let api = state
         .http
         .get("https://api.github.com/repos/Prowlarr/Prowlarr/releases/latest")
         .header("User-Agent", "trawler-setup")
         .send()
-        .await?
-        .json()
         .await?;
+    if api.status().as_u16() == 403 {
+        return Err(AppError::Other(
+            "GitHub is rate-limiting release lookups from this network — try again in a few minutes".into(),
+        ));
+    }
+    let release: Value = api.error_for_status()?.json().await?;
     let asset_url = release
         .get("assets")
         .and_then(|a| a.as_array())
@@ -444,6 +448,192 @@ pub async fn install_prowlarr(app: &AppHandle) -> Result<String> {
     }
     emit(app, "prowlarr", "done", json!({ "message": "Prowlarr is running and connected" }));
     Ok(key)
+}
+
+// ---------------- flaresolverr (optional) ----------------
+// FlareSolverr is strictly opt-in: the stack runs fine without it, it only
+// unlocks Cloudflare-protected indexers (1337x, EZTV, …) for users who ask.
+
+pub fn managed_flaresolverr_exe() -> PathBuf {
+    local_app_data().join("TrawlerTools").join("FlareSolverr").join("flaresolverr.exe")
+}
+
+pub async fn flaresolverr_running(state: &AppState) -> bool {
+    // require FlareSolverr's own greeting — "anything 2xx on :8191" would let
+    // an unrelated service masquerade as a working solver
+    let Ok(resp) = state
+        .http
+        .get("http://127.0.0.1:8191/")
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+    else {
+        return false;
+    };
+    if !resp.status().is_success() {
+        return false;
+    }
+    resp.text().await.map(|t| t.contains("FlareSolverr")).unwrap_or(false)
+}
+
+pub fn start_flaresolverr() -> Result<()> {
+    let exe = managed_flaresolverr_exe();
+    if !exe.exists() {
+        return Err(AppError::Other("FlareSolverr isn't installed".into()));
+    }
+    spawn_detached(&exe, &[])
+}
+
+pub async fn wait_for_flaresolverr(state: &AppState, secs: u64) -> bool {
+    for _ in 0..secs {
+        if flaresolverr_running(state).await {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    false
+}
+
+/// Download the latest FlareSolverr (~350 MB — it bundles a browser), extract
+/// it next to managed Prowlarr, and start it. Opt-in only; never part of the
+/// wizard.
+pub async fn install_flaresolverr(app: &AppHandle) -> Result<()> {
+    let state_guard = app.state::<AppState>();
+    let state: &AppState = state_guard.inner();
+
+    emit(app, "flaresolverr", "log", json!({ "message": "Finding the latest release…" }));
+    let api = state
+        .http
+        .get("https://api.github.com/repos/FlareSolverr/FlareSolverr/releases/latest")
+        .header("User-Agent", "trawler-setup")
+        .send()
+        .await?;
+    if api.status().as_u16() == 403 {
+        return Err(AppError::Other(
+            "GitHub is rate-limiting release lookups from this network — try again in a few minutes".into(),
+        ));
+    }
+    let release: Value = api.error_for_status()?.json().await?;
+    let asset_url = release
+        .get("assets")
+        .and_then(|a| a.as_array())
+        .and_then(|assets| {
+            assets.iter().find_map(|a| {
+                let name = a.get("name")?.as_str()?;
+                if name == "flaresolverr_windows_x64.zip" {
+                    a.get("browser_download_url")?.as_str().map(String::from)
+                } else {
+                    None
+                }
+            })
+        })
+        .ok_or_else(|| AppError::Other("could not find a FlareSolverr Windows build".into()))?;
+    // the URL came out of an API response — only fetch a real GitHub asset host
+    if !(asset_url.starts_with("https://github.com/FlareSolverr/")
+        || asset_url.starts_with("https://objects.githubusercontent.com/"))
+    {
+        return Err(AppError::Other("FlareSolverr release URL looked wrong — not downloading it".into()));
+    }
+
+    emit(app, "flaresolverr", "log", json!({ "message": "Downloading FlareSolverr (~350 MB — it bundles a browser)…" }));
+    let resp = state
+        .http
+        .get(&asset_url)
+        .timeout(std::time::Duration::from_secs(3600))
+        .send()
+        .await?
+        .error_for_status()
+        .map_err(|e| AppError::Other(format!("FlareSolverr download failed: {e}")))?;
+    let total = resp.content_length().unwrap_or(0);
+
+    // ~350 MB zip + ~700 MB unpacked: stream to disk, never into RAM
+    let tools = local_app_data().join("TrawlerTools");
+    std::fs::create_dir_all(&tools)?;
+    let zip_path = tools.join("flaresolverr-download.zip");
+    // the 326 MB temp zip must not survive ANY failure path
+    struct TempFile(PathBuf);
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _zip_guard = TempFile(zip_path.clone());
+    let mut downloaded: u64 = 0;
+    {
+        let mut out = std::fs::File::create(&zip_path)?;
+        let mut stream = resp;
+        let mut got: u64 = 0;
+        let mut last_pct = 0u32;
+        while let Some(chunk) = stream.chunk().await? {
+            use std::io::Write;
+            out.write_all(&chunk)?;
+            got += chunk.len() as u64;
+            if total > 0 {
+                let pct = (got * 100 / total) as u32;
+                if pct >= last_pct + 5 {
+                    last_pct = pct;
+                    emit(app, "flaresolverr", "progress", json!({ "pct": pct }));
+                }
+            }
+        }
+        downloaded = got;
+    }
+    if total > 0 && downloaded != total {
+        return Err(AppError::Other(format!(
+            "the download ended early ({downloaded} of {total} bytes) — check the connection and try again"
+        )));
+    }
+
+    emit(app, "flaresolverr", "log", json!({ "message": "Extracting…" }));
+    // extract into a staging dir and rename on success — a half-written
+    // install must never look installed to the status probe or the boot hook
+    let target = tools.join("FlareSolverr");
+    let staging = tools.join("FlareSolverr.new");
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging)?;
+    struct TempDir(PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let staging_guard = TempDir(staging.clone());
+    {
+        let f = std::fs::File::open(&zip_path)?;
+        let mut archive =
+            zip::ZipArchive::new(f).map_err(|e| AppError::Other(format!("bad archive: {e}")))?;
+        // single top-level "flaresolverr/" folder — strip it
+        for i in 0..archive.len() {
+            let mut file = archive
+                .by_index(i)
+                .map_err(|e| AppError::Other(format!("archive read: {e}")))?;
+            let Some(path) = file.enclosed_name() else { continue };
+            let stripped: PathBuf = path.components().skip(1).collect();
+            if stripped.as_os_str().is_empty() {
+                continue;
+            }
+            let out = staging.join(&stripped);
+            if file.is_dir() {
+                std::fs::create_dir_all(&out)?;
+            } else {
+                if let Some(parent) = out.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let mut w = std::fs::File::create(&out)?;
+                std::io::copy(&mut file, &mut w)?;
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&target);
+    std::fs::rename(&staging, &target)?;
+    std::mem::forget(staging_guard);
+
+    emit(app, "flaresolverr", "log", json!({ "message": "Starting FlareSolverr…" }));
+    start_flaresolverr()?;
+    if !wait_for_flaresolverr(state, 60).await {
+        return Err(AppError::Other("FlareSolverr installed but didn't come up on :8191".into()));
+    }
+    Ok(())
 }
 
 // ---------------- qbittorrent ----------------
