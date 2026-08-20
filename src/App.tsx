@@ -15,9 +15,9 @@ import SettingsView from "./views/Settings";
 
 const NAV: Array<{ view: View; icon: typeof Search; label: string }> = [
   { view: "search", icon: Search, label: "Search" },
-  { view: "agent", icon: Sparkles, label: "Agent" },
   { view: "shows", icon: Tv, label: "Shows" },
   { view: "downloads", icon: HardDriveDownload, label: "Downloads" },
+  { view: "agent", icon: Sparkles, label: "Agent" },
   { view: "settings", icon: Settings, label: "Settings" },
 ];
 
@@ -60,11 +60,14 @@ export default function App() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (modHeld(e) && !e.shiftKey && !e.altKey) {
-        if (e.key === "1") setView("search");
-        if (e.key === "2") setView("agent");
-        if (e.key === "3") setView("shows");
-        if (e.key === "4") setView("downloads");
-        if (e.key === "5") setView("settings");
+        // derived from NAV so the shortcut always matches the icon's
+        // position (and its tooltip) — they were hardcoded apart once.
+        // Strict digit test: Number(" ") is 0, and Cmd/Ctrl+Space isn't
+        // a view switch.
+        if (/^[1-9]$/.test(e.key)) {
+          const idx = Number(e.key) - 1;
+          if (idx < NAV.length) setView(NAV[idx].view);
+        }
       }
     };
     window.addEventListener("keydown", onKey);
