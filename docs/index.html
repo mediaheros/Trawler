@@ -1,0 +1,522 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trawler — the media app that hunts for you | mediahero.org</title>
+<meta name="description" content="Trawler searches all your torrent indexers at once through Prowlarr, follows TV shows until they end, and its AI agent grabs what episode-tracking can't name — UFC events, race weekends, anything. Free and open source, for Windows and Linux.">
+<link rel="canonical" href="https://mediahero.org/">
+<link rel="icon" type="image/svg+xml" href="logo.svg">
+<meta name="theme-color" content="#080b11">
+<meta name="robots" content="index, follow, max-image-preview:large">
+<meta property="og:site_name" content="Trawler">
+<meta property="og:title" content="Trawler — the media app that hunts for you">
+<meta property="og:description" content="Search every indexer at once. Follow shows to the end. Let the agent hunt the rest — on your own models.">
+<meta property="og:image" content="https://mediahero.org/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:url" content="https://mediahero.org/">
+<meta property="og:type" content="website">
+<meta property="og:locale" content="en_US">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Trawler — the media app that hunts for you">
+<meta name="twitter:description" content="Search every indexer at once. Follow shows to the end. Let the agent hunt the rest.">
+<meta name="twitter:image" content="https://mediahero.org/og.png">
+<link rel="preload" as="image" href="shots/search-hero.webp">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "Trawler",
+  "url": "https://mediahero.org/",
+  "image": "https://mediahero.org/og.png",
+  "description": "Trawler searches all your torrent indexers at once, follows TV shows until they end, and its AI agent grabs what episode-tracking can't name — running on your own local models.",
+  "operatingSystem": "Windows 10, Windows 11, Linux",
+  "applicationCategory": "MultimediaApplication",
+  "softwareVersion": "0.3.0",
+  "license": "https://github.com/MediaHeroSystems/trawler/blob/main/LICENSE",
+  "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+  "author": { "@type": "Organization", "name": "Hero Media", "url": "https://mediahero.org/" }
+}
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg0: #080b11; --bg1: #0d1119; --bg2: #131926; --bg3: #1a2231;
+    --line: #1e2737; --line2: #2a3549;
+    --ink: #e9eef7; --dim: #97a4ba; --faint: #5c6a81;
+    --accent: #37d4c2; --accent2: #38bdf8; --warn: #f5b950;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    background: var(--bg0);
+    color: var(--ink);
+    font-family: Inter, "Segoe UI", system-ui, sans-serif;
+    letter-spacing: -0.011em;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+  }
+  ::selection { background: rgba(55, 212, 194, 0.3); }
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 0 24px; }
+  /* sections that are themselves .wrap keep their vertical rhythm */
+  section.wrap { padding: 84px 24px; }
+  .mono { font-family: "JetBrains Mono", monospace; }
+
+  /* ambient background */
+  .ambient {
+    position: fixed; inset: 0; z-index: -1; pointer-events: none;
+    background:
+      radial-gradient(1200px 600px at 75% -5%, rgba(18, 33, 48, 0.55) 0%, transparent 60%),
+      radial-gradient(900px 500px at -5% 40%, rgba(14, 38, 58, 0.35) 0%, transparent 55%),
+      radial-gradient(1000px 700px at 50% 115%, rgba(55, 212, 194, 0.07) 0%, transparent 60%);
+  }
+
+  /* nav */
+  nav {
+    position: sticky; top: 0; z-index: 50;
+    backdrop-filter: blur(14px);
+    background: rgba(8, 11, 17, 0.75);
+    border-bottom: 1px solid var(--line);
+  }
+  nav .bar { display: flex; align-items: center; gap: 10px; height: 60px; }
+  nav img { width: 30px; height: 30px; border-radius: 8px; }
+  nav .name { font-weight: 700; font-size: 16px; letter-spacing: -0.02em; }
+  nav .links { margin-left: auto; display: flex; align-items: center; gap: 22px; }
+  nav .links a { color: var(--dim); text-decoration: none; font-size: 13.5px; font-weight: 500; transition: color 0.15s; }
+  nav .links a:hover { color: var(--ink); }
+  nav .links a.btn-primary, nav .links a.btn-primary:hover { color: var(--bg0); }
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px; padding: 10px 20px; border-radius: 12px;
+    font-size: 14px; font-weight: 600; text-decoration: none; transition: all 0.16s ease; cursor: pointer;
+  }
+  .btn-primary { background: var(--accent); color: var(--bg0); box-shadow: 0 0 32px -8px var(--accent); }
+  .btn-primary:hover { filter: brightness(1.1); transform: translateY(-1px); }
+  .btn-ghost { background: var(--bg2); color: var(--ink); border: 1px solid var(--line2); }
+  .btn-ghost:hover { background: var(--bg3); border-color: var(--accent); }
+  nav .btn { padding: 7px 16px; font-size: 13px; }
+
+  /* hero */
+  .hero { padding: 92px 0 40px; text-align: center; position: relative; }
+  .hero .eyebrow {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 5px 14px; border-radius: 999px; border: 1px solid var(--line2);
+    background: var(--bg1); font-size: 12.5px; color: var(--dim); font-weight: 500;
+  }
+  .hero .eyebrow .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+  h1 {
+    margin: 26px auto 0; max-width: 800px;
+    font-size: clamp(40px, 6.4vw, 68px); font-weight: 800; line-height: 1.06; letter-spacing: -0.038em;
+  }
+  h1 .grad {
+    background: linear-gradient(100deg, var(--accent) 10%, var(--accent2) 90%);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .hero .sub {
+    margin: 22px auto 0; max-width: 640px; font-size: clamp(15px, 2vw, 17.5px); color: var(--dim);
+  }
+  .hero .cta { margin-top: 34px; display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+  .hero .meta { margin-top: 16px; font-size: 12px; color: var(--faint); }
+
+  /* framed screenshot */
+  .frame {
+    margin: 56px auto 0; max-width: 1020px; border-radius: 16px; overflow: hidden;
+    border: 1px solid var(--line2);
+    background: var(--bg1);
+    box-shadow:
+      0 0 0 1px rgba(55, 212, 194, 0.08),
+      0 30px 90px -30px rgba(0, 0, 0, 0.85),
+      0 0 120px -40px rgba(55, 212, 194, 0.25);
+  }
+  .frame .chrome {
+    display: flex; align-items: center; gap: 6px; padding: 10px 14px;
+    background: var(--bg2); border-bottom: 1px solid var(--line);
+  }
+  .frame .chrome span { width: 10px; height: 10px; border-radius: 50%; background: var(--bg3); }
+  .frame .chrome span:first-child { background: rgba(244, 118, 110, 0.55); }
+  .frame .chrome span:nth-child(2) { background: rgba(245, 185, 80, 0.55); }
+  .frame .chrome span:nth-child(3) { background: rgba(61, 220, 151, 0.55); }
+  .frame img { display: block; width: 100%; height: auto; }
+
+  /* wave divider */
+  .waves { display: block; width: 100%; height: 70px; margin-top: 40px; opacity: 0.45; }
+
+  /* sections */
+  section { padding: 72px 0; }
+  .kicker {
+    font-size: 12px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase;
+    color: var(--accent); margin-bottom: 12px;
+  }
+  h2 { font-size: clamp(26px, 3.6vw, 36px); font-weight: 750; letter-spacing: -0.03em; line-height: 1.15; }
+  .feature {
+    display: grid; grid-template-columns: 1fr 1.25fr; gap: 56px; align-items: center;
+  }
+  .feature.flip { grid-template-columns: 1.25fr 1fr; }
+  .feature.flip .copy { order: 2; }
+  .feature .copy p { margin-top: 14px; color: var(--dim); font-size: 15px; }
+  .feature .copy ul { margin: 18px 0 0; list-style: none; }
+  .feature .copy li {
+    position: relative; padding-left: 26px; margin-top: 10px; color: var(--dim); font-size: 14px;
+  }
+  .feature .copy li::before {
+    content: ""; position: absolute; left: 0; top: 7px; width: 14px; height: 14px;
+    border-radius: 5px; background: rgba(55, 212, 194, 0.14);
+    box-shadow: inset 0 0 0 1px rgba(55, 212, 194, 0.35);
+  }
+  .feature .copy li::after {
+    content: ""; position: absolute; left: 4px; top: 12px; width: 6px; height: 3px;
+    border-left: 1.6px solid var(--accent); border-bottom: 1.6px solid var(--accent);
+    transform: rotate(-45deg);
+  }
+  .feature .copy li b { color: var(--ink); font-weight: 600; }
+  .shot {
+    border-radius: 14px; overflow: hidden; border: 1px solid var(--line2);
+    box-shadow: 0 24px 70px -28px rgba(0, 0, 0, 0.85), 0 0 80px -40px rgba(55, 212, 194, 0.2);
+  }
+  .shot img { display: block; width: 100%; height: auto; }
+
+  /* rails strip */
+  .rails { border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); background: rgba(13, 17, 25, 0.5); }
+  .rails .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
+  .rail-card {
+    padding: 20px; border-radius: 14px; border: 1px solid var(--line); background: var(--bg1);
+    transition: border-color 0.2s, transform 0.2s;
+  }
+  .rail-card:hover { border-color: var(--line2); transform: translateY(-2px); }
+  .rail-card .t { font-weight: 650; font-size: 14.5px; display: flex; align-items: center; gap: 8px; }
+  .rail-card .t::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+  .rail-card p { margin-top: 7px; font-size: 13px; color: var(--dim); }
+  .rails .note { margin-top: 22px; text-align: center; font-size: 13px; color: var(--faint); }
+
+  /* pipeline */
+  .pipeline { text-align: center; }
+  .pipeline .row { margin-top: 34px; display: flex; align-items: center; justify-content: center; gap: 14px; flex-wrap: wrap; }
+  .node {
+    padding: 13px 22px; background: var(--bg1); border: 1px solid var(--line2); border-radius: 13px;
+    font-family: "JetBrains Mono", monospace; font-size: 13.5px; color: var(--dim);
+  }
+  .node b { color: var(--ink); font-weight: 600; }
+  .node.hot { border-color: rgba(55, 212, 194, 0.5); color: var(--accent); box-shadow: 0 0 30px -10px var(--accent); }
+  .arrow { color: var(--faint); font-size: 17px; }
+  .pipeline .note { margin: 22px auto 0; max-width: 560px; font-size: 13.5px; color: var(--faint); }
+
+  /* downloads */
+  .dl-grid { margin-top: 36px; display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 16px; }
+  .dl-card {
+    padding: 26px 24px; border-radius: 16px; border: 1px solid var(--line); background: var(--bg1);
+    text-align: left; transition: border-color 0.2s, transform 0.2s, box-shadow 0.2s;
+    display: flex; flex-direction: column;
+  }
+  .dl-card:hover { border-color: rgba(55, 212, 194, 0.4); transform: translateY(-3px); box-shadow: 0 20px 50px -24px rgba(0,0,0,0.8); }
+  .dl-card.primary { border-color: rgba(55, 212, 194, 0.35); background: linear-gradient(180deg, rgba(55,212,194,0.06), var(--bg1) 55%); }
+  .dl-card .os { font-size: 16px; font-weight: 700; letter-spacing: -0.02em; display: flex; align-items: center; gap: 9px; }
+  .dl-card .os svg { width: 19px; height: 19px; color: var(--accent); flex: none; }
+  .dl-card .sub { margin-top: 5px; font-size: 12.5px; color: var(--faint); }
+  .dl-card .btn { margin-top: 18px; justify-content: center; }
+  .dl-card .alt { margin-top: 10px; text-align: center; font-size: 11.5px; color: var(--faint); }
+  .dl-card .alt a { color: var(--dim); text-decoration: none; }
+  .dl-card .alt a:hover { color: var(--accent); }
+  .dl-note { margin: 22px auto 0; max-width: 560px; text-align: center; font-size: 12.5px; color: var(--faint); }
+  .ver-pill {
+    display: inline-flex; align-items: center; gap: 7px; margin-left: 10px; padding: 3px 10px;
+    border-radius: 999px; background: var(--bg2); border: 1px solid var(--line2);
+    font-family: "JetBrains Mono", monospace; font-size: 11.5px; color: var(--accent); vertical-align: middle;
+  }
+
+  /* final cta */
+  .final { text-align: center; padding: 96px 0 84px; }
+  .final .mark { width: 84px; height: 84px; border-radius: 22px; box-shadow: 0 10px 60px -12px rgba(55, 212, 194, 0.45); }
+  .final h2 { margin-top: 28px; }
+  .final p { margin: 14px auto 0; max-width: 480px; color: var(--dim); font-size: 15px; }
+  .final .cta { margin-top: 30px; display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+
+  footer { border-top: 1px solid var(--line); padding: 30px 0 40px; }
+  footer .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  footer img { width: 22px; height: 22px; border-radius: 6px; }
+  footer p { font-size: 13px; color: var(--faint); }
+  footer a { color: var(--dim); text-decoration: none; }
+  footer a:hover { color: var(--accent); }
+  footer .right { margin-left: auto; display: flex; gap: 18px; }
+
+  /* reveal animation */
+  .reveal { opacity: 0; transform: translateY(22px); transition: opacity 0.7s cubic-bezier(0.2, 0.7, 0.25, 1), transform 0.7s cubic-bezier(0.2, 0.7, 0.25, 1); }
+  .reveal.in { opacity: 1; transform: none; }
+
+  @media (max-width: 900px) {
+    .feature, .feature.flip { grid-template-columns: 1fr; gap: 28px; }
+    .feature.flip .copy { order: 0; }
+    nav .links a:not(.btn) { display: none; }
+  }
+  @media (max-width: 640px) {
+    .pipeline .row { flex-direction: column; gap: 10px; }
+    .pipeline .arrow { transform: rotate(90deg); }
+    section.wrap { padding: 64px 24px; }
+  }
+</style>
+</head>
+<body>
+<div class="ambient"></div>
+
+<nav>
+  <div class="wrap bar">
+    <img src="logo.svg" alt="">
+    <span class="name">Trawler</span>
+    <div class="links">
+      <a href="#search">Search</a>
+      <a href="#follow">Follow</a>
+      <a href="#agent">Agent</a>
+      <a href="#more">Features</a>
+      <a href="#how">How it works</a>
+      <a class="btn btn-primary" href="#download">Download</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero wrap">
+  <span class="eyebrow"><span class="dot"></span>open source · your indexers · your models</span>
+  <h1>The media app that <span class="grad">hunts for you</span></h1>
+  <p class="sub">
+    Trawler searches all your torrent indexers at once, follows the shows you love until
+    they end, and its AI agent grabs the things episode-tracking can't even name —
+    fight nights, race weekends, whatever you're into.
+  </p>
+  <div class="cta">
+    <a class="btn btn-primary" href="#download">Download for Windows</a>
+    <a class="btn btn-ghost" href="https://github.com/MediaHeroSystems/trawler">View on GitHub</a>
+  </div>
+  <div class="meta mono">~10 MB · runs on Prowlarr + qBittorrent · agent runs on your own Ollama</div>
+
+  <div class="frame reveal">
+    <div class="chrome"><span></span><span></span><span></span></div>
+    <img src="shots/search-hero.webp" alt="Trawler search results with quality badges, seeder health and per-indexer timing chips">
+  </div>
+</header>
+
+<svg class="waves" viewBox="0 0 1200 70" preserveAspectRatio="none" aria-hidden="true">
+  <path d="M0 35 C 50 12, 100 12, 150 35 S 250 58, 300 35 S 400 12, 450 35 S 550 58, 600 35 S 700 12, 750 35 S 850 58, 900 35 S 1000 12, 1050 35 S 1150 58, 1200 35" stroke="#37d4c2" stroke-width="2" fill="none" opacity="0.55"/>
+  <path d="M0 48 C 50 25, 100 25, 150 48 S 250 71, 300 48 S 400 25, 450 48 S 550 71, 600 48 S 700 25, 750 48 S 850 71, 900 48 S 1000 25, 1050 48 S 1150 71, 1200 48" stroke="#1d6284" stroke-width="2" fill="none" opacity="0.5"/>
+</svg>
+
+<section id="search" class="wrap">
+  <div class="feature reveal">
+    <div class="copy">
+      <div class="kicker">Search</div>
+      <h2>Every indexer.<br>One query. No waiting.</h2>
+      <p>Trawler fans your search across every indexer in parallel, each on its own deadline — one slow tracker never holds your results hostage.</p>
+      <ul>
+        <li><b>Duplicates folded</b> across indexers by content, not just hash</li>
+        <li><b>Scene names decoded</b> into resolution, source, codec, audio and HDR badges</li>
+        <li><b>Junk filtered</b> — releases that don't match your words get quietly benched</li>
+        <li><b>One-click grab</b> straight into qBittorrent, magnets and .torrents alike</li>
+      </ul>
+    </div>
+    <div class="shot"><img src="shots/search.webp" alt="Search view"></div>
+  </div>
+</section>
+
+<section id="follow" class="wrap">
+  <div class="feature flip reveal">
+    <div class="copy">
+      <div class="kicker">Follow</div>
+      <h2>Follow a show once.<br>Own it forever.</h2>
+      <p>Pick a show and Trawler tracks every episode — backfilling the catalog, watching for new ones the day they air, and going quiet on its own when the story ends.</p>
+      <ul>
+        <li><b>Season packs preferred</b> when several episodes are missing</li>
+        <li><b>Quality profiles enforced</b> — your resolutions, codec taste and size caps</li>
+        <li><b>Instant grabs</b> — an RSS sweep lands new episodes minutes after release</li>
+        <li><b>Dead swarms self-heal</b> — stalled grabs get swapped for live releases</li>
+      </ul>
+    </div>
+    <div class="shot"><img src="shots/shows.webp" alt="Followed shows grid with poster art and progress"></div>
+  </div>
+</section>
+
+<section id="agent" class="wrap">
+  <div class="feature reveal">
+    <div class="copy">
+      <div class="kicker">Agent</div>
+      <h2>An agent that grabs what trackers can't name.</h2>
+      <p>There is no "season 2" of UFC. Describe a standing brief in plain language — Trawler compiles it into hard rules you confirm, then hunts on a schedule using your own local AI models.</p>
+      <ul>
+        <li><b>Standing briefs</b> — "UFC numbered events, main card, 1080p, under 6 GB"</li>
+        <li><b>Verdict cards</b> — proposals show verified facts, approve with one click</li>
+        <li><b>Chat that acts</b> — find, compare and grab conversationally</li>
+        <li><b>Your models</b> — any OpenAI-compatible endpoint; Ollama out of the box</li>
+      </ul>
+    </div>
+    <div class="shot"><img src="shots/agent.webp" alt="Agent chat with a proposal verdict card and standing briefs"></div>
+  </div>
+</section>
+
+<section id="discover" class="wrap">
+  <div class="feature flip reveal">
+    <div class="copy">
+      <div class="kicker">Discover</div>
+      <h2>Tonight's TV.<br>This month's map.</h2>
+      <p>See what the world is watching, follow it in two clicks, and watch your month fill in — every followed show on a calendar that syncs to your real one.</p>
+      <ul>
+        <li><b>Airing tonight, premieres &amp; popular</b> — poster walls with one-click follow</li>
+        <li><b>Detail cards</b> — cast, ratings, schedule, and back-catalog in one view</li>
+        <li><b>Month calendar</b> color-coded by state: downloaded, grabbing, wanted, upcoming</li>
+        <li><b>iCal export</b> — your shows, inside your actual calendar app</li>
+      </ul>
+    </div>
+    <div class="shot"><img src="shots/discover.webp" alt="Discover view with poster walls of what's airing tonight, premiering, and popular"></div>
+  </div>
+</section>
+
+<section class="rails">
+  <div class="wrap">
+    <div class="kicker" style="text-align:center">Kept on rails</div>
+    <h2 style="text-align:center; margin-bottom: 34px">Autonomous, not reckless</h2>
+    <div class="grid reveal">
+      <div class="rail-card">
+        <div class="t">Budgets live in code</div>
+        <p>Grab counts, gigabytes, searches and disk-space floors are enforced in Rust — not by asking the model nicely.</p>
+      </div>
+      <div class="rail-card">
+        <div class="t">Asks before it acts</div>
+        <p>New briefs start in propose mode. The agent earns auto-grab per brief, and only from you.</p>
+      </div>
+      <div class="rail-card">
+        <div class="t">Can't touch your data</div>
+        <p>No delete tools exist. Indexer text is treated as data, never instructions. Grabs only from live search results.</p>
+      </div>
+      <div class="rail-card">
+        <div class="t">Everything attributed</div>
+        <p>Every action lands in the activity feed with who did it and why — chat, brief, scheduler or medic.</p>
+      </div>
+    </div>
+    <p class="note">The full rail list — provenance-pinned grabs, semantic dedupe, circuit breakers, rate limits — is in the <a href="https://github.com/MediaHeroSystems/trawler" style="color: var(--dim)">README</a>.</p>
+  </div>
+</section>
+
+<section id="more" class="wrap">
+  <div class="kicker" style="text-align:center">The full tackle box</div>
+  <h2 style="text-align:center; margin-bottom: 34px">Small features, sharpened</h2>
+  <div class="rails-standalone grid reveal" style="display:grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 14px;">
+    <div class="rail-card">
+      <div class="t">Watchlist import</div>
+      <p>Paste show names, an IMDb list URL or its CSV export. Matched, disambiguated, size-estimated — reviewed by you before anything downloads.</p>
+    </div>
+    <div class="rail-card">
+      <div class="t">Quality presets</div>
+      <p>"Best available" to "Space saver" — one click sets resolutions, codec taste and size caps. Per show, if you like.</p>
+    </div>
+    <div class="rail-card">
+      <div class="t">Notifications</div>
+      <p>Discord and Telegram pings for grabs, finished downloads and proposals. Rate-capped — your phone survives.</p>
+    </div>
+    <div class="rail-card">
+      <div class="t">Stalled-grab medic</div>
+      <p>Dead swarms get detected, paused and swapped for a live release of the same content. Nothing is ever deleted.</p>
+    </div>
+    <div class="rail-card">
+      <div class="t">Upgrade scout</div>
+      <p>Opt-in weekly pass that finds better copies of recent downloads. Proposes only — and remembers your "no".</p>
+    </div>
+    <div class="rail-card">
+      <div class="t">First-run wizard</div>
+      <p>Installs and wires up Prowlarr and qBittorrent for you. Zero to hunting in minutes.</p>
+    </div>
+    <div class="rail-card">
+      <div class="t">Auto-updates</div>
+      <p>Signed releases, verified before install, delivered from a quiet card in the corner of the app.</p>
+    </div>
+    <div class="rail-card">
+      <div class="t">Tray-resident</div>
+      <p>Close the window; the scheduler keeps hunting from the tray. Starts with Windows if you want it to.</p>
+    </div>
+  </div>
+</section>
+
+<section id="how" class="pipeline wrap">
+  <div class="kicker">How it works</div>
+  <h2>Great parts, wired well</h2>
+  <div class="row reveal">
+    <span class="node"><b>TVmaze</b> metadata</span>
+    <span class="arrow">→</span>
+    <span class="node hot"><b>Trawler</b></span>
+    <span class="arrow">→</span>
+    <span class="node"><b>Prowlarr</b> indexers</span>
+    <span class="arrow">→</span>
+    <span class="node"><b>qBittorrent</b> downloads</span>
+  </div>
+  <p class="note">
+    Trawler owns none of the fragile parts. Indexer definitions stay community-maintained in Prowlarr,
+    metadata comes from TVmaze, downloading is qBittorrent's job — Trawler is the brain and the face.
+  </p>
+</section>
+
+<section id="download" class="pipeline wrap">
+  <div class="kicker">Download</div>
+  <h2>Get Trawler<span class="ver-pill">v0.3.0</span></h2>
+  <div class="dl-grid reveal">
+    <div class="dl-card primary">
+      <div class="os">
+        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M3 5.5 10.5 4.4V11.4H3V5.5ZM3 18.5 10.5 19.6V12.6H3V18.5ZM11.5 19.8 21 21V12.6H11.5V19.8ZM11.5 4.2V11.4H21V3L11.5 4.2Z"/></svg>
+        Windows
+      </div>
+      <div class="sub">Windows 10 / 11 · 64-bit · ~3 MB installer</div>
+      <a class="btn btn-primary" href="https://github.com/MediaHeroSystems/trawler/releases/latest">Download for Windows</a>
+      <div class="alt"><a href="https://github.com/MediaHeroSystems/trawler/releases">MSI &amp; checksums on GitHub</a></div>
+    </div>
+    <div class="dl-card">
+      <div class="os">
+        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M3 5.5 10.5 4.4V11.4H3V5.5ZM3 18.5 10.5 19.6V12.6H3V18.5ZM11.5 19.8 21 21V12.6H11.5V19.8ZM11.5 4.2V11.4H21V3L11.5 4.2Z"/></svg>
+        Windows on ARM
+      </div>
+      <div class="sub">Surface &amp; Snapdragon PCs · native ARM64</div>
+      <a class="btn btn-ghost" href="https://github.com/MediaHeroSystems/trawler/releases">Get from GitHub</a>
+      <div class="alt">x64 build also runs via emulation</div>
+    </div>
+    <div class="dl-card">
+      <div class="os">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 3c-2 0-3.5 1.6-3.5 3.8 0 1.5-.6 2.8-1.5 4.2-.9 1.4-2 3-2 5 0 2.2 1.4 3.5 2.5 3.5 1 0 1.3-.5 2.5-.5h4c1.2 0 1.5.5 2.5.5 1.1 0 2.5-1.3 2.5-3.5 0-2-1.1-3.6-2-5-.9-1.4-1.5-2.7-1.5-4.2C15.5 4.6 14 3 12 3Z"/><circle cx="10" cy="9" r="0.9" fill="currentColor" stroke="none"/><circle cx="14" cy="9" r="0.9" fill="currentColor" stroke="none"/></svg>
+        Linux
+      </div>
+      <div class="sub">AppImage · .deb · .rpm</div>
+      <a class="btn btn-ghost" href="https://github.com/MediaHeroSystems/trawler/releases">Get from GitHub</a>
+      <div class="alt">x64 · tray needs an AppIndicator extension on GNOME</div>
+    </div>
+  </div>
+  <p class="dl-note">
+    SmartScreen may ask once — <i>More info → Run anyway</i> (updater-signed; no Authenticode certificate yet).
+    After that Trawler keeps itself up to date. Pairs with <a href="https://prowlarr.com" style="color:var(--dim)">Prowlarr</a> and
+    <a href="https://www.qbittorrent.org" style="color:var(--dim)">qBittorrent</a>; the first-run wizard can set up both.
+  </p>
+</section>
+
+<section class="final wrap">
+  <img class="mark" src="logo.svg" alt="">
+  <h2>Stop searching. Start finding.</h2>
+  <p>Free and open source, MIT-licensed. Bring your Prowlarr, your qBittorrent, and optionally an Ollama box for the agent.</p>
+  <div class="cta">
+    <a class="btn btn-primary" href="#download">Download for Windows</a>
+    <a class="btn btn-ghost" href="https://github.com/MediaHeroSystems/trawler">Star on GitHub</a>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap row">
+    <img src="logo.svg" alt="">
+    <p>© Hero Media Systems · <a href="https://github.com/MediaHeroSystems/trawler/blob/main/LICENSE">MIT license</a> · <a href="https://mediahero.org">mediahero.org</a></p>
+    <div class="right">
+      <p><a href="https://github.com/MediaHeroSystems/trawler">GitHub</a></p>
+      <p>Built with Tauri + Rust + React</p>
+    </div>
+  </div>
+</footer>
+
+<script>
+  const io = new IntersectionObserver(
+    (entries) => entries.forEach((e) => e.isIntersecting && e.target.classList.add("in")),
+    { threshold: 0.12 }
+  );
+  document.querySelectorAll(".reveal").forEach((el) => io.observe(el));
+</script>
+</body>
+</html>

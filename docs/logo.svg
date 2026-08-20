@@ -1,0 +1,41 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1024" y2="1024" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#101826"/>
+      <stop offset="1" stop-color="#080b11"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.28" r="0.75">
+      <stop offset="0" stop-color="#37d4c2" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#37d4c2" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="wave" x1="224" y1="0" x2="800" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#37d4c2"/>
+      <stop offset="1" stop-color="#38bdf8"/>
+    </linearGradient>
+    <linearGradient id="wave2" x1="224" y1="0" x2="800" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2ba899"/>
+      <stop offset="1" stop-color="#2b93c2"/>
+    </linearGradient>
+    <linearGradient id="wave3" x1="224" y1="0" x2="800" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#1e6e66"/>
+      <stop offset="1" stop-color="#1d6284"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1024" height="1024" rx="224" fill="url(#bg)"/>
+  <rect width="1024" height="1024" rx="224" fill="url(#glow)"/>
+
+  <!-- surface wave -->
+  <path d="M224 396 C 272 340, 320 340, 368 396 S 464 452, 512 396 S 608 340, 656 396 S 752 452, 800 396"
+        stroke="url(#wave)" stroke-width="58" stroke-linecap="round" fill="none"/>
+  <!-- mid wave -->
+  <path d="M224 542 C 272 486, 320 486, 368 542 S 464 598, 512 542 S 608 486, 656 542 S 752 598, 800 542"
+        stroke="url(#wave2)" stroke-width="58" stroke-linecap="round" fill="none" opacity="0.85"/>
+  <!-- deep wave -->
+  <path d="M224 688 C 272 632, 320 632, 368 688 S 464 744, 512 688 S 608 632, 656 688 S 752 744, 800 688"
+        stroke="url(#wave3)" stroke-width="58" stroke-linecap="round" fill="none" opacity="0.7"/>
+
+  <!-- the catch -->
+  <circle cx="512" cy="830" r="34" fill="#f5b950"/>
+  <circle cx="512" cy="830" r="60" fill="#f5b950" opacity="0.18"/>
+</svg>

@@ -1,0 +1,171 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter Variable", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+
+  /* surfaces, darkest to lightest */
+  --color-bg0: #080b11;
+  --color-bg1: #0d1119;
+  --color-bg2: #131926;
+  --color-bg3: #1a2231;
+  --color-bg4: #212c3f;
+
+  --color-line: #1e2737;
+  --color-line2: #2a3549;
+
+  --color-ink: #e9eef7;
+  --color-dim: #97a4ba;
+  --color-faint: #5c6a81;
+
+  --color-accent: #37d4c2;
+  --color-accent-soft: #37d4c21f;
+  --color-accent2: #38bdf8;
+
+  --color-ok: #3ddc97;
+  --color-warn: #f5b950;
+  --color-bad: #f4766e;
+
+  --radius-card: 12px;
+  --radius-btn: 8px;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  @apply bg-bg0 text-ink font-sans antialiased;
+  font-size: 13.5px;
+  letter-spacing: -0.006em;
+  overflow: hidden;
+}
+
+::selection {
+  background: color-mix(in oklab, var(--color-accent) 30%, transparent);
+}
+
+/* scrollbars — webkit rules only: WebView2 is the sole target, and the
+   standard scrollbar-* properties would disable these richer ones */
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--color-bg4);
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--color-line2);
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* focus */
+:focus-visible {
+  outline: 2px solid color-mix(in oklab, var(--color-accent) 60%, transparent);
+  outline-offset: 1px;
+}
+
+/* subtle grain-free vignette behind everything */
+.app-bg {
+  background:
+    radial-gradient(1200px 600px at 70% -10%, #12213022 0%, transparent 60%),
+    radial-gradient(900px 500px at -10% 110%, #0e263a1e 0%, transparent 55%),
+    var(--color-bg0);
+}
+
+@keyframes shimmer {
+  0% { background-position: -400px 0; }
+  100% { background-position: 400px 0; }
+}
+.skeleton {
+  background: linear-gradient(90deg, var(--color-bg2) 25%, var(--color-bg3) 50%, var(--color-bg2) 75%);
+  background-size: 800px 100%;
+  animation: shimmer 1.4s infinite linear;
+}
+
+@keyframes rise-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.rise-in {
+  animation: rise-in 0.28s cubic-bezier(0.2, 0.7, 0.25, 1) both;
+}
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(10px) scale(0.97); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+.toast-in {
+  animation: toast-in 0.22s cubic-bezier(0.2, 0.7, 0.25, 1) both;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+.spin {
+  animation: spin 0.8s linear infinite;
+}
+
+/* typing indicator dots */
+@keyframes typing-bounce {
+  0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
+  30% { transform: translateY(-4px); opacity: 1; }
+}
+.typing-dot {
+  animation: typing-bounce 1.2s infinite ease-in-out;
+}
+
+/* agent glow pulse for the thinking state */
+@keyframes glow-pulse {
+  0%, 100% { opacity: 0.5; }
+  50% { opacity: 1; }
+}
+.glow-pulse { animation: glow-pulse 1.8s ease-in-out infinite; }
+
+/* streaming message fade-up */
+@keyframes msg-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.msg-in { animation: msg-in 0.3s cubic-bezier(0.2, 0.7, 0.25, 1) both; }
+
+/* tool-step card sliding in */
+@keyframes step-in {
+  from { opacity: 0; transform: translateX(-6px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+.step-in { animation: step-in 0.22s cubic-bezier(0.2, 0.7, 0.25, 1) both; }
+
+/* right-hand drawer entrance */
+@keyframes slide-in-right {
+  from { opacity: 0; transform: translateX(24px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+.slide-in-right { animation: slide-in-right 0.25s cubic-bezier(0.2, 0.7, 0.25, 1) both; }
+
+/* sparkle shimmer for the agent accent */
+@keyframes sheen {
+  0% { background-position: 0% 50%; }
+  100% { background-position: 200% 50%; }
+}
+.sheen {
+  background-size: 200% auto;
+  animation: sheen 3s linear infinite;
+}
+
+@keyframes indeterminate-x {
+  0% { transform: translateX(-110%); }
+  100% { transform: translateX(360%); }
+}
+.progress-indeterminate {
+  width: 30%;
+  animation: indeterminate-x 1.2s ease-in-out infinite;
+}

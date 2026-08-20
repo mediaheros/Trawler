@@ -1,0 +1,13 @@
+/*
+  X-Content-Type-Options: nosniff
+  X-Frame-Options: DENY
+  Referrer-Policy: strict-origin-when-cross-origin
+
+/shots/*
+  Cache-Control: public, max-age=604800
+
+/og.png
+  Cache-Control: public, max-age=604800
+
+# NOTE: /dl/latest.json is a _redirects rule (processed before headers);
+# nothing else lives under /dl any more — installers come from GitHub releases

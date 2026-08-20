@@ -1,0 +1,43 @@
+[package]
+name = "trawler"
+version = "0.3.0"
+description = "Search torrent indexers and hand releases to qBittorrent"
+authors = ["Hero Media Systems"]
+license = "MIT"
+edition = "2021"
+
+[lib]
+name = "trawler_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-opener = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+url = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = [
+  "json", "multipart", "cookies", "rustls-tls", "charset", "http2",
+] }
+tokio = { version = "1", features = ["full"] }
+thiserror = "2"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+urlencoding = "2"
+futures = "0.3"
+rusqlite = { version = "0.40", features = ["bundled"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true
