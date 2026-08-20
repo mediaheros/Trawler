@@ -1,6 +1,6 @@
 [package]
 name = "trawler"
-version = "0.3.1"
+version = "0.3.2"
 description = "Search torrent indexers and hand releases to qBittorrent"
 authors = ["Hero Media Systems"]
 license = "MIT"

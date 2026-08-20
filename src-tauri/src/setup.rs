@@ -25,12 +25,31 @@ fn local_app_data() -> PathBuf {
     dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Managed Prowlarr lives OUTSIDE the app install dir (the NSIS installer
+/// owns %LOCALAPPDATA%\Trawler for Trawler itself — updates and uninstalls
+/// operate on that folder). Legacy installs that landed inside it keep working.
 pub fn managed_prowlarr_exe() -> PathBuf {
-    local_app_data().join("Trawler").join("Prowlarr").join("Prowlarr.exe")
+    let new = local_app_data().join("TrawlerTools").join("Prowlarr").join("Prowlarr.exe");
+    if new.exists() {
+        return new;
+    }
+    let legacy = local_app_data().join("Trawler").join("Prowlarr").join("Prowlarr.exe");
+    if legacy.exists() { legacy } else { new }
+}
+
+fn managed_prowlarr_dir() -> PathBuf {
+    managed_prowlarr_exe()
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| local_app_data().join("TrawlerTools").join("Prowlarr"))
 }
 
 fn managed_prowlarr_data() -> PathBuf {
-    local_app_data().join("Trawler").join("ProwlarrData")
+    let legacy = local_app_data().join("Trawler").join("ProwlarrData");
+    if legacy.join("config.xml").exists() {
+        return legacy;
+    }
+    local_app_data().join("TrawlerTools").join("ProwlarrData")
 }
 
 fn qbt_exe_candidates() -> Vec<PathBuf> {
@@ -177,13 +196,77 @@ fn spawn_detached(exe: &PathBuf, args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// 32 hex chars from OS entropy (RandomState seeds from the OS CSPRNG).
+fn random_api_key() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let mut out = String::with_capacity(32);
+    for i in 0..2u8 {
+        let mut h = RandomState::new().build_hasher();
+        h.write_u8(i);
+        out.push_str(&format!("{:016x}", h.finish()));
+    }
+    out
+}
+
+/// Replace a flat <Tag>value</Tag> under <Config>, or insert it if missing.
+pub fn upsert_xml_tag(xml: &str, tag: &str, value: &str) -> String {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    if let (Some(s), Some(e)) = (xml.find(&open), xml.find(&close)) {
+        if s < e {
+            return format!("{}{}{}{}", &xml[..s + open.len()], value, close, &xml[e + close.len()..]);
+        }
+    }
+    match xml.rfind("</Config>") {
+        Some(pos) => format!("{}  {open}{value}{close}
+{}", &xml[..pos], &xml[pos..]),
+        None => format!("<Config>
+  {open}{value}{close}
+</Config>
+"),
+    }
+}
+
+/// A Trawler-managed Prowlarr must never pop a browser or demand an admin
+/// login: localhost-only, local auth exempt, browser launch off. Seeded
+/// BEFORE first boot so the auth-setup form never exists; re-applied gently
+/// on later boots — a login the user deliberately created is left alone.
+fn seed_managed_prowlarr_config() -> Result<String> {
+    let data = managed_prowlarr_data();
+    std::fs::create_dir_all(&data)?;
+    let path = data.join("config.xml");
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let key = read_prowlarr_api_key().unwrap_or_else(random_api_key);
+
+    let mut xml = if existing.trim().is_empty() {
+        "<Config>
+</Config>
+".to_string()
+    } else {
+        existing
+    };
+    xml = upsert_xml_tag(&xml, "BindAddress", "127.0.0.1");
+    xml = upsert_xml_tag(&xml, "Port", "9696");
+    xml = upsert_xml_tag(&xml, "ApiKey", &key);
+    xml = upsert_xml_tag(&xml, "LaunchBrowser", "False");
+    let has_user_auth = xml.contains("<AuthenticationMethod>Forms</AuthenticationMethod>")
+        || xml.contains("<AuthenticationMethod>Basic</AuthenticationMethod>");
+    if !has_user_auth {
+        xml = upsert_xml_tag(&xml, "AuthenticationMethod", "External");
+        xml = upsert_xml_tag(&xml, "AuthenticationRequired", "DisabledForLocalAddresses");
+    }
+    std::fs::write(&path, xml)?;
+    Ok(key)
+}
+
 pub fn start_managed_prowlarr() -> Result<()> {
     let exe = managed_prowlarr_exe();
     if !exe.exists() {
         return Err(AppError::Other("no managed Prowlarr install found".into()));
     }
+    let _ = seed_managed_prowlarr_config();
     let data = managed_prowlarr_data();
-    std::fs::create_dir_all(&data)?;
     spawn_detached(&exe, &[format!("-data={}", data.display())])
 }
 
@@ -261,7 +344,7 @@ pub async fn install_prowlarr(app: &AppHandle) -> Result<String> {
     }
 
     emit(app, "prowlarr", "log", json!({ "message": "Extracting…" }));
-    let target = local_app_data().join("Trawler").join("Prowlarr");
+    let target = managed_prowlarr_dir();
     let _ = std::fs::remove_dir_all(&target);
     std::fs::create_dir_all(&target)?;
     let cursor = std::io::Cursor::new(bytes);
@@ -289,22 +372,16 @@ pub async fn install_prowlarr(app: &AppHandle) -> Result<String> {
         }
     }
 
+    // Seed config BEFORE first boot: our own API key, localhost-only, no
+    // browser popup, no admin-login form. First impressions matter.
+    emit(app, "prowlarr", "log", json!({ "message": "Configuring…" }));
+    let key = seed_managed_prowlarr_config()?;
+
     emit(app, "prowlarr", "log", json!({ "message": "Starting Prowlarr…" }));
     start_managed_prowlarr()?;
     if !wait_for_prowlarr(state, 45).await {
         return Err(AppError::Other("Prowlarr installed but didn't come up on :9696".into()));
     }
-
-    // capture the API key it generated on first boot
-    let mut key = None;
-    for _ in 0..15 {
-        key = read_prowlarr_api_key();
-        if key.is_some() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    }
-    let key = key.ok_or_else(|| AppError::Other("could not read Prowlarr's API key".into()))?;
 
     {
         let mut cfg = state.config.write().await;
@@ -393,9 +470,13 @@ pub fn configure_and_launch_qbt() -> Result<()> {
     spawn_detached(&exe, &[])
 }
 
-/// Kick a winget install of qBittorrent (fires one UAC prompt); the caller
-/// polls status until the exe appears, then runs configure_and_launch.
-pub fn install_qbt_via_winget() -> Result<()> {
+/// Install qBittorrent via winget and babysit it: stream status while the
+/// download / UAC / install runs, return once the exe actually exists. The
+/// caller's button stays busy the whole time instead of going quiet.
+pub async fn install_qbt_via_winget(app: &AppHandle) -> Result<()> {
+    if qbt_exe_candidates().iter().any(|p| p.exists()) {
+        return Ok(());
+    }
     let mut cmd = std::process::Command::new("winget");
     cmd.args([
         "install", "--id", "qBittorrent.qBittorrent", "-e",
@@ -408,12 +489,53 @@ pub fn install_qbt_via_winget() -> Result<()> {
     }
     cmd.spawn()
         .map_err(|_| AppError::Other("winget isn't available — install qBittorrent from qbittorrent.org, then return here".into()))?;
-    Ok(())
+
+    emit(app, "qbit", "log", json!({ "message": "Downloading via winget — approve the Windows prompt if one appears…" }));
+    for i in 0..180u32 {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        if qbt_exe_candidates().iter().any(|p| p.exists()) {
+            emit(app, "qbit", "done", json!({ "message": "qBittorrent installed" }));
+            return Ok(());
+        }
+        if i == 45 {
+            emit(app, "qbit", "log", json!({ "message": "Still installing — winget can take a few minutes…" }));
+        }
+    }
+    Err(AppError::Other(
+        "the installer didn't finish within 6 minutes — if you dismissed the Windows prompt, click Install again".into(),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::ensure_qbt_ini;
+    use super::upsert_xml_tag;
+
+    #[test]
+    fn xml_upsert_replaces_and_inserts() {
+        let xml = "<Config>\n  <Port>9696</Port>\n  <LaunchBrowser>True</LaunchBrowser>\n</Config>\n";
+        let out = upsert_xml_tag(xml, "LaunchBrowser", "False");
+        assert!(out.contains("<LaunchBrowser>False</LaunchBrowser>"));
+        assert!(!out.contains("<LaunchBrowser>True</LaunchBrowser>"));
+        // untouched sibling survives
+        assert!(out.contains("<Port>9696</Port>"));
+        // missing tag gets inserted inside <Config>
+        let out2 = upsert_xml_tag(&out, "BindAddress", "127.0.0.1");
+        assert!(out2.contains("<BindAddress>127.0.0.1</BindAddress>"));
+        assert!(out2.rfind("</Config>").unwrap() > out2.find("<BindAddress>").unwrap());
+        // degenerate input still produces a valid config
+        let out3 = upsert_xml_tag("", "ApiKey", "abc");
+        assert!(out3.contains("<Config>") && out3.contains("<ApiKey>abc</ApiKey>"));
+    }
+
+    #[test]
+    fn api_keys_are_32_hex_and_unique() {
+        let a = super::random_api_key();
+        let b = super::random_api_key();
+        assert_eq!(a.len(), 32);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+    }
 
     #[test]
     fn creates_missing_ini() {

@@ -104,9 +104,11 @@ export default function FirstRun({ onDone }: { onDone: () => void }) {
               : status.qbit === "installed_stopped" ? "Installed but not running"
               : "Not installed"
             }
+            indeterminate={busy === "qbit-install"}
+            logLine={busy === "qbit-install" ? logLine : null}
           >
             {status?.qbit === "missing" && (
-              <Button variant="primary" busy={busy === "qbit-install"} onClick={() => run("qbit-install", api.setupInstallQbit, "Installer started — approve the Windows prompt, then this card updates itself")} className="text-[12px]">
+              <Button variant="primary" busy={busy === "qbit-install"} onClick={() => run("qbit-install", api.setupInstallQbit, "qBittorrent installed — one more click to enable its Web UI")} className="text-[12px]">
                 <Download size={13} /> Install automatically
               </Button>
             )}
@@ -237,6 +239,7 @@ function SetupCard({
   statusLine,
   progress,
   logLine,
+  indeterminate,
   dimWhenMissing,
   children,
 }: {
@@ -247,6 +250,7 @@ function SetupCard({
   statusLine: string;
   progress?: number | null;
   logLine?: string | null;
+  indeterminate?: boolean;
   dimWhenMissing?: boolean;
   children?: React.ReactNode;
 }) {
@@ -272,14 +276,18 @@ function SetupCard({
             <span className="truncate text-[11px] text-faint">{role}</span>
           </div>
           <div className={cx("mt-0.5 text-[12px]", ok ? "text-ok" : "text-dim")}>{statusLine}</div>
-          {typeof progress === "number" && (
+          {typeof progress === "number" ? (
             <div className="mt-2 h-[4px] overflow-hidden rounded-full bg-bg3">
               <div
                 className="h-full rounded-full bg-gradient-to-r from-accent to-accent2 transition-[width] duration-300"
                 style={{ width: `${progress}%` }}
               />
             </div>
-          )}
+          ) : indeterminate ? (
+            <div className="mt-2 h-[4px] overflow-hidden rounded-full bg-bg3">
+              <div className="progress-indeterminate h-full rounded-full bg-gradient-to-r from-accent to-accent2" />
+            </div>
+          ) : null}
           {logLine && <div className="mt-1.5 text-[11px] text-faint">{logLine}</div>}
           {children && <div className="mt-2.5 flex flex-wrap items-center gap-2">{children}</div>}
         </div>
