@@ -99,7 +99,7 @@ export default function AddShow({ onClose }: { onClose: () => void }) {
                 >
                   <div className="h-[72px] w-[48px] shrink-0 overflow-hidden rounded-md bg-bg3">
                     {r.poster ? (
-                      <img src={r.poster} alt="" className="size-full object-cover" />
+                      <img src={r.poster} alt="" loading="lazy" className="size-full object-cover" />
                     ) : (
                       <div className="flex size-full items-center justify-center text-faint">
                         <Tv size={16} />

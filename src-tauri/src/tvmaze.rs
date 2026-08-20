@@ -102,6 +102,33 @@ pub async fn get_gated(http: &reqwest::Client, url: &str) -> Result<reqwest::Res
     get_with_retry(http, url, &[]).await
 }
 
+/// Burst GET: no per-call gate, but the same one-polite-retry on 429.
+/// For bounded fan-outs (the 14 discover schedule days) where serializing
+/// through the 550ms gate turns one page-load into eight seconds of drip —
+/// callers must bound their own concurrency (buffered(4)).
+pub async fn get_burst(http: &reqwest::Client, url: &str) -> Result<reqwest::Response> {
+    for attempt in 0..2 {
+        let resp = http
+            .get(url)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await?;
+        if resp.status().as_u16() == 429 && attempt == 0 {
+            let wait = resp
+                .headers()
+                .get("Retry-After")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(2)
+                .min(15);
+            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            continue;
+        }
+        return Ok(resp);
+    }
+    unreachable!()
+}
+
 /// One polite retry on 429, honoring Retry-After (capped at 15s).
 async fn get_with_retry(http: &reqwest::Client, url: &str, query: &[(&str, &str)]) -> Result<reqwest::Response> {
     for attempt in 0..2 {

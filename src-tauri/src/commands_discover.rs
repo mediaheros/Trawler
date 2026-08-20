@@ -123,7 +123,7 @@ async fn fetch_schedule_day(http: &reqwest::Client, kind: &str, date: &str) -> V
         "web" => format!("https://api.tvmaze.com/schedule/web?date={date}"),
         _ => format!("https://api.tvmaze.com/schedule?country=US&date={date}"),
     };
-    match crate::tvmaze::get_gated(http, &url).await {
+    match crate::tvmaze::get_burst(http, &url).await {
         Ok(r) if r.status().is_success() => r.json::<Vec<Value>>().await.unwrap_or_default(),
         _ => vec![],
     }
@@ -211,7 +211,10 @@ pub async fn discover(state: State<'_, AppState>, force: Option<bool>) -> Result
         futs.push(fetch_schedule_day(&state.http, "tv", date));
         futs.push(fetch_schedule_day(&state.http, "web", date));
     }
-    let results = futures::future::join_all(futs).await;
+    // four at a time: fast enough to feel instant, polite enough for TVmaze's
+    // 20-per-10s ceiling (get_burst still backs off on a 429)
+    use futures::StreamExt;
+    let results: Vec<_> = futures::stream::iter(futs).buffered(4).collect().await;
 
     let mut tonight_raw = vec![];
     let mut week_raw = vec![];
