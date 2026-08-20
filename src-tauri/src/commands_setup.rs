@@ -44,8 +44,25 @@ pub async fn setup_install_qbit(app: tauri::AppHandle) -> Result<()> {
 }
 
 #[tauri::command]
-pub async fn setup_configure_qbit() -> Result<()> {
-    setup::configure_and_launch_qbt()
+pub async fn setup_configure_qbit(state: State<'_, AppState>) -> Result<()> {
+    setup::configure_and_launch_qbt().await?;
+    // don't declare victory until the WebUI actually answers
+    let cfg = state.config.read().await.clone();
+    let q = crate::qbit::QbitClient {
+        http: &state.http,
+        base: cfg.qbit_url.clone(),
+        username: cfg.qbit_username.clone(),
+        password: cfg.qbit_password.clone(),
+    };
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if q.version().await.is_ok() {
+            return Ok(());
+        }
+    }
+    Err(AppError::Other(
+        "qBittorrent launched but its Web UI didn't come up — if it's showing a first-run Legal Notice window, accept it and hit re-check".into(),
+    ))
 }
 
 /// Add a starter set of reliable public indexers (verified in Prowlarr's catalog).

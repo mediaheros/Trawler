@@ -1,6 +1,6 @@
 [package]
 name = "trawler"
-version = "0.3.3"
+version = "0.3.4"
 description = "Search torrent indexers and hand releases to qBittorrent"
 authors = ["Hero Media Systems"]
 license = "MIT"
@@ -21,6 +21,9 @@ tauri-plugin-autostart = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 url = "2"
+pbkdf2 = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = [

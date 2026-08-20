@@ -100,7 +100,7 @@ export default function FirstRun({ onDone }: { onDone: () => void }) {
             statusLine={
               status === null ? "Checking…"
               : status.qbit === "ok" ? "Connected and ready"
-              : status.qbit === "running_no_webui" ? "Running, but its Web UI is off — close qBittorrent, then configure"
+              : status.qbit === "running_no_webui" ? "Running, but its Web UI is off"
               : status.qbit === "installed_stopped" ? "Installed but not running"
               : "Not installed"
             }
@@ -114,7 +114,7 @@ export default function FirstRun({ onDone }: { onDone: () => void }) {
             )}
             {(status?.qbit === "installed_stopped" || status?.qbit === "running_no_webui") && (
               <Button variant="primary" busy={busy === "qbit-cfg"} onClick={() => run("qbit-cfg", api.setupConfigureQbit, "qBittorrent configured and launched")} className="text-[12px]">
-                <Wrench size={13} /> {status.qbit === "running_no_webui" ? "Configure (close qBittorrent first)" : "Enable Web UI & launch"}
+                <Wrench size={13} /> {status.qbit === "running_no_webui" ? "Restart with Web UI enabled" : "Enable Web UI & launch"}
               </Button>
             )}
           </SetupCard>

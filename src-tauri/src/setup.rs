@@ -395,14 +395,47 @@ pub async fn install_prowlarr(app: &AppHandle) -> Result<String> {
 
 // ---------------- qbittorrent ----------------
 
+/// qBittorrent's password blob: PBKDF2-HMAC-SHA512, 100k rounds,
+/// base64(salt):base64(dk). qBittorrent 5.x REFUSES to start the WebUI when
+/// no credentials exist — even with localhost auth bypassed — so a fresh
+/// install must be seeded with a (random, never-shown) password.
+fn qbt_password_blob(password: &str) -> String {
+    use base64::Engine;
+    use pbkdf2::pbkdf2_hmac;
+    use sha2::Sha512;
+    let salt: [u8; 16] = {
+        let mut s = [0u8; 16];
+        let hex = random_api_key(); // 32 hex chars of OS entropy
+        for (i, b) in s.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap_or(0);
+        }
+        s
+    };
+    let mut dk = [0u8; 64];
+    pbkdf2_hmac::<Sha512>(password.as_bytes(), &salt, 100_000, &mut dk);
+    let b64 = base64::engine::general_purpose::STANDARD;
+    format!("@ByteArray({}:{})", b64.encode(salt), b64.encode(dk))
+}
+
 /// Idempotently force the WebUI settings Trawler needs into qBittorrent.ini.
 /// Only safe while qBittorrent is NOT running (it rewrites the file on exit).
-pub fn ensure_qbt_ini(ini: &str) -> String {
-    let wanted = [
-        (r"WebUI\Enabled", "true"),
-        (r"WebUI\Port", "8080"),
-        (r"WebUI\LocalHostAuth", "false"),
+/// `fresh` additionally pre-accepts the legal notice (only used when the ini
+/// didn't exist — i.e. the install the user explicitly clicked for; without
+/// it qBittorrent halts ALL startup, WebUI included, behind a modal).
+pub fn ensure_qbt_ini(ini: &str, credentials: Option<(&str, &str)>, fresh: bool) -> String {
+    let mut wanted: Vec<(String, String)> = vec![
+        (r"WebUI\Enabled".into(), "true".into()),
+        (r"WebUI\Port".into(), "8080".into()),
+        (r"WebUI\LocalHostAuth".into(), "false".into()),
     ];
+    // never clobber a password the user already has
+    if !ini.contains(r"WebUI\Password_PBKDF2") {
+        if let Some((user, blob)) = credentials {
+            wanted.push((r"WebUI\Username".into(), user.into()));
+            wanted.push((r"WebUI\Password_PBKDF2".into(), format!("\"{blob}\"")));
+        }
+    }
+    let wanted: Vec<(&str, String)> = wanted.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
     let mut lines: Vec<String> = ini.lines().map(String::from).collect();
     let mut in_prefs = false;
     let mut prefs_end = lines.len();
@@ -423,10 +456,10 @@ pub fn ensure_qbt_ini(ini: &str) -> String {
             continue;
         }
         if in_prefs {
-            for (k, v) in wanted {
+            for (k, v) in &wanted {
                 if line.starts_with(&format!("{k}=")) {
                     lines[i] = format!("{k}={v}");
-                    seen.push(k);
+                    seen.push(*k);
                 }
             }
         }
@@ -436,23 +469,46 @@ pub fn ensure_qbt_ini(ini: &str) -> String {
         lines.push("[Preferences]".into());
         prefs_end = lines.len();
     }
-    for (k, v) in wanted {
-        if !seen.contains(&k) {
+    for (k, v) in &wanted {
+        if !seen.contains(k) {
             lines.insert(prefs_end, format!("{k}={v}"));
             prefs_end += 1;
         }
+    }
+    // a truly fresh install: pre-accept the notice the user's install click
+    // already implied, or qBittorrent freezes ALL of startup behind a modal
+    if fresh && !lines.iter().any(|l| l.trim() == "[LegalNotice]") {
+        lines.insert(0, String::new());
+        lines.insert(0, "Accepted=true".into());
+        lines.insert(0, "[LegalNotice]".into());
     }
     let mut out = lines.join("\r\n");
     out.push_str("\r\n");
     out
 }
 
-/// Enable the WebUI (file edit) and launch qBittorrent. Requires it stopped.
-pub fn configure_and_launch_qbt() -> Result<()> {
+/// Enable the WebUI and (re)launch qBittorrent. If it's running we close it
+/// ourselves — its X button only hides to tray, so "close it first" was a
+/// trap users couldn't escape.
+pub async fn configure_and_launch_qbt() -> Result<()> {
     if process_running("qbittorrent.exe") {
-        return Err(AppError::Other(
-            "qBittorrent is running — close it first so its settings can be updated".into(),
-        ));
+        let mut kill = std::process::Command::new("taskkill");
+        kill.args(["/IM", "qbittorrent.exe", "/F"]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            kill.creation_flags(0x0800_0000);
+        }
+        let _ = kill.output();
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+            if !process_running("qbittorrent.exe") {
+                break;
+            }
+        }
+        if process_running("qbittorrent.exe") {
+            return Err(AppError::Other("couldn't close qBittorrent — try quitting it from its tray icon".into()));
+        }
     }
     let exe = qbt_exe_candidates()
         .into_iter()
@@ -461,7 +517,12 @@ pub fn configure_and_launch_qbt() -> Result<()> {
 
     let ini_path = qbt_ini_path();
     let current = std::fs::read_to_string(&ini_path).unwrap_or_default();
-    let updated = ensure_qbt_ini(&current);
+    let fresh = current.trim().is_empty();
+    // random password nobody ever needs to see — localhost API access is
+    // exempted from auth; qBittorrent just requires that credentials EXIST
+    let password = random_api_key();
+    let blob = qbt_password_blob(&password);
+    let updated = ensure_qbt_ini(&current, Some(("admin", &blob)), fresh);
     if let Some(parent) = ini_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -539,7 +600,7 @@ mod tests {
 
     #[test]
     fn creates_missing_ini() {
-        let out = ensure_qbt_ini("");
+        let out = ensure_qbt_ini("", None, false);
         assert!(out.contains("[Preferences]"));
         assert!(out.contains(r"WebUI\Enabled=true"));
         assert!(out.contains(r"WebUI\Port=8080"));
@@ -549,7 +610,7 @@ mod tests {
     #[test]
     fn updates_existing_values_in_place() {
         let ini = "[BitTorrent]\r\nSession\\Port=23177\r\n[Preferences]\r\nWebUI\\Enabled=false\r\nWebUI\\Port=9090\r\nGeneral\\Locale=en\r\n";
-        let out = ensure_qbt_ini(ini);
+        let out = ensure_qbt_ini(ini, None, false);
         assert!(out.contains(r"WebUI\Enabled=true"));
         assert!(out.contains(r"WebUI\Port=8080"));
         assert!(!out.contains(r"WebUI\Port=9090"));
@@ -559,10 +620,27 @@ mod tests {
     }
 
     #[test]
+    fn seeds_credentials_and_legal_notice() {
+        let blob = "@ByteArray(abc:def)";
+        let out = ensure_qbt_ini("", Some(("admin", blob)), true);
+        assert!(out.contains("[LegalNotice]"));
+        assert!(out.contains("Accepted=true"));
+        assert!(out.contains("Password_PBKDF2"));
+        assert!(out.contains("@ByteArray(abc:def)"));
+        // an existing password is sacred
+        let existing = concat!("[Preferences]", "\r\n", r"WebUI\Password_PBKDF2=USER_OWN", "\r\n");
+        let out2 = ensure_qbt_ini(existing, Some(("admin", blob)), false);
+        assert!(out2.contains("USER_OWN"));
+        assert!(!out2.contains("abc:def"));
+        // not fresh: no legal notice injected
+        assert!(!out2.contains("[LegalNotice]"));
+    }
+
+    #[test]
     fn respects_section_boundaries() {
         // keys must land inside [Preferences], not in a later section
         let ini = "[Preferences]\r\nGeneral\\Locale=en\r\n[RSS]\r\nFeeds=none\r\n";
-        let out = ensure_qbt_ini(ini);
+        let out = ensure_qbt_ini(ini, None, false);
         let prefs_pos = out.find("[Preferences]").unwrap();
         let rss_pos = out.find("[RSS]").unwrap();
         let enabled_pos = out.find(r"WebUI\Enabled=true").unwrap();
