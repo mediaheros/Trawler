@@ -582,7 +582,7 @@ async fn completion_pass(app: &tauri::AppHandle, state: &AppState) -> Vec<DeadGr
             torrents.iter().map(|t| normalize(&t.name)).collect();
         let all_hashes: std::collections::HashSet<String> =
             torrents.iter().map(|t| t.hash.to_ascii_lowercase()).collect();
-        let cutoff = db::now() - 30 * 60; // fresh grabs may still be fetching metadata
+        let cutoff = db::now() - 5 * 60; // covers the add-to-listing gap; a magnet mid-metaDL is already listed
         let rows: Vec<(i64, String, Option<String>)> = conn
             .prepare("SELECT id, title, info_hash FROM grab_ledger WHERE state = 'grabbed' AND ts < ?1")
             .ok()
