@@ -13,6 +13,7 @@
   ![React 19](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)
   ![License: MIT](https://img.shields.io/badge/License-MIT-37d4c2)
   ![Windows](https://img.shields.io/badge/Windows-10%2F11-0078D4)
+  ![macOS](https://img.shields.io/badge/macOS-12%2B_universal-000000?logo=apple)
 
   [mediahero.org](https://mediahero.org)
 
@@ -69,13 +70,16 @@ There is no "season 2" of UFC. Describe a **standing brief** in plain language �
 
 ## Install
 
-Grab the latest from **[Releases](https://github.com/mediaheros/Trawler/releases)** — Windows x64 (`-setup.exe` or `.msi`), Windows ARM64 (`arm64-setup.exe`), or Linux (`.AppImage` / `.deb` / `.rpm`). Or download from [mediahero.org](https://mediahero.org/#download).
+Download from **[mediahero.org](https://mediahero.org/#download)**:
 
-Builds are signed for the auto-updater but not Authenticode-signed, so Windows SmartScreen may ask once (*More info → Run anyway*). The installer fetches the WebView2 runtime automatically if it's missing — that's the only dependency Trawler bundles for you. From then on, **Trawler keeps itself up to date**.
+- **Windows 10/11** — `Trawler_x64-setup.exe` (or the `.msi`). The installer fetches the WebView2 runtime automatically if it's missing.
+- **macOS 12+** — `Trawler_universal.dmg`, one app for Apple Silicon and Intel. Drag to Applications.
+
+Builds are signed for the auto-updater but carry no OS certificates yet, so the first launch asks for trust once: Windows SmartScreen wants *More info → Run anyway*; macOS Gatekeeper wants a right-click → *Open*. From then on, **Trawler keeps itself up to date** on both platforms.
 
 ## Five-minute setup
 
-Trawler is the brain; two free apps do the heavy lifting. The **first-run wizard** offers to install and wire up both for you — or do it by hand:
+Trawler is the brain; two free apps do the heavy lifting. The **first-run wizard** installs and wires up both for you — on Windows and macOS alike, including enabling qBittorrent's Web UI so you never see a setup form. Prefer doing it by hand?
 
 1. **[qBittorrent](https://www.qbittorrent.org/download)** — the download engine.
    After installing: *Tools → Options → Web UI* → enable **Web User Interface**, port **8080**, and tick **Bypass authentication for clients on localhost**. (If you set a username/password instead, enter them in Trawler's Settings.)

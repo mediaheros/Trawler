@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Trawler — the media app that hunts for you | mediahero.org</title>
-<meta name="description" content="Trawler searches all your torrent indexers at once through Prowlarr, follows TV shows until they end, and its AI agent grabs what episode-tracking can't name — UFC events, race weekends, anything. Free and open source, for Windows and Linux.">
+<meta name="description" content="Trawler searches all your torrent indexers at once through Prowlarr, follows TV shows until they end, and its AI agent grabs what episode-tracking can't name — UFC events, race weekends, anything. Free and open source, for Windows, macOS, and Linux.">
 <link rel="canonical" href="https://mediahero.org/">
 <link rel="icon" type="image/svg+xml" href="logo.svg">
 <meta name="theme-color" content="#080b11">
@@ -31,7 +31,7 @@
   "url": "https://mediahero.org/",
   "image": "https://mediahero.org/og.png",
   "description": "Trawler searches all your torrent indexers at once, follows TV shows until they end, and its AI agent grabs what episode-tracking can't name — running on your own local models.",
-  "operatingSystem": "Windows 10, Windows 11, Linux",
+  "operatingSystem": "Windows 10, Windows 11, macOS 12, Linux",
   "applicationCategory": "MultimediaApplication",
   "softwareVersion": "0.3.6",
   "license": "https://github.com/mediaheros/Trawler/blob/main/LICENSE",
@@ -287,7 +287,7 @@
     <a class="btn btn-primary" href="#download">Download free</a>
     <a class="btn btn-ghost" href="https://github.com/mediaheros/Trawler">View on GitHub</a>
   </div>
-  <div class="meta mono">Windows &amp; Linux · ~10 MB · runs on Prowlarr + qBittorrent · agent on your own Ollama</div>
+  <div class="meta mono">Windows · macOS · Linux · runs on Prowlarr + qBittorrent · agent on your own Ollama</div>
 
   <div class="frame reveal">
     <div class="chrome"><span></span><span></span><span></span></div>
@@ -428,7 +428,7 @@
     </div>
     <div class="rail-card">
       <div class="t">Tray-resident</div>
-      <p>Close the window; the scheduler keeps hunting from the tray. Starts with Windows if you want it to.</p>
+      <p>Close the window; the scheduler keeps hunting from the tray. Starts at login if you want it to.</p>
     </div>
   </div>
 </section>
@@ -462,7 +462,16 @@
       </div>
       <div class="sub">Windows 10 / 11 · 64-bit · ~4 MB installer</div>
       <a class="btn btn-primary" href="/dl/0.3.6/Trawler_0.3.6_x64-setup.exe">Download for Windows</a>
-      <div class="alt"><a href="/dl/0.3.6/Trawler_0.3.6_x64_en-US.msi">MSI</a> · <a href="https://github.com/mediaheros/Trawler/releases">GitHub releases</a></div>
+      <div class="alt"><a href="/dl/0.3.6/Trawler_0.3.6_x64_en-US.msi">Prefer an MSI?</a></div>
+    </div>
+    <div class="dl-card primary">
+      <div class="os">
+        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M16.4 12.5c0-2 1.6-3 1.7-3.1-.9-1.4-2.4-1.5-2.9-1.6-1.2-.1-2.4.7-3 .7-.6 0-1.6-.7-2.6-.7-1.3 0-2.6.8-3.3 2-1.4 2.4-.4 6 1 8 .7.9 1.4 2 2.4 2 1 0 1.3-.6 2.5-.6s1.5.6 2.6.6c1 0 1.7-1 2.4-1.9.7-1.1 1-2.1 1-2.2-.1 0-2-.8-2-3.2ZM14.6 6.3c.5-.7.9-1.6.8-2.6-.8 0-1.8.5-2.3 1.2-.5.6-1 1.6-.8 2.5.9.1 1.8-.4 2.3-1.1Z"/></svg>
+        macOS
+      </div>
+      <div class="sub">Apple Silicon &amp; Intel · one universal app</div>
+      <a class="btn btn-primary" href="/dl/0.3.6/Trawler_0.3.6_universal.dmg">Download for Mac</a>
+      <div class="alt">macOS 12 or newer</div>
     </div>
     <div class="dl-card">
       <div class="os">
@@ -470,8 +479,8 @@
         Windows on ARM
       </div>
       <div class="sub">Surface &amp; Snapdragon PCs · native ARM64</div>
-      <a class="btn btn-ghost" href="https://github.com/mediaheros/Trawler/releases">Get from GitHub</a>
-      <div class="alt">x64 build also runs via emulation</div>
+      <a class="btn btn-ghost" href="https://github.com/mediaheros/Trawler">Coming soon</a>
+      <div class="alt">the x64 build already runs via emulation</div>
     </div>
     <div class="dl-card">
       <div class="os">
@@ -479,14 +488,15 @@
         Linux
       </div>
       <div class="sub">AppImage · .deb · .rpm</div>
-      <a class="btn btn-ghost" href="https://github.com/mediaheros/Trawler/releases">Get from GitHub</a>
-      <div class="alt">x64 · tray needs an AppIndicator extension on GNOME</div>
+      <a class="btn btn-ghost" href="https://github.com/mediaheros/Trawler">Coming soon</a>
+      <div class="alt">follow the repo to catch it</div>
     </div>
   </div>
   <p class="dl-note">
-    SmartScreen may ask once — <i>More info → Run anyway</i> (updater-signed; no Authenticode certificate yet).
-    After that Trawler keeps itself up to date. Pairs with <a href="https://prowlarr.com" style="color:var(--dim)">Prowlarr</a> and
-    <a href="https://www.qbittorrent.org" style="color:var(--dim)">qBittorrent</a>; the first-run wizard can set up both.
+    First launch: Windows SmartScreen may ask once — <i>More info → Run anyway</i>; on a Mac, right-click the app and choose <i>Open</i>
+    (updater-signed; no OS certificates yet). After that Trawler keeps itself up to date on both platforms.
+    Pairs with <a href="https://prowlarr.com" style="color:var(--dim)">Prowlarr</a> and
+    <a href="https://www.qbittorrent.org" style="color:var(--dim)">qBittorrent</a>; the first-run wizard sets up both by itself.
   </p>
 </section>
 
