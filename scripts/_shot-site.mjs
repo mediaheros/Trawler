@@ -1,5 +1,8 @@
 import puppeteer from "puppeteer-core";
-const OUT = "C:/Users/Shanti/AppData/Local/Temp/claude/C--Users-Shanti/9f1d4765-0506-4f4e-aa6c-1e89728c9913/scratchpad";
+import { mkdirSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+const OUT = fileURLToPath(new URL(".out/", import.meta.url));
+mkdirSync(OUT, { recursive: true });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const browser = await puppeteer.launch({
   executablePath: "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",

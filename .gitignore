@@ -7,3 +7,12 @@ src-tauri/gen/
 docs/dl/
 dev.cmd
 .claude/
+
+# private working notes for AI-assisted sessions
+CLAUDE.md
+
+# the updater signing key must never enter this repo, under any name
+*.key
+
+# local screenshot-rig output
+scripts/.out/
