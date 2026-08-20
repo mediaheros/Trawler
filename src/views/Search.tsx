@@ -17,7 +17,7 @@ import { Badge, Button, CenterMessage, Chip, SeederDot, Segmented, cx } from "..
 
 export default function SearchView() {
   const {
-    query, setQuery, kind, setKind, sort, setSort,
+    query, setQuery, kind, setKind, sort, setSort, sortThen, setSortThen,
     searching, hasSearched, results, searchError, runSearch,
     showHidden, setShowHidden, filters, setFilter,
   } = useStore();
@@ -64,17 +64,36 @@ export default function SearchView() {
     if (filters.codec) rel = rel.filter((r) => r.parsed.codec === filters.codec);
     if (filters.source) rel = rel.filter((r) => r.parsed.source === filters.source);
     const filteredCount = before - rel.length;
-    const val = (r: Release): number => {
-      switch (sort) {
+    const raw = (key: SortKey, r: Release): number => {
+      switch (key) {
         case "seeders": return r.seeders ?? 0;
         case "size": return r.size;
         case "age": return -ageDays(r);
         default: return r.score;
       }
     };
-    rel.sort((a, b) => val(b) - val(a));
+    // With a secondary sort, the primary is BANDED (seeder health bands,
+    // rough size classes, whole days) — otherwise exact values almost never
+    // tie and the secondary would never speak.
+    const band = (key: SortKey, r: Release): number => {
+      switch (key) {
+        case "seeders": return Math.floor(Math.log(Math.max(0, r.seeders ?? 0) + 1) / Math.log(3));
+        case "size": return Math.floor(Math.log2(r.size / 5e8 + 1));
+        case "age": return -Math.floor(ageDays(r));
+        default: return r.score;
+      }
+    };
+    const secondary = sort !== "score" && sortThen && sortThen !== sort ? sortThen : null;
+    rel.sort((a, b) => {
+      if (secondary) {
+        const p = band(sort, b) - band(sort, a);
+        if (p !== 0) return p;
+        return raw(secondary, b) - raw(secondary, a);
+      }
+      return raw(sort, b) - raw(sort, a);
+    });
     return { sorted: rel, hiddenCount, filteredCount };
-  }, [results, sort, showHidden, filters]);
+  }, [results, sort, sortThen, showHidden, filters]);
 
   const landing = !hasSearched;
 
@@ -238,6 +257,34 @@ export default function SearchView() {
                   { value: "age", label: "Newest" },
                 ]}
               />
+              {sort !== "score" && (
+                <span className="flex items-center gap-1" title="Break near-ties in the first sort with a second one — e.g. Seeds then Newest = the freshest of the well-seeded">
+                  <span className="text-faint">then</span>
+                  {(
+                    [
+                      ["seeders", "Seeds"],
+                      ["size", "Size"],
+                      ["age", "Newest"],
+                    ] as const
+                  )
+                    .filter(([k]) => k !== sort)
+                    .map(([k, label]) => (
+                      <button
+                        key={k}
+                        type="button"
+                        onClick={() => setSortThen(sortThen === k ? null : k)}
+                        className={cx(
+                          "cursor-pointer rounded-md px-1.5 py-0.5 text-[11px] transition-colors",
+                          sortThen === k
+                            ? "bg-accent-soft text-accent"
+                            : "bg-bg2 text-faint hover:bg-bg3 hover:text-dim",
+                        )}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                </span>
+              )}
             </div>
           </div>
         )}

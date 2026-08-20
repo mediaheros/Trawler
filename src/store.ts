@@ -58,9 +58,12 @@ interface Store {
   query: string;
   kind: Kind;
   sort: SortKey;
+  /** secondary sort: decides among releases the banded primary calls equal */
+  sortThen: SortKey | null;
   setQuery: (q: string) => void;
   setKind: (k: Kind) => void;
   setSort: (s: SortKey) => void;
+  setSortThen: (s: SortKey | null) => void;
   searching: boolean;
   hasSearched: boolean;
   results: SearchResponse | null;
@@ -176,6 +179,7 @@ export const useStore = create<Store>((set, get) => ({
   query: "",
   kind: "all",
   sort: "score",
+  sortThen: null,
   // typing a new query manually breaks any episode linkage
   setQuery: (query) => set({ query, episodeLink: null }),
   /** back to the landing hero: view + search state reset */
@@ -195,7 +199,14 @@ export const useStore = create<Store>((set, get) => ({
     }
   },
   setKind: (kind) => set({ kind }),
-  setSort: (sort) => set({ sort }),
+  // "Best" is already a composite score; a secondary only makes sense for
+  // single-key sorts, and never the same key twice
+  setSort: (sort) =>
+    set((st) => ({
+      sort,
+      sortThen: sort === "score" || st.sortThen === sort ? null : st.sortThen,
+    })),
+  setSortThen: (sortThen) => set({ sortThen }),
   searching: false,
   hasSearched: false,
   results: null,
