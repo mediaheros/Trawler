@@ -4845,7 +4845,7 @@ dependencies = [
 
 [[package]]
 name = "trawler"
-version = "0.3.10"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
