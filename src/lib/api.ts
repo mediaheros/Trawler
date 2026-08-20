@@ -37,7 +37,6 @@ export interface Config {
   rssEnabled: boolean;
   rssMinutes: number;
   downloadBackend: string;
-  bitportToken: string;
   upgradeScoutEnabled: boolean;
   upgradeWindowDays: number;
 }
@@ -709,7 +708,7 @@ const mockEpisodes: EpisodeRow[] = Array.from({ length: 19 }, (_, i) => {
 const mockChat: ChatRow[] = [];
 
 const mockFs = { done: false };
-const mockBp = { connected: false };
+const mockBp = { connected: false, deleted: new Set<string>() };
 const mockSetup: SetupStatus = {
   qbit: "missing",
   prowlarr: "missing",
@@ -804,7 +803,6 @@ async function mock(cmd: string, args?: Record<string, unknown>): Promise<unknow
         rssEnabled: true,
         rssMinutes: 15,
         downloadBackend: "qbittorrent",
-  bitportToken: "",
   upgradeScoutEnabled: false,
         upgradeWindowDays: 30,
       } satisfies Config;
@@ -859,7 +857,7 @@ async function mock(cmd: string, args?: Record<string, unknown>): Promise<unknow
           ? [
               { token: "bp1", name: "UFC.Fight.Night.720p.WEBRip.x265-PSA.mkv", status: "finished", substatus: null, progress: 100, size: null, fileId: "f1", folderId: null, src: null },
               { token: "bp2", name: "Lioness.S03E04.1080p.WEB.h264.mkv", status: "downloading", substatus: null, progress: 61, size: null, fileId: null, folderId: null, src: null },
-            ]
+            ].filter((t) => !mockBp.deleted.has(t.token))
           : [],
       } satisfies DownloadsView;
     case "torrent_action":
@@ -1013,6 +1011,7 @@ async function mock(cmd: string, args?: Record<string, unknown>): Promise<unknow
       mockBp.connected = false;
       return;
     case "bitport_delete":
+      mockBp.deleted.add(String((args as { token?: string })?.token));
       return;
     case "logs_recent": {
       const now = Date.now() / 1000;

@@ -63,8 +63,8 @@ pub struct GrabOrder {
 }
 
 pub enum GrabOutcome {
-    /// Sent to qBittorrent; ledger row written, episodes stamped.
-    Grabbed,
+    /// Accepted by the chosen backend; ledger row written, episodes stamped.
+    Grabbed { backend: &'static str },
     /// Another path is grabbing this content right now — treat as handled.
     AlreadyClaimed,
     /// The ledger already counts this content — nothing to do.
@@ -96,24 +96,44 @@ pub async fn dispatch(
     let backend: &'static str = if use_bitport { "bitport" } else { "qbittorrent" };
     let handle = tauri::async_runtime::spawn(async move {
         let _claim = claim; // released when the grab settles, even on panic
-        if use_bitport {
-            // Bitport takes a magnet (or a URL to a .torrent). The magnet is
-            // preferred; a Prowlarr download_url resolves to a magnet via the
-            // redirect handling in fetch_torrent for most public indexers.
-            let src = match order.magnet_url.clone().or_else(|| order.download_url.clone()) {
-                Some(s) => s,
-                None => {
-                    return Err(crate::error::AppError::Other(
-                        "this release offers no magnet or download link".into(),
-                    ))
+        let mut order = order;
+        let bp_token: Option<String> = if use_bitport {
+            // Bitport receives a magnet and nothing else: a download_url can
+            // carry Prowlarr's API key or a private-tracker passkey, and
+            // .torrent bytes embed the passkey in their announce URL — none
+            // of that may leave this machine. Resolve through local Prowlarr;
+            // most "torrent" links are magnet redirects anyway.
+            let src = if let Some(m) = order.magnet_url.clone() {
+                m
+            } else if let Some(du) = order.download_url.clone() {
+                let p = crate::commands::prowlarr_pub(&http, &cfg)?;
+                let (_bytes, magnet) = p.fetch_torrent(&du).await?;
+                match magnet {
+                    Some(m) => m,
+                    None => {
+                        return Err(crate::error::AppError::Other(
+                            "this release only offers a .torrent file — cloud grabs need a magnet link (uploading the file would hand tracker credentials to Bitport)".into(),
+                        ))
+                    }
                 }
+            } else {
+                return Err(crate::error::AppError::Other(
+                    "this release offers no magnet or download link".into(),
+                ))
             };
+            // the magnet's btih makes cloud completion/reaper matching exact
+            // even when the search result carried no info_hash
+            if order.info_hash.is_none() {
+                order.info_hash = crate::scheduler::magnet_hash(Some(&src));
+            }
             let bp = crate::bitport::BitportClient { http: &http, token: cfg.bitport_token.clone() };
-            bp.add_transfer(&src).await?;
+            let tok = bp.add_transfer(&src).await?;
             crate::applog::info("bitport", format!("sent to cloud: {}", order.title.chars().take(70).collect::<String>()));
+            tok
         } else {
             perform_grab_core(&http, &cfg, &order).await?;
-        }
+            None
+        };
         // A fresh connection, not AppState's: this task must outlive callers
         // that can be dropped mid-await, and the shared connection is not
         // 'static. If recording fails after qBittorrent accepted the add,
@@ -132,6 +152,7 @@ pub async fn dispatch(
                     order.size,
                     &ep_ids,
                     backend,
+                    bp_token.as_deref(),
                 )?;
                 if !ep_ids.is_empty() {
                     if let Err(e) = db::mark_grabbed(&conn, &ep_ids, &order.title) {
@@ -159,7 +180,7 @@ pub async fn dispatch(
     handle
         .await
         .map_err(|e| AppError::Other(format!("grab task failed: {e}")))??;
-    Ok(GrabOutcome::Grabbed)
+    Ok(GrabOutcome::Grabbed { backend })
 }
 
 #[cfg(test)]

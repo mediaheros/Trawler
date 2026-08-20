@@ -434,7 +434,7 @@ pub async fn proposal_resolve(state: State<'_, AppState>, id: i64, approve: bool
 
     let conn = state.db.lock().await;
     match outcome {
-        Ok(crate::grab::GrabOutcome::Grabbed) => {
+        Ok(crate::grab::GrabOutcome::Grabbed { .. }) => {
             conn.execute("UPDATE proposals SET status = 'approved' WHERE id = ?1", [id])
                 .map_err(db::db_err)?;
             db::log_activity(&conn, "agent", None, &format!("Approved proposal: {title}"));

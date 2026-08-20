@@ -459,7 +459,7 @@ pub async fn run_brief(app: &tauri::AppHandle, brief: &BriefRow) -> Result<Strin
             app,
             crate::notify::Kind::Grab,
             format!("Brief \u{201C}{}\u{201D} grabbed", brief.name),
-            format!("{} release(s) sent to qBittorrent", outcome.grabs),
+            format!("{} release(s) grabbed", outcome.grabs),
         );
     }
     if outcome.new_proposals > 0 {

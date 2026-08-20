@@ -45,13 +45,23 @@ fn qbit<'a>(http: &'a reqwest::Client, cfg: &Config) -> QbitClient<'a> {
 
 #[tauri::command]
 pub async fn get_config(state: State<'_, AppState>) -> Result<Config> {
-    Ok(state.config.read().await.clone())
+    // the Bitport token never travels to the webview: Settings round-trips
+    // the whole config as a draft, and a draft must be able to neither wipe
+    // nor read the secret
+    let mut cfg = state.config.read().await.clone();
+    cfg.bitport_token.clear();
+    Ok(cfg)
 }
 
 #[tauri::command]
 pub async fn set_config(state: State<'_, AppState>, config: Config) -> Result<Config> {
+    // only bitport_connect / bitport_disconnect write the token — whatever
+    // the frontend sends in that field is a stale blank, not intent
+    let mut config = config;
+    config.bitport_token = state.config.read().await.bitport_token.clone();
     config::save(&config)?;
     *state.config.write().await = config.clone();
+    config.bitport_token.clear();
     Ok(config)
 }
 
@@ -516,7 +526,10 @@ pub async fn grab(
     )
     .await?;
     let detail = match outcome {
-        crate::grab::GrabOutcome::Grabbed => format!("Sent to qBittorrent: {title}"),
+        crate::grab::GrabOutcome::Grabbed { backend } => match backend {
+            "bitport" => format!("Sent to your Bitport cloud: {title}"),
+            _ => format!("Sent to qBittorrent: {title}"),
+        },
         crate::grab::GrabOutcome::AlreadyClaimed => {
             "Already being grabbed right now — one moment".to_string()
         }
@@ -604,7 +617,12 @@ pub async fn downloads(state: State<'_, AppState>, all: bool) -> Result<Download
         vec![]
     } else {
         let bp = crate::bitport::BitportClient { http: &state.http, token: cfg.bitport_token.clone() };
-        bp.transfers().await.unwrap_or_default()
+        // short leash: this rides the 2s Downloads poll — a Bitport hiccup
+        // must never stall the local list behind a 20s network timeout
+        match tokio::time::timeout(std::time::Duration::from_secs(4), bp.transfers()).await {
+            Ok(Ok(t)) => t,
+            _ => vec![],
+        }
     };
     Ok(DownloadsView { torrents, transfer, cloud })
 }
@@ -637,7 +655,7 @@ pub async fn torrent_action(
         let h = hash.to_lowercase();
         // retire ledger rows for this torrent — hash first, title fallback
         let rows: Vec<(i64, String, Option<String>, Option<String>)> = conn
-            .prepare("SELECT id, title, info_hash, ep_ids FROM grab_ledger WHERE state IN ('grabbed','completed')")
+            .prepare("SELECT id, title, info_hash, ep_ids FROM grab_ledger WHERE state IN ('grabbed','completed') AND backend = 'qbittorrent'")
             .ok()
             .map(|mut stmt| {
                 stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
@@ -967,7 +985,7 @@ pub async fn bitport_authorize_url() -> Result<String> {
 /// Exchange the pasted authorization code and persist the token.
 #[tauri::command]
 pub async fn bitport_connect(state: State<'_, AppState>, code: String) -> Result<BitportStatus> {
-    let code = code.trim().to_string();
+    let code = crate::bitport::extract_code(&code);
     if code.is_empty() {
         return Err(AppError::Other("paste the code Bitport showed you".into()));
     }
@@ -1012,7 +1030,57 @@ pub async fn bitport_disconnect(state: State<'_, AppState>) -> Result<()> {
 pub async fn bitport_delete(state: State<'_, AppState>, token: String) -> Result<()> {
     let cfg = state.config.read().await.clone();
     let bp = crate::bitport::BitportClient { http: &state.http, token: cfg.bitport_token.clone() };
-    bp.delete_transfer(&token).await
+    // capture the transfer's identity before it disappears — removing a cloud
+    // grab must RELEASE it in Trawler, exactly like deleting a local torrent:
+    // the ledger's anti-double-grab memory must not outlive the thing it
+    // points at, or a deliberate re-download stays blocked forever
+    let victim = bp.transfers().await.ok().and_then(|ts| ts.into_iter().find(|t| t.token == token));
+    bp.delete_transfer(&token).await?;
+    let vic_hash = victim.as_ref().and_then(crate::bitport::transfer_hash);
+    let vic_norm = victim.as_ref().map(|t| normalize(&t.name));
+    let conn = state.db.lock().await;
+    let rows: Vec<(i64, String, Option<String>, Option<String>, Option<String>)> = conn
+        .prepare("SELECT id, title, info_hash, ep_ids, bp_token FROM grab_ledger WHERE backend = 'bitport' AND state IN ('grabbed','completed')")
+        .ok()
+        .map(|mut stmt| {
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+                .map(|it| it.flatten().collect::<Vec<_>>())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    let mut freed = 0usize;
+    let mut freed_name = String::new();
+    for (id, title, info_hash, ep_ids_raw, bp_token) in rows {
+        let tok_match = bp_token.as_deref() == Some(token.as_str());
+        let hash_match = match (&info_hash, &vic_hash) {
+            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+            _ => false,
+        };
+        let norm_match = vic_norm.as_ref().map(|n| &normalize(&title) == n).unwrap_or(false);
+        if tok_match || hash_match || norm_match {
+            let _ = conn.execute("UPDATE grab_ledger SET state = 'removed' WHERE id = ?1", [id]);
+            crate::db::set_episodes_state_by_ids(
+                &conn,
+                &crate::db::parse_ep_ids(ep_ids_raw.as_deref()),
+                "wanted",
+                None,
+            );
+            freed += 1;
+            freed_name = title;
+        }
+    }
+    if freed > 0 {
+        crate::db::log_activity(
+            &conn,
+            "system",
+            None,
+            &format!(
+                "Removed from your cloud: {} — released; Trawler can grab it again",
+                freed_name.chars().take(60).collect::<String>()
+            ),
+        );
+    }
+    Ok(())
 }
 
 // ---------- log console ----------

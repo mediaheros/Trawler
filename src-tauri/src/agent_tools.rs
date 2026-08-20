@@ -347,7 +347,7 @@ async fn grab_release(state: &AppState, ctx: &mut RunCtx, args: &Value) -> Value
     )
     .await;
     match outcome {
-        Ok(crate::grab::GrabOutcome::Grabbed) => {
+        Ok(crate::grab::GrabOutcome::Grabbed { .. }) => {
             ctx.grabs_done += 1;
             ctx.gb_done += size_gb;
             ctx.grabbed_titles.push(stored.title.clone());

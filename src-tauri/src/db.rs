@@ -90,7 +90,8 @@ pub fn open() -> Result<Connection> {
            state TEXT NOT NULL DEFAULT 'grabbed',
            ts INTEGER NOT NULL,
            ep_ids TEXT,
-           backend TEXT NOT NULL DEFAULT 'qbittorrent'
+           backend TEXT NOT NULL DEFAULT 'qbittorrent',
+           bp_token TEXT
          );
          CREATE INDEX IF NOT EXISTS idx_ledger_key ON grab_ledger(content_key);
 
@@ -148,6 +149,7 @@ pub fn open() -> Result<Connection> {
         "ALTER TABLE grab_ledger ADD COLUMN backend TEXT NOT NULL DEFAULT 'qbittorrent'",
         [],
     );
+    let _ = conn.execute("ALTER TABLE grab_ledger ADD COLUMN bp_token TEXT", []);
     if let Err(e) = conn.execute("ALTER TABLE grab_ledger ADD COLUMN ep_ids TEXT", []) {
         let msg = e.to_string();
         if !msg.contains("duplicate column") {
@@ -245,6 +247,7 @@ pub fn ledger_insert(
     size: i64,
     ep_ids: &[i64],
     backend: &str,
+    bp_token: Option<&str>,
 ) -> Result<()> {
     let eps_json = if ep_ids.is_empty() {
         None
@@ -252,9 +255,9 @@ pub fn ledger_insert(
         serde_json::to_string(ep_ids).ok()
     };
     conn.execute(
-        "INSERT INTO grab_ledger (content_key, brief_id, title, info_hash, size, state, ts, ep_ids, backend)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'grabbed', ?6, ?7, ?8)",
-        rusqlite::params![content_key, brief_id, title, info_hash, size, now(), eps_json, backend],
+        "INSERT INTO grab_ledger (content_key, brief_id, title, info_hash, size, state, ts, ep_ids, backend, bp_token)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'grabbed', ?6, ?7, ?8, ?9)",
+        rusqlite::params![content_key, brief_id, title, info_hash, size, now(), eps_json, backend, bp_token],
     )
     .map_err(db_err)?;
     Ok(())

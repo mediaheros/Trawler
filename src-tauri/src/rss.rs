@@ -366,7 +366,7 @@ pub async fn sweep(app: &AppHandle) -> Result<SweepStats> {
         )
         .await;
         match outcome {
-            Ok(crate::grab::GrabOutcome::Grabbed) => {
+            Ok(crate::grab::GrabOutcome::Grabbed { .. }) => {
                 episode_grabs += 1;
                 {
                     let conn = state.db.lock().await;
@@ -456,7 +456,7 @@ pub async fn sweep(app: &AppHandle) -> Result<SweepStats> {
             )
             .await;
             match outcome {
-                Ok(crate::grab::GrabOutcome::Grabbed) => {
+                Ok(crate::grab::GrabOutcome::Grabbed { .. }) => {
                     *used += 1;
                     *gb_this_sweep.get_mut(&brief_id).unwrap() += size_gb;
                     brief_grabs += 1;

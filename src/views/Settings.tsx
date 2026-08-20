@@ -447,7 +447,7 @@ export default function SettingsView() {
           <div className="grid grid-cols-2 gap-x-6 gap-y-2.5">
             {(
               [
-                ["notifyGrabs", "Grabs", "A release was sent to qBittorrent"],
+                ["notifyGrabs", "Grabs", "A release was sent to your download client"],
                 ["notifyCompletions", "Completed downloads", "Something finished downloading"],
                 ["notifyProposals", "Proposals", "The agent wants your approval on a release"],
                 ["notifyErrors", "Problems", "Dead swarms and failed grabs"],
@@ -886,16 +886,20 @@ function BitportCard({ backend, onBackend }: { backend: string; onBackend: (b: s
                   Plan <span className="font-medium text-ink">{status.quota.planName}</span>
                   {status.quota.planExpired && <span className="ml-1 text-bad">expired</span>}
                 </span>
-                <span className="text-faint">
-                  {(status.quota.diskUsed / 1e9).toFixed(0)} / {(status.quota.diskSize / 1e9).toFixed(0)} GB used
-                </span>
+                {status.quota.diskSize > 0 && (
+                  <span className="text-faint">
+                    {(status.quota.diskUsed / 1e9).toFixed(0)} / {(status.quota.diskSize / 1e9).toFixed(0)} GB used
+                  </span>
+                )}
               </div>
-              <div className="mt-1.5 h-[5px] overflow-hidden rounded-full bg-bg3">
-                <div
-                  className={cx("h-full rounded-full", status.quota.diskUsed / status.quota.diskSize > 0.9 ? "bg-bad" : "bg-accent2")}
-                  style={{ width: Math.min(100, (status.quota.diskUsed / status.quota.diskSize) * 100) + "%" }}
-                />
-              </div>
+              {status.quota.diskSize > 0 && (
+                <div className="mt-1.5 h-[5px] overflow-hidden rounded-full bg-bg3">
+                  <div
+                    className={cx("h-full rounded-full", status.quota.diskUsed / status.quota.diskSize > 0.9 ? "bg-bad" : "bg-accent2")}
+                    style={{ width: Math.min(100, (status.quota.diskUsed / status.quota.diskSize) * 100) + "%" }}
+                  />
+                </div>
+              )}
             </div>
           )}
           <Field label="Where do grabs go?" hint="Applies after Save — every grab path honors it">

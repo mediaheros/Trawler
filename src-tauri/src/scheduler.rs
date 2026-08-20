@@ -246,7 +246,7 @@ async fn execute_plan(app: &tauri::AppHandle, state: &AppState, plan: &PlannedGr
     .await;
 
     match outcome {
-        Ok(crate::grab::GrabOutcome::Grabbed) => {
+        Ok(crate::grab::GrabOutcome::Grabbed { .. }) => {
             let what = if plan.is_pack {
                 format!("{} S{:02} season pack", plan.show_name, plan.season)
             } else {
@@ -322,7 +322,7 @@ fn reopen_dead_grabs(
         let norm = normalize(&t.name);
         // match by normalized title against still-open grabs
         let hit: Option<(i64, String, i64, Option<String>)> = conn
-            .prepare("SELECT id, title, size, ep_ids FROM grab_ledger WHERE state = 'grabbed'")
+            .prepare("SELECT id, title, size, ep_ids FROM grab_ledger WHERE state = 'grabbed' AND backend = 'qbittorrent'")
             .ok()
             .and_then(|mut stmt| {
                 stmt.query_map([], |r| {
@@ -541,9 +541,13 @@ pub(crate) fn magnet_hash(magnet: Option<&str>) -> Option<String> {
     }
 }
 
-/// Cloud-side completion: a Bitport transfer reporting "finished" flips its
-/// ledger row and linked episodes exactly like a finished local torrent —
-/// matched by the btih from the transfer's source magnet, title as fallback.
+/// Cloud-side completion and reaping. A Bitport transfer reporting
+/// "finished" flips its ledger row and linked episodes exactly like a
+/// finished local torrent; a transfer that has VANISHED from the account
+/// (deleted in Bitport's own UI, or an add that never stuck) releases its
+/// row and episodes, mirroring the local orphan reaper. Rows are matched by
+/// the transfer token stored at grab time; the magnet's btih and the title
+/// cover rows without one.
 async fn bitport_completion_pass(app: &tauri::AppHandle, state: &AppState) {
     let cfg = state.config.read().await.clone();
     if cfg.bitport_token.is_empty() {
@@ -553,10 +557,17 @@ async fn bitport_completion_pass(app: &tauri::AppHandle, state: &AppState) {
     let transfers = match bp.transfers().await {
         Ok(t) => t,
         Err(e) => {
+            // no reaping on a failed poll — absence of evidence only counts
+            // when the account actually answered
             crate::applog::warn("bitport", format!("transfer poll failed: {e}"));
             return;
         }
     };
+    let done_tokens: std::collections::HashSet<&str> = transfers
+        .iter()
+        .filter(|t| t.status == "finished")
+        .map(|t| t.token.as_str())
+        .collect();
     let done_hashes: std::collections::HashSet<String> = transfers
         .iter()
         .filter(|t| t.status == "finished")
@@ -567,24 +578,40 @@ async fn bitport_completion_pass(app: &tauri::AppHandle, state: &AppState) {
         .filter(|t| t.status == "finished")
         .map(|t| normalize(&t.name))
         .collect();
-    if done_hashes.is_empty() && done_norms.is_empty() {
-        return;
-    }
+    let live_tokens: std::collections::HashSet<&str> =
+        transfers.iter().map(|t| t.token.as_str()).collect();
+    let live_hashes: std::collections::HashSet<String> =
+        transfers.iter().filter_map(crate::bitport::transfer_hash).collect();
+    let live_norms: std::collections::HashSet<String> =
+        transfers.iter().map(|t| normalize(&t.name)).collect();
+    let reap_cutoff = db::now() - 5 * 60; // covers the add-to-listing gap
+    let recent_cutoff = db::now() - 3 * 86_400; // first cycle after an upgrade may flip a backlog
+    let mut completed_display: Vec<String> = vec![];
     let conn = state.db.lock().await;
-    let rows: Vec<(i64, String, Option<String>, Option<String>)> = conn
-        .prepare("SELECT id, title, info_hash, ep_ids FROM grab_ledger WHERE state = 'grabbed' AND backend = 'bitport'")
+    let rows: Vec<(i64, String, Option<String>, Option<String>, Option<String>, i64)> = conn
+        .prepare("SELECT id, title, info_hash, ep_ids, bp_token, ts FROM grab_ledger WHERE state = 'grabbed' AND backend = 'bitport'")
         .ok()
         .map(|mut stmt| {
-            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
-                .map(|it| it.flatten().collect::<Vec<_>>())
-                .unwrap_or_default()
+            stmt.query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+            })
+            .map(|it| it.flatten().collect::<Vec<_>>())
+            .unwrap_or_default()
         })
         .unwrap_or_default();
-    for (id, title, info_hash, ep_ids_raw) in rows {
-        let hash_done = info_hash
-            .map(|h| done_hashes.contains(&h.to_ascii_lowercase()))
-            .unwrap_or(false);
-        if hash_done || done_norms.contains(&normalize(&title)) {
+    for (id, title, info_hash, ep_ids_raw, bp_token, ts) in rows {
+        let h = info_hash.map(|x| x.to_ascii_lowercase());
+        let norm = normalize(&title);
+        // a row WITH a token must not complete off an unrelated old transfer
+        // that happens to share an infohash — token match is exact
+        let is_done = match bp_token.as_deref() {
+            Some(tok) => done_tokens.contains(tok),
+            None => {
+                h.as_ref().map(|x| done_hashes.contains(x)).unwrap_or(false)
+                    || done_norms.contains(&norm)
+            }
+        };
+        if is_done {
             let _ = conn.execute("UPDATE grab_ledger SET state = 'completed' WHERE id = ?1", [id]);
             db::set_episodes_state_by_ids(&conn, &db::parse_ep_ids(ep_ids_raw.as_deref()), "downloaded", None);
             db::log_activity(
@@ -593,7 +620,43 @@ async fn bitport_completion_pass(app: &tauri::AppHandle, state: &AppState) {
                 None,
                 &format!("Finished in the cloud: {}", title.chars().take(60).collect::<String>()),
             );
+            if ts >= recent_cutoff {
+                completed_display.push(title.chars().take(60).collect());
+            }
+            continue;
         }
+        let is_present = match bp_token.as_deref() {
+            Some(tok) => live_tokens.contains(tok),
+            None => {
+                h.as_ref().map(|x| live_hashes.contains(x)).unwrap_or(false)
+                    || live_norms.contains(&norm)
+            }
+        };
+        if !is_present && ts < reap_cutoff {
+            let _ = conn.execute("UPDATE grab_ledger SET state = 'removed' WHERE id = ?1", [id]);
+            db::set_episodes_state_by_ids(&conn, &db::parse_ep_ids(ep_ids_raw.as_deref()), "wanted", None);
+            db::log_activity(
+                &conn,
+                "system",
+                None,
+                &format!(
+                    "{} vanished from your Bitport cloud — its claim is released, Trawler can grab again",
+                    title.chars().take(60).collect::<String>()
+                ),
+            );
+        }
+    }
+    drop(conn);
+    if !completed_display.is_empty() {
+        let (title, body) = if completed_display.len() == 1 {
+            ("Finished in the cloud".to_string(), completed_display[0].clone())
+        } else {
+            (
+                format!("{} cloud transfers finished", completed_display.len()),
+                completed_display.iter().take(6).cloned().collect::<Vec<_>>().join("\n"),
+            )
+        };
+        crate::notify::dispatch(app, crate::notify::Kind::Complete, title, body);
     }
 }
 
@@ -703,7 +766,7 @@ async fn completion_pass(app: &tauri::AppHandle, state: &AppState) -> Vec<DeadGr
     // "this finished" via the ledger's infohash and fold it into the name set
     if !done_hashes.is_empty() {
         if let Ok(mut stmt) =
-            conn.prepare("SELECT title, info_hash FROM grab_ledger WHERE info_hash IS NOT NULL")
+            conn.prepare("SELECT title, info_hash FROM grab_ledger WHERE info_hash IS NOT NULL AND backend = 'qbittorrent'")
         {
             let rows = stmt
                 .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))

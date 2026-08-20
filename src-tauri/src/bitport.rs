@@ -135,8 +135,11 @@ impl BitportClient<'_> {
             .unwrap_or_default())
     }
 
-    /// Submit a magnet (or a URL to a .torrent) to the cloud.
-    pub async fn add_transfer(&self, torrent: &str) -> Result<()> {
+    /// Submit a magnet to the cloud; returns the new transfer's token when
+    /// the response carries one, so the ledger can match it exactly later.
+    /// (The API also accepts URLs on this field — Trawler never sends one,
+    /// because a local download_url can carry credentials.)
+    pub async fn add_transfer(&self, torrent: &str) -> Result<Option<String>> {
         let resp = self
             .http
             .post(format!("{BASE}/transfers"))
@@ -145,7 +148,8 @@ impl BitportClient<'_> {
             .timeout(std::time::Duration::from_secs(30))
             .send()
             .await?;
-        unwrap_envelope(resp.json().await?).map(|_| ())
+        let d = unwrap_envelope(resp.json().await?)?;
+        Ok(token_from_add_response(&d))
     }
 
     pub async fn delete_transfer(&self, token: &str) -> Result<()> {
@@ -157,6 +161,30 @@ impl BitportClient<'_> {
             .send()
             .await?;
         unwrap_envelope(resp.json().await?).map(|_| ())
+    }
+}
+
+/// The add response's data shape isn't pinned by a live probe — pull the
+/// token defensively from an object or a one-element array; None just means
+/// completion matching falls back to the magnet's btih.
+fn token_from_add_response(d: &serde_json::Value) -> Option<String> {
+    let obj = if d.is_array() { d.as_array()?.first()? } else { d };
+    obj.get("token").and_then(|v| v.as_str()).map(str::to_string)
+}
+
+/// Users paste either the bare authorization code or the whole redirect URL
+/// from the address bar — accept both.
+pub fn extract_code(input: &str) -> String {
+    let s = input.trim();
+    if let Some(i) = s.find("code=") {
+        s[i + 5..]
+            .split(['&', '#', '?'])
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    } else {
+        s.to_string()
     }
 }
 
@@ -197,6 +225,20 @@ pub fn transfer_hash(t: &BitportTransfer) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn add_response_token_and_pasted_code_parse() {
+        use serde_json::json;
+        assert_eq!(token_from_add_response(&json!({"token": "abC1", "name": "x"})).as_deref(), Some("abC1"));
+        assert_eq!(token_from_add_response(&json!([{"token": "t2"}])).as_deref(), Some("t2"));
+        assert_eq!(token_from_add_response(&json!({"ok": true})), None);
+        assert_eq!(extract_code("04ccde79"), "04ccde79");
+        assert_eq!(
+            extract_code("http://127.0.0.1:28688/bitport-callback?code=04ccde79&state=x"),
+            "04ccde79"
+        );
+        assert_eq!(extract_code("  code=abc#frag  "), "abc");
+    }
 
     #[test]
     fn progress_parses_defensively() {
