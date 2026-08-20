@@ -85,7 +85,8 @@ pub fn open() -> Result<Connection> {
            info_hash TEXT,
            size INTEGER NOT NULL DEFAULT 0,
            state TEXT NOT NULL DEFAULT 'grabbed',
-           ts INTEGER NOT NULL
+           ts INTEGER NOT NULL,
+           ep_ids TEXT
          );
          CREATE INDEX IF NOT EXISTS idx_ledger_key ON grab_ledger(content_key);
 
@@ -139,7 +140,58 @@ pub fn open() -> Result<Connection> {
     let _ = conn.execute("ALTER TABLE shows ADD COLUMN search_alias TEXT", []);
     // which episodes a grab belongs to, as a JSON id array — durable linkage
     // that survives unfollow/refollow (grabbed_title matching does not)
-    let _ = conn.execute("ALTER TABLE grab_ledger ADD COLUMN ep_ids TEXT", []);
+    if let Err(e) = conn.execute("ALTER TABLE grab_ledger ADD COLUMN ep_ids TEXT", []) {
+        let msg = e.to_string();
+        if !msg.contains("duplicate column") {
+            eprintln!("[trawler] ep_ids migration failed: {msg}");
+        }
+    }
+    // one-shot backfill: link every healthy in-flight grab to its episodes by
+    // the title match that still works TODAY, so the linkage survives the
+    // refollow that would otherwise sever it tomorrow
+    let backfilled: Option<String> = conn
+        .query_row("SELECT value FROM meta WHERE key = 'ledger_ep_backfill'", [], |r| r.get(0))
+        .ok();
+    if backfilled.is_none() {
+        let rows: Vec<(i64, String)> = conn
+            .prepare("SELECT id, title FROM grab_ledger WHERE state IN ('grabbed','completed') AND ep_ids IS NULL")
+            .ok()
+            .map(|mut stmt| {
+                stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .map(|it| it.flatten().collect::<Vec<_>>())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        let eps: Vec<(i64, String)> = conn
+            .prepare("SELECT tvmaze_ep_id, grabbed_title FROM episodes WHERE grabbed_title IS NOT NULL")
+            .ok()
+            .map(|mut stmt| {
+                stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .map(|it| it.flatten().collect::<Vec<_>>())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        for (id, title) in rows {
+            let norm = crate::commands::normalize(&title);
+            let linked: Vec<i64> = eps
+                .iter()
+                .filter(|(_, gt)| crate::commands::normalize(gt) == norm)
+                .map(|(e, _)| *e)
+                .collect();
+            if !linked.is_empty() {
+                if let Ok(json) = serde_json::to_string(&linked) {
+                    let _ = conn.execute(
+                        "UPDATE grab_ledger SET ep_ids = ?2 WHERE id = ?1",
+                        rusqlite::params![id, json],
+                    );
+                }
+            }
+        }
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('ledger_ep_backfill', '1')",
+            [],
+        );
+    }
     let _ = conn.execute(
         "ALTER TABLE shows ADD COLUMN alias_status TEXT",
         [],
@@ -181,8 +233,6 @@ pub fn ledger_insert(
     );
 }
 
-/// Everything already grabbed or completed for this content: (title, size).
-/// The upgrade scout uses this to see what quality the user already has.
 /// Parse a ledger row's ep_ids JSON into ids (empty when absent/invalid).
 pub fn parse_ep_ids(raw: Option<&str>) -> Vec<i64> {
     raw.and_then(|r| serde_json::from_str::<Vec<i64>>(r).ok()).unwrap_or_default()
@@ -191,33 +241,45 @@ pub fn parse_ep_ids(raw: Option<&str>) -> Vec<i64> {
 /// Flip a grab's linked episodes to a new state by id — the linkage that
 /// keeps working after unfollow/refollow wipes grabbed_title.
 pub fn set_episodes_state_by_ids(conn: &Connection, ids: &[i64], state: &str, grabbed_title: Option<&str>) {
-    for id in ids {
-        match (state, grabbed_title) {
-            ("downloaded", _) => {
-                let _ = conn.execute(
-                    "UPDATE episodes SET state = 'downloaded' WHERE tvmaze_ep_id = ?1 AND state != 'ignored'",
-                    [id],
-                );
-            }
-            ("grabbed", Some(t)) => {
-                let _ = conn.execute(
-                    "UPDATE episodes SET state = 'grabbed', grabbed_title = ?2, grabbed_at = COALESCE(grabbed_at, ?3)
-                     WHERE tvmaze_ep_id = ?1 AND state = 'wanted'",
-                    rusqlite::params![id, t, now()],
-                );
-            }
-            ("wanted", _) => {
-                let _ = conn.execute(
-                    "UPDATE episodes SET state = 'wanted', grabbed_title = NULL, grabbed_at = NULL, last_searched_at = 0
-                     WHERE tvmaze_ep_id = ?1 AND state = 'grabbed'",
-                    [id],
-                );
-            }
-            _ => {}
+    if ids.is_empty() {
+        return;
+    }
+    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    match (state, grabbed_title) {
+        ("downloaded", _) => {
+            let sql = format!(
+                "UPDATE episodes SET state = 'downloaded' WHERE tvmaze_ep_id IN ({placeholders}) AND state != 'ignored'"
+            );
+            let _ = conn.execute(&sql, rusqlite::params_from_iter(ids.iter()));
+        }
+        ("grabbed", Some(t)) => {
+            // grabbed_title IS NULL is the discriminator: a refollow recreates
+            // rows without it, while a user's deliberate "want this again"
+            // (set_episode_state) preserves it — never fight the user
+            let sql = format!(
+                "UPDATE episodes SET state = 'grabbed', grabbed_title = ?1, grabbed_at = COALESCE(grabbed_at, ?2)
+                 WHERE tvmaze_ep_id IN ({placeholders}) AND state = 'wanted' AND grabbed_title IS NULL"
+            );
+            let mut params: Vec<rusqlite::types::Value> =
+                vec![t.to_string().into(), now().into()];
+            params.extend(ids.iter().map(|i| rusqlite::types::Value::from(*i)));
+            let _ = conn.execute(&sql, rusqlite::params_from_iter(params));
+        }
+        ("wanted", _) => {
+            let sql = format!(
+                "UPDATE episodes SET state = 'wanted', grabbed_title = NULL, grabbed_at = NULL, last_searched_at = 0
+                 WHERE tvmaze_ep_id IN ({placeholders}) AND state = 'grabbed'"
+            );
+            let _ = conn.execute(&sql, rusqlite::params_from_iter(ids.iter()));
+        }
+        (other, _) => {
+            eprintln!("[trawler] set_episodes_state_by_ids: unsupported state {other}");
         }
     }
 }
 
+/// Everything already grabbed or completed for this content: (title, size).
+/// The upgrade scout uses this to see what quality the user already has.
 pub fn ledger_entries(conn: &Connection, content_key: &str) -> Vec<(String, i64)> {
     conn.prepare(
         "SELECT title, size FROM grab_ledger WHERE content_key = ?1 AND state IN ('grabbed','completed')",

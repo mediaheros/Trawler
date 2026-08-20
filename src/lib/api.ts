@@ -393,12 +393,15 @@ export const api = {
   listIndexers: () => call<Indexer[]>("list_indexers"),
   search: (query: string, kind: string, indexerIds: number[] = []) =>
     call<SearchResponse>("search", { query, kind, indexerIds }),
-  grab: (r: Release) =>
+  grab: (r: Release, epIds: number[] = []) =>
     call<GrabResult>("grab", {
       title: r.title,
       kind: r.kind,
       magnetUrl: r.magnetUrl,
       downloadUrl: r.downloadUrl,
+      infoHash: r.infoHash,
+      size: r.size,
+      epIds,
     }),
   downloads: (all = false) => call<DownloadsView>("downloads", { all }),
   torrentAction: (action: string, hash: string) =>

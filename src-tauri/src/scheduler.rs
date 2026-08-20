@@ -288,6 +288,8 @@ pub struct DeadGrab {
     pub title: String,
     pub qbt_hash: String,
     pub size: i64,
+    /// episodes the dead grab was for — the medic's replacement re-links them
+    pub ep_ids: Vec<i64>,
 }
 
 /// Reopen ledger entries whose torrents are demonstrably dead — stuck fetching
@@ -309,17 +311,18 @@ fn reopen_dead_grabs(
         }
         let norm = normalize(&t.name);
         // match by normalized title against still-open grabs
-        let hit: Option<(i64, String, i64)> = conn
-            .prepare("SELECT id, title, size FROM grab_ledger WHERE state = 'grabbed'")
+        let hit: Option<(i64, String, i64, Option<String>)> = conn
+            .prepare("SELECT id, title, size, ep_ids FROM grab_ledger WHERE state = 'grabbed'")
             .ok()
             .and_then(|mut stmt| {
                 stmt.query_map([], |r| {
-                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get(3)?))
                 })
                 .ok()
-                .and_then(|rows| rows.flatten().find(|(_, title, _)| normalize(title) == norm))
+                .and_then(|rows| rows.flatten().find(|(_, title, _, _)| normalize(title) == norm))
             });
-        if let Some((id, title, size)) = hit {
+        if let Some((id, title, size, ep_ids_raw)) = hit {
+            let linked_ids = db::parse_ep_ids(ep_ids_raw.as_deref());
             let _ = conn.execute("UPDATE grab_ledger SET state = 'stalled' WHERE id = ?1", [id]);
             // hand the episode back to the scheduler: without this it sits in
             // 'grabbed' forever pointing at a dead release, and nothing —
@@ -330,11 +333,7 @@ fn reopen_dead_grabs(
                  WHERE state = 'grabbed' AND grabbed_title = ?1",
                 [&title],
             );
-            let linked: Option<String> = conn
-                .query_row("SELECT ep_ids FROM grab_ledger WHERE id = ?1", [id], |r| r.get(0))
-                .ok()
-                .flatten();
-            db::set_episodes_state_by_ids(&conn, &db::parse_ep_ids(linked.as_deref()), "wanted", None);
+            db::set_episodes_state_by_ids(&conn, &linked_ids, "wanted", None);
             // A stalled UPGRADE grab (same content key already completed once)
             // needs no medic — the user keeps the copy they already have, and
             // the agent would only refuse "already grabbed" replacements.
@@ -372,6 +371,7 @@ fn reopen_dead_grabs(
                 title,
                 qbt_hash: t.hash.clone(),
                 size: if size > 0 { size } else { t.size },
+                ep_ids: linked_ids.clone(),
             });
         }
     }
@@ -442,6 +442,7 @@ async fn medic_pass(app: &tauri::AppHandle, state: &AppState, dead: Vec<DeadGrab
         );
         ctx.max_searches = 4;
         ctx.max_grabs = 1;
+        ctx.medic_ep_ids = item.ep_ids.clone();
         ctx.max_gb = ((item.size as f64 / 1e9) * 2.0).max(3.0);
 
         let messages = vec![
@@ -556,6 +557,8 @@ async fn completion_pass(app: &tauri::AppHandle, state: &AppState) -> Vec<DeadGr
 
     let mut completed_display: Vec<String> = vec![];
     let conn = state.db.lock().await;
+    // NOTE: no early return on "nothing finished" — the resync and orphan
+    // logic below must run even (especially) when everything is mid-download
     // magnet grabs: qBt renames the torrent once metadata lands, so recover
     // "this finished" via the ledger's infohash and fold it into the name set
     if !done_hashes.is_empty() {
@@ -583,16 +586,16 @@ async fn completion_pass(app: &tauri::AppHandle, state: &AppState) -> Vec<DeadGr
         let all_hashes: std::collections::HashSet<String> =
             torrents.iter().map(|t| t.hash.to_ascii_lowercase()).collect();
         let cutoff = db::now() - 5 * 60; // covers the add-to-listing gap; a magnet mid-metaDL is already listed
-        let rows: Vec<(i64, String, Option<String>)> = conn
-            .prepare("SELECT id, title, info_hash FROM grab_ledger WHERE state = 'grabbed' AND ts < ?1")
+        let rows: Vec<(i64, String, Option<String>, Option<String>)> = conn
+            .prepare("SELECT id, title, info_hash, ep_ids FROM grab_ledger WHERE state = 'grabbed' AND ts < ?1")
             .ok()
             .map(|mut stmt| {
-                stmt.query_map([cutoff], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                stmt.query_map([cutoff], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
                     .map(|it| it.flatten().collect::<Vec<_>>())
                     .unwrap_or_default()
             })
             .unwrap_or_default();
-        for (id, title, info_hash) in rows {
+        for (id, title, info_hash, ep_ids_raw) in rows {
             let hash_present = info_hash
                 .map(|h| all_hashes.contains(&h.to_ascii_lowercase()))
                 .unwrap_or(false);
@@ -606,11 +609,7 @@ async fn completion_pass(app: &tauri::AppHandle, state: &AppState) -> Vec<DeadGr
                  WHERE state = 'grabbed' AND grabbed_title = ?1",
                 [&title],
             );
-            let linked: Option<String> = conn
-                .query_row("SELECT ep_ids FROM grab_ledger WHERE id = ?1", [id], |r| r.get(0))
-                .ok()
-                .flatten();
-            db::set_episodes_state_by_ids(&conn, &db::parse_ep_ids(linked.as_deref()), "wanted", None);
+            db::set_episodes_state_by_ids(&conn, &db::parse_ep_ids(ep_ids_raw.as_deref()), "wanted", None);
             db::log_activity(
                 &conn,
                 "system",
@@ -623,11 +622,6 @@ async fn completion_pass(app: &tauri::AppHandle, state: &AppState) -> Vec<DeadGr
         }
     }
     let dead = reopen_dead_grabs(&conn, &torrents);
-    if done.is_empty() {
-        drop(conn);
-        notify_dead(app, &dead);
-        return dead;
-    }
     // display names dedupe on the normalized torrent title, since an episode
     // grab appears both in episodes and in the shared ledger
     let mut seen_norms: std::collections::HashSet<String> = Default::default();
@@ -797,6 +791,12 @@ async fn run_cycle_inner(app: &tauri::AppHandle, state: &AppState) -> Result<usi
         crate::rss::promote_aired(&conn);
         db::list_shows(&conn)?
     };
+    // completion + resync FIRST: the planner must see post-resync episode
+    // states, or the first cycle after a refollow can double-grab a season
+    // pack whose episodes still read as wanted
+    let dead = completion_pass(app, state).await;
+    medic_pass(app, state, dead).await;
+
     let now = db::now();
     let mut grabs = 0usize;
     // the follow path gets the same rails briefs have: a per-cycle grab cap
@@ -858,8 +858,6 @@ async fn run_cycle_inner(app: &tauri::AppHandle, state: &AppState) -> Result<usi
         }
     }
 
-    let dead = completion_pass(app, state).await;
-    medic_pass(app, state, dead).await;
     Ok(grabs)
 }
 

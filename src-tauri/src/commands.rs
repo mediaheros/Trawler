@@ -458,6 +458,9 @@ pub async fn grab(
     kind: String, // "movie" | "tv" | "other"
     magnet_url: Option<String>,
     download_url: Option<String>,
+    info_hash: Option<String>,
+    size: Option<i64>,
+    ep_ids: Option<Vec<i64>>,
 ) -> Result<GrabResult> {
     let cfg = state.config.read().await.clone();
     let save_path = match kind.as_str() {
@@ -466,7 +469,24 @@ pub async fn grab(
         _ => String::new(),
     };
     let save_path = if save_path.is_empty() { None } else { Some(save_path) };
-    perform_grab(state.inner(), &title, magnet_url, download_url, save_path).await
+    let result = perform_grab(state.inner(), &title, magnet_url, download_url, save_path).await?;
+    // manual grabs join the ledger too: they count as "already have" for the
+    // scout and the scheduler, and they survive unfollow/refollow like any
+    // other grab instead of living on a fragile title string
+    {
+        let conn = state.db.lock().await;
+        let ck = crate::briefs::content_key(&title);
+        crate::db::ledger_insert(
+            &conn,
+            &ck,
+            None,
+            &title,
+            info_hash.as_deref(),
+            size.unwrap_or(0),
+            &ep_ids.unwrap_or_default(),
+        );
+    }
+    Ok(result)
 }
 
 /// Core grab, shared by the UI command and the follow scheduler.

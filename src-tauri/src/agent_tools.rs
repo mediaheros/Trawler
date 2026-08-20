@@ -71,6 +71,8 @@ pub struct RunCtx {
     pub tool_calls_used: u32,
     seen_calls: HashSet<String>,
     pub grabbed_titles: Vec<String>,
+    /// medic runs only: episodes the replacement grab should re-link
+    pub medic_ep_ids: Vec<i64>,
     // caps
     pub max_searches: u32,
     pub max_grabs: u32,
@@ -94,6 +96,7 @@ impl RunCtx {
             tool_calls_used: 0,
             seen_calls: HashSet::new(),
             grabbed_titles: vec![],
+            medic_ep_ids: vec![],
             max_searches: 8,
             max_grabs: 3,
             max_gb: 15.0,
@@ -339,8 +342,13 @@ async fn grab_release(state: &AppState, ctx: &mut RunCtx, args: &Value) -> Value
                 &stored.title,
                 stored.info_hash.as_deref(),
                 stored.size,
-                &[],
+                &ctx.medic_ep_ids,
             );
+            if !ctx.medic_ep_ids.is_empty() {
+                // the dead grab freed these to wanted — the replacement owns
+                // them now, or they'd re-search forever and never complete
+                db::mark_grabbed(&conn, &ctx.medic_ep_ids, &stored.title);
+            }
             db::log_activity(
                 &conn,
                 "agent",

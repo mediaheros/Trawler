@@ -256,7 +256,16 @@ export const useStore = create<Store>((set, get) => ({
     const key = r.guid ?? r.title;
     set((s) => ({ grabState: { ...s.grabState, [key]: "loading" } }));
     try {
-      const res = await api.grab(r);
+      // an episode-linked grab carries its episode id so the backend ledger
+      // remembers WHO this grab was for (survives unfollow/refollow)
+      const link0 = get().episodeLink;
+      const linked =
+        link0 &&
+        r.parsed.season === link0.ep.season &&
+        (r.parsed.episode === link0.ep.number || r.parsed.seasonPack)
+          ? [link0.ep.tvmazeEpId]
+          : [];
+      const res = await api.grab(r, linked);
       set((s) => ({ grabState: { ...s.grabState, [key]: "done" } }));
       get().toast(res.detail, "ok");
       // If this grab was initiated from an episode row and the release matches
