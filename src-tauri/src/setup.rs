@@ -523,6 +523,28 @@ pub async fn install_prowlarr(app: &AppHandle) -> Result<String> {
         if !ok {
             return Err(AppError::Other("couldn't extract the Prowlarr archive".into()));
         }
+        // Apple Silicon SIGKILLs unsigned arm64 code with no output at all,
+        // and Prowlarr's osx tarball ships unsigned — ad-hoc sign everything
+        // executable so the kernel lets it run (verified: exit 137 without)
+        #[cfg(target_os = "macos")]
+        {
+            emit(app, "prowlarr", "log", json!({ "message": "Signing for macOS…" }));
+            let _ = std::process::Command::new("codesign")
+                .args(["--force", "--sign", "-"])
+                .arg(target.join("Prowlarr"))
+                .output();
+            if let Ok(walk) = std::process::Command::new("find")
+                .arg(&target)
+                .args(["-name", "*.dylib"])
+                .output()
+            {
+                for line in String::from_utf8_lossy(&walk.stdout).lines() {
+                    let _ = std::process::Command::new("codesign")
+                        .args(["--force", "--sign", "-", line])
+                        .output();
+                }
+            }
+        }
     }
 
     // Seed config BEFORE first boot: our own API key, localhost-only, no
