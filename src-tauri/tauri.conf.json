@@ -45,7 +45,7 @@
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEMzMkZBRTA5NEQ4RUVFMTMKUldRVDdvNU5DYTR2d3hNalMxbitKOUI1d1ZndytaNlRVM01LOStZR3laUjg3ZnNaSCtGZ05yQTMK",
       "endpoints": [
         "https://mediahero.org/dl/latest.json",
-        "https://github.com/MediaHeroSystems/trawler/releases/latest/download/latest.json"
+        "https://github.com/mediaheros/Trawler/releases/latest/download/latest.json"
       ]
     }
   }

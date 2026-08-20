@@ -69,7 +69,7 @@ There is no "season 2" of UFC. Describe a **standing brief** in plain language �
 
 ## Install
 
-Grab the latest from **[Releases](https://github.com/MediaHeroSystems/trawler/releases)** — Windows x64 (`-setup.exe` or `.msi`), Windows ARM64 (`arm64-setup.exe`), or Linux (`.AppImage` / `.deb` / `.rpm`). Or download from [mediahero.org](https://mediahero.org/#download).
+Grab the latest from **[Releases](https://github.com/mediaheros/Trawler/releases)** — Windows x64 (`-setup.exe` or `.msi`), Windows ARM64 (`arm64-setup.exe`), or Linux (`.AppImage` / `.deb` / `.rpm`). Or download from [mediahero.org](https://mediahero.org/#download).
 
 Builds are signed for the auto-updater but not Authenticode-signed, so Windows SmartScreen may ask once (*More info → Run anyway*). The installer fetches the WebView2 runtime automatically if it's missing — that's the only dependency Trawler bundles for you. From then on, **Trawler keeps itself up to date**.
 
