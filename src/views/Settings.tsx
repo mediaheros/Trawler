@@ -532,9 +532,15 @@ export default function SettingsView() {
       {/* pinned action bar */}
       <div className="border-t border-line bg-bg1/60 px-6 py-3">
         <div className="flex max-w-[680px] items-center gap-2.5">
+          {tab === "indexers" ? (
+            <span className="text-[11.5px] text-faint">
+              Indexer changes talk to Prowlarr directly and apply instantly — nothing to save here.
+            </span>
+          ) : (
           <Button variant="primary" disabled={!dirty} onClick={() => saveConfig(draft)}>
             Save changes
           </Button>
+          )}
           {tab === "connections" && (
             <Button onClick={runTest} busy={testing}>
               <PlugZap size={13} />

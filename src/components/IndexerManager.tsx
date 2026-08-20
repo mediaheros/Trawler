@@ -77,6 +77,10 @@ export default function IndexerManager() {
       setInstalled((list) =>
         (list ?? []).map((i) => (i.id === ix.id ? { ...i, enable: !ix.enable } : i)),
       );
+      toast(
+        ix.enable ? `${ix.name} disabled — it won't be searched` : `${ix.name} enabled`,
+        "info",
+      );
     } catch (e) {
       toast(String(e), "bad");
     }
