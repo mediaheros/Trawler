@@ -550,7 +550,81 @@ pub async fn torrent_action(
     hash: String,
 ) -> Result<()> {
     let cfg = state.config.read().await.clone();
-    qbit(&state.http, &cfg).torrent_action(&action, &hash).await
+    let client = qbit(&state.http, &cfg);
+    // deleting a grab must also RELEASE it in Trawler: otherwise the ledger's
+    // anti-double-grab memory blocks the user's deliberate re-download, and
+    // episodes sit "grabbed" forever pointing at a torrent that's gone
+    let removed_name = if action.starts_with("delete") {
+        client
+            .list(None)
+            .await
+            .ok()
+            .and_then(|ts| ts.into_iter().find(|t| t.hash.eq_ignore_ascii_case(&hash)))
+            .map(|t| t.name)
+    } else {
+        None
+    };
+    client.torrent_action(&action, &hash).await?;
+    if let Some(name) = removed_name {
+        let conn = state.db.lock().await;
+        let norm_name = normalize(&name);
+        let h = hash.to_lowercase();
+        // retire ledger rows for this torrent — hash first, title fallback
+        let rows: Vec<(i64, String, Option<String>)> = conn
+            .prepare("SELECT id, title, info_hash FROM grab_ledger WHERE state IN ('grabbed','completed')")
+            .ok()
+            .map(|mut stmt| {
+                stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                    .map(|it| it.flatten().collect::<Vec<_>>())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        let mut freed: Vec<String> = vec![];
+        for (id, title, info_hash) in rows {
+            let hash_match = info_hash.map(|x| x.eq_ignore_ascii_case(&h)).unwrap_or(false);
+            if hash_match || normalize(&title) == norm_name {
+                let _ = conn.execute("UPDATE grab_ledger SET state = 'removed' WHERE id = ?1", [id]);
+                freed.push(title);
+            }
+        }
+        // episodes still pointing at this grab go back to wanted
+        let eps: Vec<(i64, String)> = conn
+            .prepare("SELECT tvmaze_ep_id, grabbed_title FROM episodes WHERE state = 'grabbed' AND grabbed_title IS NOT NULL")
+            .ok()
+            .map(|mut stmt| {
+                stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .map(|it| it.flatten().collect::<Vec<_>>())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        let mut ep_count = 0;
+        for (ep_id, gt) in eps {
+            let gt_matches = normalize(&gt) == norm_name
+                || freed.iter().any(|f| normalize(f) == normalize(&gt));
+            if gt_matches {
+                let _ = conn.execute(
+                    "UPDATE episodes SET state = 'wanted', grabbed_title = NULL, grabbed_at = NULL,
+                            last_searched_at = 0
+                     WHERE tvmaze_ep_id = ?1",
+                    [ep_id],
+                );
+                ep_count += 1;
+            }
+        }
+        if !freed.is_empty() || ep_count > 0 {
+            crate::db::log_activity(
+                &conn,
+                "system",
+                None,
+                &format!(
+                    "Removed {} — released {} episode(s); Trawler can grab them again",
+                    name.chars().take(60).collect::<String>(),
+                    ep_count
+                ),
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

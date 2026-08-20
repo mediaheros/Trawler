@@ -568,6 +568,50 @@ async fn completion_pass(app: &tauri::AppHandle, state: &AppState) -> Vec<DeadGr
             }
         }
     }
+    // Orphan reaping: a 'grabbed' ledger row whose torrent is nowhere in
+    // qBittorrent means the user deleted it (in our Downloads view before
+    // v0.3.7, or in qBittorrent itself). Holding the claim would block their
+    // deliberate re-download forever — retire it and free the episodes.
+    {
+        let all_norms: std::collections::HashSet<String> =
+            torrents.iter().map(|t| normalize(&t.name)).collect();
+        let all_hashes: std::collections::HashSet<String> =
+            torrents.iter().map(|t| t.hash.to_ascii_lowercase()).collect();
+        let cutoff = db::now() - 30 * 60; // fresh grabs may still be fetching metadata
+        let rows: Vec<(i64, String, Option<String>)> = conn
+            .prepare("SELECT id, title, info_hash FROM grab_ledger WHERE state = 'grabbed' AND ts < ?1")
+            .ok()
+            .map(|mut stmt| {
+                stmt.query_map([cutoff], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                    .map(|it| it.flatten().collect::<Vec<_>>())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        for (id, title, info_hash) in rows {
+            let hash_present = info_hash
+                .map(|h| all_hashes.contains(&h.to_ascii_lowercase()))
+                .unwrap_or(false);
+            if hash_present || all_norms.contains(&normalize(&title)) {
+                continue;
+            }
+            let _ = conn.execute("UPDATE grab_ledger SET state = 'removed' WHERE id = ?1", [id]);
+            let _ = conn.execute(
+                "UPDATE episodes SET state = 'wanted', grabbed_title = NULL, grabbed_at = NULL,
+                        last_searched_at = 0
+                 WHERE state = 'grabbed' AND grabbed_title = ?1",
+                [&title],
+            );
+            db::log_activity(
+                &conn,
+                "system",
+                None,
+                &format!(
+                    "{} vanished from qBittorrent — its claim is released, Trawler can grab again",
+                    title.chars().take(60).collect::<String>()
+                ),
+            );
+        }
+    }
     let dead = reopen_dead_grabs(&conn, &torrents);
     if done.is_empty() {
         drop(conn);

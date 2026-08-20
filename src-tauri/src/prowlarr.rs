@@ -348,6 +348,22 @@ impl<'a> ProwlarrClient<'a> {
             req = req.header("X-Api-Key", &self.api_key);
         }
         let resp = req.send().await?;
+        // Prowlarr's /download answers with a redirect TO A MAGNET for
+        // magnet-only indexers (Knaben, TPB…). reqwest can't follow a
+        // non-http scheme, so the 3xx surfaces here — the magnet is in the
+        // Location header, not an error. (Seen live: every Knaben grab
+        // without an inline magnet failed with "rejected the request (301)".)
+        if resp.status().is_redirection() {
+            if let Some(loc) = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+            {
+                if loc.starts_with("magnet:") {
+                    return Ok((Vec::new(), Some(loc.to_string())));
+                }
+            }
+        }
         let resp = Self::check(resp).await?;
         // A "torrent" download link can still bounce to a magnet redirect.
         let final_url = resp.url().to_string();
