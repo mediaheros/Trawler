@@ -21,8 +21,131 @@ use crate::error::{AppError, Result};
 pub const CLIENT_ID: &str = "998344708";
 pub const CLIENT_SECRET: &str = "9ckrekz28iqrm6mcy2";
 
+/// The loopback port Trawler listens on to catch the OAuth redirect.
+///
+/// Deliberately low: every Hyper-V/WSL/Docker reserved range observed in the
+/// wild sits above 28000, and a reserved port makes the listener UNBINDABLE
+/// (EACCES) with no way to recover in-process. The original registered
+/// callback used 53682, which landed inside 53647-53746 on exactly such a
+/// machine — the whole reason this flow once demanded copy-paste.
+pub const CALLBACK_PORT: u16 = 8788;
+
+pub fn redirect_uri() -> String {
+    format!("http://127.0.0.1:{CALLBACK_PORT}/bitport-callback")
+}
+
+/// The registered app credentials, overridable via env so a rotation by
+/// Bitport (these are public in the MIT repo) doesn't strand installs
+/// until an app update ships.
+pub fn client_id() -> String {
+    std::env::var("TRAWLER_BITPORT_CLIENT_ID").unwrap_or_else(|_| CLIENT_ID.into())
+}
+pub fn client_secret() -> String {
+    std::env::var("TRAWLER_BITPORT_CLIENT_SECRET").unwrap_or_else(|_| CLIENT_SECRET.into())
+}
+
 pub fn authorize_url() -> String {
-    format!("https://api.bitport.io/v2/oauth2/authorize?response_type=code&client_id={CLIENT_ID}")
+    let redirect: String = url::form_urlencoded::byte_serialize(redirect_uri().as_bytes()).collect();
+    format!(
+        "https://api.bitport.io/v2/oauth2/authorize?response_type=code&client_id={}&redirect_uri={redirect}",
+        client_id()
+    )
+}
+
+/// Claim the callback port BEFORE the browser opens, so a fast approval can
+/// never beat us to it — and so an unbindable port fails immediately with an
+/// explanation instead of hanging until timeout.
+pub async fn bind_callback() -> Result<tokio::net::TcpListener> {
+    tokio::net::TcpListener::bind(("127.0.0.1", CALLBACK_PORT))
+        .await
+        .map_err(|e| {
+            let hint = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                " — on Windows this port is inside a system-reserved range (check: netsh interface ipv4 show excludedportrange protocol=tcp)"
+            } else if e.kind() == std::io::ErrorKind::AddrInUse {
+                " — something else is already using it; close it and try again"
+            } else {
+                ""
+            };
+            AppError::Other(format!("Trawler could not listen on 127.0.0.1:{CALLBACK_PORT}{hint} ({e})"))
+        })
+}
+
+fn callback_page(ok: bool, headline: &str, detail: &str) -> String {
+    let accent = if ok { "#2dd4bf" } else { "#f87171" };
+    let body = format!(
+        "<!doctype html><meta charset=utf-8><title>Trawler</title>\
+<body style=\"margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;\
+background:#0b0f14;color:#e6edf3;font:15px/1.5 -apple-system,Segoe UI,system-ui,sans-serif\">\
+<div style=\"text-align:center;padding:40px\">\
+<div style=\"font-size:34px;font-weight:600;color:{accent};margin-bottom:10px\">{headline}</div>\
+<div style=\"opacity:.75\">{detail}</div></div>"
+    );
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+}
+
+/// Wait for the browser to hand back the authorization code. Ignores the
+/// stray requests browsers make (favicon, prefetch) and keeps listening.
+pub async fn await_code(
+    listener: tokio::net::TcpListener,
+    timeout: std::time::Duration,
+) -> Result<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let (mut sock, _) = match tokio::time::timeout_at(deadline, listener.accept()).await {
+            Err(_) => {
+                return Err(AppError::Other(
+                    "timed out waiting for the approval in your browser — click Connect again".into(),
+                ))
+            }
+            Ok(Ok(pair)) => pair,
+            Ok(Err(e)) => return Err(AppError::Other(format!("callback listener failed: {e}"))),
+        };
+        let mut buf = [0u8; 4096];
+        let n = sock.read(&mut buf).await.unwrap_or(0);
+        let req = String::from_utf8_lossy(&buf[..n]);
+        let target = req
+            .lines()
+            .next()
+            .unwrap_or("")
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or("")
+            .to_string();
+        let query = target.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let mut code: Option<String> = None;
+        let mut denied: Option<String> = None;
+        for (k, v) in url::form_urlencoded::parse(query.as_bytes()) {
+            match k.as_ref() {
+                "code" => code = Some(v.into_owned()),
+                "error_description" => denied = Some(v.into_owned()),
+                "error" => denied = denied.or_else(|| Some(v.into_owned())),
+                _ => {}
+            }
+        }
+        if let Some(c) = code.filter(|c| !c.is_empty()) {
+            let _ = sock
+                .write_all(callback_page(true, "Connected", "Trawler has your Bitport account. You can close this tab.").as_bytes())
+                .await;
+            let _ = sock.flush().await;
+            return Ok(c);
+        }
+        if let Some(d) = denied {
+            let _ = sock
+                .write_all(callback_page(false, "Not connected", &format!("Bitport said: {d}")).as_bytes())
+                .await;
+            let _ = sock.flush().await;
+            return Err(AppError::Other(format!("Bitport declined the connection: {d}")));
+        }
+        // favicon / prefetch / bare visit — answer politely and keep waiting
+        let _ = sock
+            .write_all(callback_page(true, "Waiting", "Approve Trawler on the Bitport page to finish.").as_bytes())
+            .await;
+    }
 }
 
 const BASE: &str = "https://api.bitport.io/v2";
@@ -77,8 +200,8 @@ pub async fn exchange_code(http: &reqwest::Client, code: &str) -> Result<String>
     let resp = http
         .post(format!("{BASE}/oauth2/access-token"))
         .form(&[
-            ("client_id", CLIENT_ID),
-            ("client_secret", CLIENT_SECRET),
+            ("client_id", client_id().as_str()),
+            ("client_secret", client_secret().as_str()),
             ("grant_type", "authorization_code"),
             ("code", code),
         ])
@@ -130,9 +253,13 @@ impl BitportClient<'_> {
 
     pub async fn transfers(&self) -> Result<Vec<BitportTransfer>> {
         let d = self.get("/transfers").await?;
-        Ok(d.as_array()
-            .map(|a| a.iter().filter_map(parse_transfer).collect())
-            .unwrap_or_default())
+        // a shape-drifted response must be an ERROR, not an empty account —
+        // the completion pass reaps rows whose transfers are absent, and a
+        // silent [] here would release every cloud grab at once
+        let arr = d.as_array().ok_or_else(|| {
+            AppError::Other("Bitport transfers: unexpected response shape (not a list)".into())
+        })?;
+        Ok(arr.iter().filter_map(parse_transfer).collect())
     }
 
     /// Submit a magnet to the cloud; returns the new transfer's token when

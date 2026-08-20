@@ -56,11 +56,16 @@ pub async fn get_config(state: State<'_, AppState>) -> Result<Config> {
 #[tauri::command]
 pub async fn set_config(state: State<'_, AppState>, config: Config) -> Result<Config> {
     // only bitport_connect / bitport_disconnect write the token — whatever
-    // the frontend sends in that field is a stale blank, not intent
+    // the frontend sends in that field is a stale blank, not intent.
+    // Read-modify-write happens UNDER the write lock: a Save racing a
+    // connect must not resurrect the old token or drop the new one.
     let mut config = config;
-    config.bitport_token = state.config.read().await.bitport_token.clone();
-    config::save(&config)?;
-    *state.config.write().await = config.clone();
+    {
+        let mut guard = state.config.write().await;
+        config.bitport_token = guard.bitport_token.clone();
+        config::save(&config)?;
+        *guard = config.clone();
+    }
     config.bitport_token.clear();
     Ok(config)
 }
@@ -598,6 +603,7 @@ pub struct DownloadsView {
     pub torrents: Vec<QbitTorrent>,
     pub transfer: Option<TransferInfo>,
     pub cloud: Vec<crate::bitport::BitportTransfer>,
+    pub qbit_error: Option<String>,
 }
 
 #[tauri::command]
@@ -609,8 +615,13 @@ pub async fn downloads(state: State<'_, AppState>, all: bool) -> Result<Download
     } else {
         Some(cfg.qbit_category.as_str())
     };
-    let torrents = q.list(category).await?;
-    let transfer = q.transfer_info().await.ok();
+    // qBittorrent being down must not take the cloud section with it — the
+    // backends are independent; surface the local error inline instead
+    let (torrents, qbit_error) = match q.list(category).await {
+        Ok(t) => (t, None),
+        Err(e) => (vec![], Some(e.to_string())),
+    };
+    let transfer = if qbit_error.is_none() { q.transfer_info().await.ok() } else { None };
     // cloud transfers ride along whenever an account is connected — additive,
     // and a Bitport hiccup must never blank the local list
     let cloud = if cfg.bitport_token.is_empty() {
@@ -624,7 +635,7 @@ pub async fn downloads(state: State<'_, AppState>, all: bool) -> Result<Download
             _ => vec![],
         }
     };
-    Ok(DownloadsView { torrents, transfer, cloud })
+    Ok(DownloadsView { torrents, transfer, cloud, qbit_error })
 }
 
 #[tauri::command]
@@ -982,6 +993,58 @@ pub async fn bitport_authorize_url() -> Result<String> {
     Ok(crate::bitport::authorize_url())
 }
 
+/// The whole connect handshake behind one button: claim the callback port,
+/// open the browser, catch the redirect, exchange the code, prove the token.
+/// Nothing to copy, nothing to paste.
+#[tauri::command]
+pub async fn bitport_connect_flow(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<BitportStatus> {
+    use tauri_plugin_opener::OpenerExt;
+    // bind first: a blocked port must fail now, with a reason, not after a
+    // five-minute wait on a redirect that could never arrive
+    let listener = crate::bitport::bind_callback().await?;
+    let url = crate::bitport::authorize_url();
+    crate::applog::info("bitport", "waiting for browser approval on 127.0.0.1:8788");
+    app.opener()
+        .open_url(url.clone(), None::<&str>)
+        .map_err(|e| AppError::Other(format!("could not open your browser ({e}) — visit {url} manually")))?;
+    let code = crate::bitport::await_code(listener, std::time::Duration::from_secs(300)).await?;
+    let token = crate::bitport::exchange_code(&state.http, &code).await?;
+    bitport_store_and_probe(&state, token).await
+}
+
+/// A minted token is stored unless Bitport itself rejects it (401): the
+/// authorization code is single-use, so discarding a good token on a
+/// transient probe failure would burn the user's whole approval.
+async fn bitport_store_and_probe(state: &AppState, token: String) -> Result<BitportStatus> {
+    let bp = crate::bitport::BitportClient { http: &state.http, token: token.clone() };
+    match bp.me().await {
+        Ok(quota) => {
+            let mut cfg = state.config.write().await;
+            cfg.bitport_token = token;
+            crate::config::save(&cfg)?;
+            crate::applog::info(
+                "bitport",
+                format!("connected — plan {}, {:.0} GB free", quota.plan_name, quota.disk_available as f64 / 1e9),
+            );
+            Ok(BitportStatus { connected: true, quota: Some(quota) })
+        }
+        Err(e) if e.to_string().contains("rejected the token") => Err(e),
+        Err(e) => {
+            let mut cfg = state.config.write().await;
+            cfg.bitport_token = token;
+            crate::config::save(&cfg)?;
+            crate::applog::warn(
+                "bitport",
+                format!("connected, but the account probe failed ({e}) — quota will appear once Bitport answers"),
+            );
+            Ok(BitportStatus { connected: true, quota: None })
+        }
+    }
+}
+
 /// Exchange the pasted authorization code and persist the token.
 #[tauri::command]
 pub async fn bitport_connect(state: State<'_, AppState>, code: String) -> Result<BitportStatus> {
@@ -990,15 +1053,7 @@ pub async fn bitport_connect(state: State<'_, AppState>, code: String) -> Result
         return Err(AppError::Other("paste the code Bitport showed you".into()));
     }
     let token = crate::bitport::exchange_code(&state.http, &code).await?;
-    let bp = crate::bitport::BitportClient { http: &state.http, token: token.clone() };
-    let quota = bp.me().await?; // proves the token before we store it
-    {
-        let mut cfg = state.config.write().await;
-        cfg.bitport_token = token;
-        crate::config::save(&cfg)?;
-    }
-    crate::applog::info("bitport", format!("connected — plan {}, {:.0} GB free", quota.plan_name, quota.disk_available as f64 / 1e9));
-    Ok(BitportStatus { connected: true, quota: Some(quota) })
+    bitport_store_and_probe(&state, token).await
 }
 
 #[tauri::command]

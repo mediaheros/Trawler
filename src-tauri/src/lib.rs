@@ -227,6 +227,7 @@ pub fn run() {
             commands_setup::setup_finish,
             commands_setup::rss_sweep_now,
             commands::bitport_authorize_url,
+            commands::bitport_connect_flow,
             commands::bitport_connect,
             commands::bitport_status,
             commands::bitport_disconnect,

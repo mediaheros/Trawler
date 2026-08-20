@@ -584,6 +584,13 @@ async fn bitport_completion_pass(app: &tauri::AppHandle, state: &AppState) {
         transfers.iter().filter_map(crate::bitport::transfer_hash).collect();
     let live_norms: std::collections::HashSet<String> =
         transfers.iter().map(|t| normalize(&t.name)).collect();
+    // reaping needs TWO consecutive polls agreeing a transfer is gone: one
+    // odd listing (pagination surprise, partial response) must not release
+    // every claim at once. Absence is only evidence when it repeats.
+    static BP_MISSING: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<i64>>> =
+        std::sync::OnceLock::new();
+    let missing_lock = BP_MISSING.get_or_init(Default::default);
+    let listing_empty = transfers.is_empty();
     let reap_cutoff = db::now() - 5 * 60; // covers the add-to-listing gap
     let recent_cutoff = db::now() - 3 * 86_400; // first cycle after an upgrade may flip a backlog
     let mut completed_display: Vec<String> = vec![];
@@ -599,6 +606,13 @@ async fn bitport_completion_pass(app: &tauri::AppHandle, state: &AppState) {
             .unwrap_or_default()
         })
         .unwrap_or_default();
+    if listing_empty && !rows.is_empty() {
+        // an empty listing with open rows is suspicious, not evidence
+        crate::applog::warn(
+            "bitport",
+            "transfer listing came back empty while cloud grabs are open — not reaping",
+        );
+    }
     for (id, title, info_hash, ep_ids_raw, bp_token, ts) in rows {
         let h = info_hash.map(|x| x.to_ascii_lowercase());
         let norm = normalize(&title);
@@ -612,6 +626,7 @@ async fn bitport_completion_pass(app: &tauri::AppHandle, state: &AppState) {
             }
         };
         if is_done {
+            missing_lock.lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
             let _ = conn.execute("UPDATE grab_ledger SET state = 'completed' WHERE id = ?1", [id]);
             db::set_episodes_state_by_ids(&conn, &db::parse_ep_ids(ep_ids_raw.as_deref()), "downloaded", None);
             db::log_activity(
@@ -632,7 +647,13 @@ async fn bitport_completion_pass(app: &tauri::AppHandle, state: &AppState) {
                     || live_norms.contains(&norm)
             }
         };
-        if !is_present && ts < reap_cutoff {
+        let mut missing = missing_lock.lock().unwrap_or_else(|p| p.into_inner());
+        if is_present || listing_empty {
+            missing.remove(&id);
+            continue;
+        }
+        if ts < reap_cutoff && missing.contains(&id) {
+            missing.remove(&id);
             let _ = conn.execute("UPDATE grab_ledger SET state = 'removed' WHERE id = ?1", [id]);
             db::set_episodes_state_by_ids(&conn, &db::parse_ep_ids(ep_ids_raw.as_deref()), "wanted", None);
             db::log_activity(
@@ -644,6 +665,8 @@ async fn bitport_completion_pass(app: &tauri::AppHandle, state: &AppState) {
                     title.chars().take(60).collect::<String>()
                 ),
             );
+        } else {
+            missing.insert(id); // strike one — reap on the next agreeing poll
         }
     }
     drop(conn);

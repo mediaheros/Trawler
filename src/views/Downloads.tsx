@@ -17,6 +17,9 @@ import { Cloud } from "lucide-react";
 export default function DownloadsView() {
   const [data, setData] = useState<DL | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // tokens removed optimistically: a poll already in flight when the user
+  // clicked remove can still carry the dead transfer — hide it briefly
+  const removedRef = useRef<Map<string, number>>(new Map());
   const [scope, setScope] = useState<"trawler" | "all">("trawler");
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
   const toast = useStore((s) => s.toast);
@@ -87,9 +90,9 @@ export default function DownloadsView() {
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto px-6 pb-6">
-        {error && data && (
+        {(error ?? data?.qbitError) && data && (
           <div className="mb-3 flex items-center gap-2 rounded-lg border border-warn/25 bg-warn/8 px-3 py-1.5 text-[11.5px] text-warn">
-            qBittorrent didn't answer the last check — showing the previous state
+            qBittorrent didn't answer the last check — the local list may be stale
           </div>
         )}
         {error && !data ? (
@@ -100,6 +103,8 @@ export default function DownloadsView() {
               <div key={i} className="skeleton h-[74px] rounded-(--radius-card)" />
             ))}
           </div>
+        ) : data.qbitError && data.torrents.length === 0 && data.cloud.length === 0 ? (
+          <CenterMessage icon={<HardDrive size={28} />} title="Can't reach qBittorrent" body={data.qbitError} />
         ) : data.torrents.length === 0 && data.cloud.length === 0 ? (
           <CenterMessage
             icon={<HardDrive size={28} />}
@@ -115,14 +120,31 @@ export default function DownloadsView() {
             {data.torrents.map((t) => (
               <TorrentCard key={t.hash} t={t} onAction={act} />
             ))}
-            {data.cloud.length > 0 && (
+            {data.cloud.some((c) => {
+              const t = removedRef.current.get(c.token);
+              return !t || Date.now() - t >= 15_000;
+            }) && (
               <>
                 <div className="flex items-center gap-1.5 pt-3 pb-1 text-[11.5px] font-medium text-dim">
                   <Cloud size={13} className="text-accent2" /> In your Bitport cloud
                 </div>
-                {data.cloud.map((c) => (
-                  <CloudCard key={c.token} c={c} onDeleted={() => setData((d) => (d ? { ...d, cloud: d.cloud.filter((x) => x.token !== c.token) } : d))} />
-                ))}
+                {data.cloud
+                  .filter((c) => {
+                    const t = removedRef.current.get(c.token);
+                    if (t && Date.now() - t < 15_000) return false;
+                    if (t) removedRef.current.delete(c.token);
+                    return true;
+                  })
+                  .map((c) => (
+                    <CloudCard
+                      key={c.token}
+                      c={c}
+                      onDeleted={() => {
+                        removedRef.current.set(c.token, Date.now());
+                        setData((d) => (d ? { ...d, cloud: d.cloud.filter((x) => x.token !== c.token) } : d));
+                      }}
+                    />
+                  ))}
               </>
             )}
           </div>

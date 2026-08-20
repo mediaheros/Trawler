@@ -260,6 +260,7 @@ export interface DownloadsView {
   torrents: QbitTorrent[];
   transfer: { dl_info_speed: number; up_info_speed: number } | null;
   cloud: BitportTransfer[];
+  qbitError: string | null;
 }
 
 export interface GrabResult {
@@ -506,6 +507,7 @@ export const api = {
   flaresolverrStatus: () => call<FlaresolverrStatus>("flaresolverr_status"),
   bitportAuthorizeUrl: () => call<string>("bitport_authorize_url"),
   bitportConnect: (code: string) => call<BitportStatus>("bitport_connect", { code }),
+  bitportConnectFlow: () => call<BitportStatus>("bitport_connect_flow"),
   bitportStatus: () => call<BitportStatus>("bitport_status"),
   bitportDisconnect: () => call<void>("bitport_disconnect"),
   bitportDelete: (token: string) => call<void>("bitport_delete", { token }),
@@ -859,6 +861,7 @@ async function mock(cmd: string, args?: Record<string, unknown>): Promise<unknow
               { token: "bp2", name: "Lioness.S03E04.1080p.WEB.h264.mkv", status: "downloading", substatus: null, progress: 61, size: null, fileId: null, folderId: null, src: null },
             ].filter((t) => !mockBp.deleted.has(t.token))
           : [],
+        qbitError: null,
       } satisfies DownloadsView;
     case "torrent_action":
       return;
@@ -999,6 +1002,10 @@ async function mock(cmd: string, args?: Record<string, unknown>): Promise<unknow
       return;
     case "bitport_authorize_url":
       return "https://api.bitport.io/v2/oauth2/authorize?response_type=code&client_id=mock";
+    case "bitport_connect_flow":
+      await sleep(1500);
+      mockBp.connected = true;
+      return { connected: true, quota: { planName: "big", planExpired: false, diskSize: 1073741824000, diskAvailable: 343501989179, diskUsed: 730239834821 } };
     case "bitport_connect":
       await sleep(700);
       mockBp.connected = true;

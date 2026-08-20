@@ -853,9 +853,26 @@ function TestLine({ ok, text }: { ok: boolean; text: string }) {
  *  arrive over HTTPS. Connect once; the token lasts a decade. */
 function BitportCard({ backend, onBackend }: { backend: string; onBackend: (b: string) => void }) {
   const toast = useStore((s) => s.toast);
+  const loadConfig = useStore((s) => s.loadConfig);
   const [status, setStatus] = useState<import("../lib/api").BitportStatus | null>(null);
   const [code, setCode] = useState("");
   const [busy, setBusy] = useState(false);
+  const [waiting, setWaiting] = useState(false);
+  const [manual, setManual] = useState(false);
+
+  const connectFlow = async () => {
+    setWaiting(true);
+    try {
+      const s = await api.bitportConnectFlow();
+      setStatus(s);
+      await loadConfig(); // the zustand config is loaded once at startup — resync it
+      toast(`Bitport connected — ${s.quota ? (s.quota.diskAvailable / 1e9).toFixed(0) + " GB free" : "ready"}`, "ok");
+    } catch (e) {
+      toast(String(e), "bad");
+    } finally {
+      setWaiting(false);
+    }
+  };
 
   useEffect(() => {
     void api.bitportStatus().then(setStatus).catch(() => {});
@@ -867,6 +884,7 @@ function BitportCard({ backend, onBackend }: { backend: string; onBackend: (b: s
       const s = await api.bitportConnect(code);
       setStatus(s);
       setCode("");
+      await loadConfig();
       toast(`Bitport connected — ${s.quota ? (s.quota.diskAvailable / 1e9).toFixed(0) + " GB free" : "ready"}`, "ok");
     } catch (e) {
       toast(String(e), "bad");
@@ -920,6 +938,7 @@ function BitportCard({ backend, onBackend }: { backend: string; onBackend: (b: s
                 await api.bitportDisconnect();
                 setStatus({ connected: false, quota: null });
                 onBackend("qbittorrent");
+                await loadConfig();
                 toast("Bitport disconnected — grabs go to local qBittorrent", "info");
               } catch (e) {
                 toast(String(e), "bad");
@@ -933,24 +952,46 @@ function BitportCard({ backend, onBackend }: { backend: string; onBackend: (b: s
         <div className="space-y-2.5">
           <p className="text-[11.5px] leading-snug text-faint">
             Connect once and Trawler can send grabs to your Bitport account instead of the local
-            client — useful when your network dislikes BitTorrent. Click Connect, approve in the
-            browser, then paste the code from the address bar (everything after <span className="font-mono">code=</span>).
+            client — useful when your network dislikes BitTorrent. One click: approve in the
+            browser and Trawler does the rest.
           </p>
-          <div className="flex items-center gap-2">
-            <Button
-              onClick={async () => {
-                const url = await api.bitportAuthorizeUrl();
-                window.open(url, "_blank");
-              }}
-              className="shrink-0 px-2.5 py-1.5 text-[11.5px]"
-            >
-              Connect Bitport
+          <div className="flex items-center gap-3">
+            <Button variant="primary" busy={waiting} onClick={() => void connectFlow()} className="shrink-0 px-2.5 py-1.5 text-[11.5px]">
+              {waiting ? "Waiting for your approval…" : "Connect Bitport"}
             </Button>
-            <TextInput mono value={code} onChange={setCode} placeholder="paste the code here" />
-            <Button variant="primary" busy={busy} disabled={!code.trim()} onClick={() => void connect()} className="shrink-0 px-2.5 py-1.5 text-[11.5px]">
-              Link
-            </Button>
+            {waiting && (
+              <span className="text-[11px] text-faint">
+                Approve Trawler on the Bitport page that just opened.
+              </span>
+            )}
           </div>
+          {!waiting && (
+            <button
+              type="button"
+              className="cursor-pointer text-[10.5px] text-faint underline decoration-line2 underline-offset-2 hover:text-dim"
+              onClick={() => setManual((m) => !m)}
+            >
+              {manual ? "hide manual option" : "browser on another machine? paste the code manually"}
+            </button>
+          )}
+          {manual && !waiting && (
+            <div className="flex items-center gap-2">
+              <Button
+                onClick={async () => {
+                  const url = await api.bitportAuthorizeUrl();
+                  await navigator.clipboard.writeText(url);
+                  toast("Approval link copied — open it in a browser, then paste the code from the address bar", "info");
+                }}
+                className="shrink-0 px-2.5 py-1.5 text-[11.5px]"
+              >
+                Copy approval link
+              </Button>
+              <TextInput mono value={code} onChange={setCode} placeholder="paste the code or the whole URL" />
+              <Button variant="primary" busy={busy} disabled={!code.trim()} onClick={() => void connect()} className="shrink-0 px-2.5 py-1.5 text-[11.5px]">
+                Link
+              </Button>
+            </div>
+          )}
         </div>
       )}
     </Card>
