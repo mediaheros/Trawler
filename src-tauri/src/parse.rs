@@ -40,7 +40,11 @@ pub fn parse(title: &str) -> ParsedRelease {
             _ => c,
         })
         .collect();
-    let upper = norm.to_uppercase();
+    // ASCII-only uppercase: to_uppercase() is NOT length-preserving ('ı'→'I'
+    // shrinks), and every index below is a byte offset into `norm` — mixing
+    // the two index spaces panicked (and with panic=abort, killed the app)
+    // on Turkish titles. char::to_ascii_uppercase keeps byte parity exactly.
+    let upper: String = norm.chars().map(|c| c.to_ascii_uppercase()).collect();
     let u = upper.as_str();
 
     p.resolution = find_any(
@@ -110,21 +114,38 @@ pub fn parse(title: &str) -> ParsedRelease {
     let bytes = u.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'S' && i + 2 < bytes.len() && bytes[i + 1].is_ascii_digit() {
+        // 'S' must start a word — otherwise "DTS5.1" reads as season 5
+        let word_start = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+        if word_start && bytes[i] == b'S' && i + 2 < bytes.len() && bytes[i + 1].is_ascii_digit() {
             let mut j = i + 1;
             while j < bytes.len() && bytes[j].is_ascii_digit() && j - i <= 2 {
                 j += 1;
             }
+            // a longer digit run ("S2023") is a year or id, not a season
+            if j < bytes.len() && bytes[j].is_ascii_digit() {
+                i = j;
+                continue;
+            }
             let season: i32 = u[i + 1..j].parse().unwrap_or(-1);
             if season >= 0 && p.season.is_none() {
                 p.season = Some(season);
-                if j < bytes.len() && bytes[j] == b'E' {
-                    let mut k = j + 1;
-                    while k < bytes.len() && bytes[k].is_ascii_digit() && k - j <= 3 {
+                // allow one separator between season and episode: S01E05,
+                // S01.E05 (dot became space), S01 E05, S01xE05, S01-E05
+                let mut e = j;
+                if e < bytes.len()
+                    && matches!(bytes[e], b' ' | b'-' | b'X')
+                    && e + 1 < bytes.len()
+                    && bytes[e + 1] == b'E'
+                {
+                    e += 1;
+                }
+                if e < bytes.len() && bytes[e] == b'E' {
+                    let mut k = e + 1;
+                    while k < bytes.len() && bytes[k].is_ascii_digit() && k - e <= 3 {
                         k += 1;
                     }
-                    if k > j + 1 {
-                        p.episode = u[j + 1..k].parse().ok();
+                    if k > e + 1 {
+                        p.episode = u[e + 1..k].parse().ok();
                     }
                 }
             }
@@ -152,12 +173,17 @@ pub fn parse(title: &str) -> ParsedRelease {
             }
         }
     }
-    if p.season.is_some() && p.episode.is_none() {
-        p.season_pack = true;
-    }
-    if u.contains("COMPLETE") || u.contains("SEASON PACK") {
-        p.season_pack = true;
-    }
+    // A pack needs positive evidence. "Season present, episode missing" alone
+    // used to be enough — which turned single episodes with unusual episode
+    // markers into "packs" that stamped whole seasons as grabbed. Bare-season
+    // titles ("Show S02 1080p WEB") only count when quality tags corroborate
+    // that this is a real release listing.
+    p.season_pack = u.contains("COMPLETE")
+        || u.contains("SEASON PACK")
+        || u.contains("FULL SEASON")
+        || (p.season.is_some()
+            && p.episode.is_none()
+            && (p.resolution.is_some() || p.source.is_some()));
 
     // Year: standalone 19xx/20xx
     let chars: Vec<char> = norm.chars().collect();
@@ -191,6 +217,7 @@ pub fn parse(title: &str) -> ParsedRelease {
     // Clean title: cut at the first structural marker.
     let cut_markers = [
         " S0", " S1", " S2", " S3", " SEASON ", " 2160P", " 1080P", " 720P", " 480P",
+        "(2160P", "(1080P", "(720P", "(480P", "[2160P", "[1080P", "[720P", "[480P",
         " BLURAY", " BDRIP", " WEB-DL", " WEBDL", " WEBRIP", " HDTV", " DVDRIP", " REMUX",
         " X264", " X265", " H264", " H265", " HEVC", " AV1", " COMPLETE",
     ];
@@ -208,10 +235,36 @@ pub fn parse(title: &str) -> ParsedRelease {
             }
         }
     }
-    p.clean_title = norm[..cut]
-        .trim()
-        .trim_matches(['(', '[', '-', ' '])
-        .to_string();
+    // belt and braces: `upper` is byte-parallel to `norm` by construction,
+    // but a slice must never be able to panic on indexer-controlled input
+    while cut > 0 && !norm.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut ct = norm[..cut].trim().trim_matches(['(', '[', '-', ' ']).to_string();
+    // anime-style names: drop the leading "[Group]" tag, trailing bracketed
+    // CRC/quality groups, and container extensions, so two groups' releases
+    // of the same episode share one identity in the dedupe ledger
+    if let Some(close) = ct.find(']') {
+        if ct[..close].len() <= 24 && (ct.starts_with('[') || !ct[..close].contains(' ') || close < 24) {
+            let rest = ct[close + 1..].trim();
+            if !rest.is_empty() {
+                ct = rest.to_string();
+            }
+        }
+    }
+    while let Some(open) = ct.rfind('[') {
+        if ct[open..].contains(']') || ct.len() - open <= 16 {
+            ct = ct[..open].trim_end().to_string();
+        } else {
+            break;
+        }
+    }
+    for ext in [" mkv", " mp4", " avi", " MKV", " MP4", " AVI"] {
+        if ct.ends_with(ext) {
+            ct = ct[..ct.len() - ext.len()].trim_end().to_string();
+        }
+    }
+    p.clean_title = ct.trim().trim_matches(['(', '[', ']', '-', ' ']).to_string();
     if p.clean_title.is_empty() {
         p.clean_title = norm.trim().to_string();
     }
@@ -253,5 +306,48 @@ mod tests {
         assert_eq!(p.season, Some(1));
         assert!(p.season_pack);
         assert_eq!(p.episode, None);
+        // bare season + quality tags is a pack listing
+        assert!(parse("Show S02 1080p WEB-DL x265-GRP").season_pack);
+    }
+
+    #[test]
+    fn multibyte_titles_never_panic_or_truncate() {
+        // 'ı' uppercases to a shorter byte sequence — this used to abort the app
+        let p = parse("Kızılcık.Şerbeti.S03E12.1080p.WEB-DL.x264-TR");
+        assert_eq!(p.season, Some(3));
+        assert_eq!(p.episode, Some(12));
+        assert_eq!(p.clean_title, "Kızılcık Şerbeti");
+        let p2 = parse("ı.S01E01.1080p");
+        assert_eq!(p2.clean_title, "ı");
+        parse("Bir Başkadır S01 COMPLETE 1080p");
+        parse("ﬁnale.ß.S01E01.720p");
+    }
+
+    #[test]
+    fn separated_episode_markers_are_episodes_not_packs() {
+        let p = parse("Show.Name.S01.E05.1080p.WEB");
+        assert_eq!((p.season, p.episode), (Some(1), Some(5)));
+        assert!(!p.season_pack);
+        let p2 = parse("Show Name S01xE05 720p HDTV");
+        assert_eq!((p2.season, p2.episode), (Some(1), Some(5)));
+    }
+
+    #[test]
+    fn no_false_seasons_from_words_or_years() {
+        // "DTS5.1" must not become season 5
+        let p = parse("Movie.Title.2024.1080p.BluRay.DTS5.1.x264-GRP");
+        assert_eq!(p.season, None);
+        assert!(!p.season_pack);
+        // "S2023" is a year-like id, not season 20
+        let p2 = parse("Show.Name.S2023E05.1080p.WEB");
+        assert_eq!(p2.season, None);
+    }
+
+    #[test]
+    fn anime_titles_share_identity_across_groups() {
+        let a = parse("[SubsPlease] Frieren - 12 (1080p) [A1B2C3D4].mkv");
+        let b = parse("[Erai-raws] Frieren - 12 [1080p][Multiple Subtitle]");
+        assert_eq!(a.clean_title, "Frieren - 12");
+        assert_eq!(a.clean_title, b.clean_title);
     }
 }

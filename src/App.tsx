@@ -31,6 +31,25 @@ export default function App() {
   const [wizardDismissed, setWizardDismissed] = useState(false);
   const showWizard = config !== null && !config.setupCompleted && !wizardDismissed;
 
+  // WebView2 swallows target="_blank" navigations (no new-window handler),
+  // so every external link in the app would be a dead click. Route them
+  // through the opener plugin instead.
+  useEffect(() => {
+    if (!inTauri) return;
+    const onClick = (e: MouseEvent) => {
+      const a = (e.target as HTMLElement | null)?.closest?.("a[target='_blank']") as
+        | HTMLAnchorElement
+        | null;
+      if (!a || !/^https?:/i.test(a.href)) return;
+      e.preventDefault();
+      void import("@tauri-apps/plugin-opener")
+        .then((m) => m.openUrl(a.href))
+        .catch(() => useStore.getState().toast("Couldn't open that link", "bad"));
+    };
+    document.addEventListener("click", onClick);
+    return () => document.removeEventListener("click", onClick);
+  }, []);
+
   useEffect(() => {
     void loadConfig().then(refreshStatus);
     const t = setInterval(refreshStatus, 30_000);

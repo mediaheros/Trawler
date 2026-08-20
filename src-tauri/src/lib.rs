@@ -37,6 +37,8 @@ pub struct AppState {
     pub brief_tick_busy: AtomicBool,
     /// one RSS sweep at a time
     pub rss_busy: AtomicBool,
+    /// one upgrade-scout pass at a time
+    pub scout_busy: AtomicBool,
     /// (fetched_at, payload) for the discovery rows
     pub discover_cache: Mutex<Option<(i64, serde_json::Value)>>,
 }
@@ -60,6 +62,7 @@ pub fn run() {
         agent_chat_busy: AtomicBool::new(false),
         brief_tick_busy: AtomicBool::new(false),
         rss_busy: AtomicBool::new(false),
+        scout_busy: AtomicBool::new(false),
         discover_cache: Mutex::new(None),
     };
 

@@ -79,12 +79,21 @@ fn profile_for(show: &ShowRow, default: &QualityProfile) -> QualityProfile {
         .unwrap_or_else(|| default.clone())
 }
 
+/// What one planning pass produced: the grabs to make, and which episodes
+/// were ACTUALLY searched with at least one indexer answering — only those
+/// may be stamped, or the 12h back-catalog throttle starves episodes that
+/// were never looked for.
+pub struct PlanOutcome {
+    pub plans: Vec<PlannedGrab>,
+    pub searched_ep_ids: Vec<i64>,
+}
+
 /// Decide what to grab for one show. Read-only: no grabs, no stamps.
 pub async fn plan_for_show(
     state: &AppState,
     show: &ShowRow,
     ignore_throttle: bool,
-) -> Result<Vec<PlannedGrab>> {
+) -> Result<PlanOutcome> {
     let cfg = state.config.read().await.clone();
     let profile = profile_for(show, &cfg.default_quality);
     let now = db::now();
@@ -108,10 +117,11 @@ pub async fn plan_for_show(
     actionable.sort_by_key(|e| (e.season, e.number));
 
     if actionable.is_empty() {
-        return Ok(vec![]);
+        return Ok(PlanOutcome { plans: vec![], searched_ep_ids: vec![] });
     }
 
     let mut plans: Vec<PlannedGrab> = Vec::new();
+    let mut searched_ep_ids: Vec<i64> = Vec::new();
     let mut by_season: std::collections::BTreeMap<i64, Vec<&EpisodeRow>> = Default::default();
     for e in &actionable {
         by_season.entry(e.season).or_default().push(e);
@@ -122,6 +132,10 @@ pub async fn plan_for_show(
         if profile.allow_season_packs && eps.len() >= 4 {
             let q = season_query(&show.name, season);
             let results = perform_search(state, &q, "tv", &[]).await?;
+            if results.indexers.iter().any(|o| o.ok) {
+                // the season query covered every wanted episode in this group
+                searched_ep_ids.extend(eps.iter().map(|e| e.tvmaze_ep_id));
+            }
             let season_size = episodes.iter().filter(|e| e.season == season).count() as i64;
             if let Some(pick) =
                 pick_candidate(&results.releases, &profile, season, None, season_size.max(1))
@@ -136,6 +150,9 @@ pub async fn plan_for_show(
         for ep in eps {
             let q = episode_query(&show.name, season, ep.number);
             let results = perform_search(state, &q, "tv", &[]).await?;
+            if results.indexers.iter().any(|o| o.ok) && !searched_ep_ids.contains(&ep.tvmaze_ep_id) {
+                searched_ep_ids.push(ep.tvmaze_ep_id);
+            }
             if let Some(pick) =
                 pick_candidate(&results.releases, &profile, season, Some(ep.number), 1)
             {
@@ -145,7 +162,7 @@ pub async fn plan_for_show(
         }
     }
 
-    Ok(plans)
+    Ok(PlanOutcome { plans, searched_ep_ids })
 }
 
 fn planned(
@@ -226,7 +243,7 @@ async fn execute_plan(app: &tauri::AppHandle, state: &AppState, plan: &PlannedGr
     match result {
         Ok(_) => {
             db::mark_grabbed(&conn, &fresh_ep_ids, &plan.title);
-            db::ledger_insert(&conn, &ck, None, &plan.title, None, plan.size);
+            db::ledger_insert(&conn, &ck, None, &plan.title, magnet_hash(plan.magnet_url.as_deref()).as_deref(), plan.size);
             let what = if plan.is_pack {
                 format!("{} S{:02} season pack", plan.show_name, plan.season)
             } else {
@@ -304,6 +321,15 @@ fn reopen_dead_grabs(
             });
         if let Some((id, title, size)) = hit {
             let _ = conn.execute("UPDATE grab_ledger SET state = 'stalled' WHERE id = ?1", [id]);
+            // hand the episode back to the scheduler: without this it sits in
+            // 'grabbed' forever pointing at a dead release, and nothing —
+            // medic off, agent unreachable, medic failure — ever frees it
+            let _ = conn.execute(
+                "UPDATE episodes SET state = 'wanted', grabbed_title = NULL, grabbed_at = NULL,
+                        last_searched_at = 0
+                 WHERE state = 'grabbed' AND grabbed_title = ?1",
+                [&title],
+            );
             // A stalled UPGRADE grab (same content key already completed once)
             // needs no medic — the user keeps the copy they already have, and
             // the agent would only refuse "already grabbed" replacements.
@@ -363,6 +389,7 @@ async fn medic_pass(app: &tauri::AppHandle, state: &AppState, dead: Vec<DeadGrab
         password: cfg.qbit_password.clone(),
     };
 
+    // only the ones we actually handle this cycle; the rest stay detectable
     for item in dead.into_iter().take(2) {
         // pause the dead torrent — recoverable, never deleted
         let _ = q.torrent_action("stop", &item.qbt_hash).await;
@@ -481,6 +508,21 @@ async fn medic_pass(app: &tauri::AppHandle, state: &AppState, dead: Vec<DeadGrab
     }
 }
 
+/// The btih out of a magnet link, lowercased — identity that survives
+/// qBittorrent renaming the torrent once metadata arrives.
+pub(crate) fn magnet_hash(magnet: Option<&str>) -> Option<String> {
+    let m = magnet?;
+    let idx = m.find("btih:")?;
+    let rest = &m[idx + 5..];
+    let end = rest.find('&').unwrap_or(rest.len());
+    let h = &rest[..end];
+    if h.len() == 40 || h.len() == 32 {
+        Some(h.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
 /// Flip grabbed → downloaded by matching qBittorrent's finished torrents.
 /// Returns any dead grabs detected, for the medic.
 async fn completion_pass(app: &tauri::AppHandle, state: &AppState) -> Vec<DeadGrab> {
@@ -496,14 +538,36 @@ async fn completion_pass(app: &tauri::AppHandle, state: &AppState) -> Vec<DeadGr
         Ok(t) => t,
         Err(_) => return vec![],
     };
-    let done: std::collections::HashSet<String> = torrents
+    let mut done: std::collections::HashSet<String> = torrents
         .iter()
         .filter(|t| t.progress >= 0.999)
         .map(|t| normalize(&t.name))
         .collect();
+    let done_hashes: std::collections::HashSet<String> = torrents
+        .iter()
+        .filter(|t| t.progress >= 0.999)
+        .map(|t| t.hash.to_ascii_lowercase())
+        .collect();
 
     let mut completed_display: Vec<String> = vec![];
     let conn = state.db.lock().await;
+    // magnet grabs: qBt renames the torrent once metadata lands, so recover
+    // "this finished" via the ledger's infohash and fold it into the name set
+    if !done_hashes.is_empty() {
+        if let Ok(mut stmt) =
+            conn.prepare("SELECT title, info_hash FROM grab_ledger WHERE info_hash IS NOT NULL")
+        {
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .map(|it| it.flatten().collect::<Vec<_>>())
+                .unwrap_or_default();
+            for (title, hash) in rows {
+                if done_hashes.contains(&hash.to_ascii_lowercase()) {
+                    done.insert(normalize(&title));
+                }
+            }
+        }
+    }
     let dead = reopen_dead_grabs(&conn, &torrents);
     if done.is_empty() {
         drop(conn);
@@ -574,7 +638,17 @@ async fn completion_pass(app: &tauri::AppHandle, state: &AppState) -> Vec<DeadGr
         .unwrap_or_default();
     for (id, title, ts) in open_ledger {
         let norm = normalize(&title);
-        if done.contains(&norm) {
+        // hash first — magnet grabs get renamed by qBt once metadata lands,
+        // so the listing title and the torrent name often disagree
+        let hash_done = conn
+            .query_row("SELECT info_hash FROM grab_ledger WHERE id = ?1", [id], |r| {
+                r.get::<_, Option<String>>(0)
+            })
+            .ok()
+            .flatten()
+            .map(|h| done_hashes.contains(&h.to_ascii_lowercase()))
+            .unwrap_or(false);
+        if hash_done || done.contains(&norm) {
             let _ = conn.execute("UPDATE grab_ledger SET state = 'completed' WHERE id = ?1", [id]);
             if seen_norms.insert(norm) && ts >= recent_cutoff {
                 completed_display.push(title.chars().take(60).collect());
@@ -637,11 +711,16 @@ pub async fn run_cycle(app: &tauri::AppHandle) -> Result<usize> {
     if state.scheduler_busy.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return Ok(0); // a cycle is already running
     }
-    let result = run_cycle_inner(app, state).await;
-    state
-        .scheduler_busy
-        .store(false, std::sync::atomic::Ordering::SeqCst);
-    result
+    // drop guard: a panic inside the cycle must not leave the flag stuck,
+    // which would silently disable the scheduler for the whole session
+    struct Busy<'a>(&'a std::sync::atomic::AtomicBool);
+    impl Drop for Busy<'_> {
+        fn drop(&mut self) {
+            self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let _busy = Busy(&state.scheduler_busy);
+    run_cycle_inner(app, state).await
 }
 
 async fn run_cycle_inner(app: &tauri::AppHandle, state: &AppState) -> Result<usize> {
@@ -653,6 +732,25 @@ async fn run_cycle_inner(app: &tauri::AppHandle, state: &AppState) -> Result<usi
     };
     let now = db::now();
     let mut grabs = 0usize;
+    // the follow path gets the same rails briefs have: a per-cycle grab cap
+    // and a free-disk floor, so a catalog import can't flood the disk
+    const MAX_GRABS_PER_CYCLE: usize = 6;
+    let disk_ok = {
+        let cfg = state.config.read().await.clone();
+        let q = crate::qbit::QbitClient {
+            http: &state.http,
+            base: cfg.qbit_url.clone(),
+            username: cfg.qbit_username.clone(),
+            password: cfg.qbit_password.clone(),
+        };
+        match q.free_space().await {
+            Ok(free) => (free as f64) >= cfg.agent_min_free_disk_gb.max(5.0) * 1e9,
+            Err(_) => true, // can't tell — don't block grabs on a hiccup
+        }
+    };
+    if !disk_ok {
+        eprintln!("[trawler] free disk below the floor — no grabs this cycle");
+    }
     eprintln!(
         "[trawler] scheduler cycle: {} show(s), {} wanted episode(s)",
         shows.len(),
@@ -670,22 +768,23 @@ async fn run_cycle_inner(app: &tauri::AppHandle, state: &AppState) -> Result<usi
         }
 
         match plan_for_show(state, show, false).await {
-            Ok(plans) => {
-                {
-                    // stamp everything we looked for, found or not
+            Ok(outcome) => {
+                if !outcome.searched_ep_ids.is_empty() {
+                    // stamp ONLY what was actually searched with indexers
+                    // answering — stamping unsearched episodes starves them
                     let conn = state.db.lock().await;
-                    let searched: Vec<i64> = db::list_episodes(&conn, show.tvmaze_id)
-                        .unwrap_or_default()
-                        .iter()
-                        .filter(|e| e.state == "wanted")
-                        .map(|e| e.tvmaze_ep_id)
-                        .collect();
-                    db::stamp_searched(&conn, &searched);
+                    db::stamp_searched(&conn, &outcome.searched_ep_ids);
                 }
-                for plan in &plans {
+                for plan in &outcome.plans {
+                    if !disk_ok || grabs >= MAX_GRABS_PER_CYCLE {
+                        break;
+                    }
                     if execute_plan(app, state, plan).await {
                         grabs += 1;
                     }
+                }
+                if grabs >= MAX_GRABS_PER_CYCLE {
+                    break;
                 }
             }
             Err(e) => eprintln!("[trawler] planning {} failed: {e}", show.name),

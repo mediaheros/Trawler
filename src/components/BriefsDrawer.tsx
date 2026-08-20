@@ -12,7 +12,7 @@ import {
 } from "lucide-react";
 import { api, type BriefRow, type HuntPlan } from "../lib/api";
 import { useStore } from "../store";
-import { Button, Chip, CloseBtn, Field, TextInput, cx } from "./ui";
+import { Button, Chip, CloseBtn, Field, NumInput, TextInput, cx } from "./ui";
 
 export default function BriefsDrawer({ onClose }: { onClose: () => void }) {
   const { briefs, loadBriefs, toast } = useStore();
@@ -192,9 +192,16 @@ function BriefEditor({ existing, onClose }: { existing: BriefRow | null; onClose
   const toast = useStore((s) => s.toast);
   const [name, setName] = useState(existing?.name ?? "");
   const [prompt, setPrompt] = useState(existing?.prompt ?? "");
-  const [plan, setPlan] = useState<HuntPlan | null>(
-    existing ? (JSON.parse(existing.planJson) as HuntPlan) : null,
-  );
+  const [plan, setPlan] = useState<HuntPlan | null>(() => {
+    if (!existing) return null;
+    try {
+      return JSON.parse(existing.planJson) as HuntPlan;
+    } catch {
+      return null; // a corrupt plan re-compiles from the prompt instead of crashing
+    }
+  });
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const [cadence, setCadence] = useState(existing?.cadenceMinutes ?? 180);
   const [mode, setMode] = useState<"propose" | "auto">(existing?.mode ?? "propose");
   const [maxGrabs, setMaxGrabs] = useState(existing?.maxGrabsPerRun ?? 2);
@@ -239,10 +246,19 @@ function BriefEditor({ existing, onClose }: { existing: BriefRow | null; onClose
     }
   };
 
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   return (
     <div
       className="fixed inset-0 z-40 flex items-start justify-center bg-black/60 pt-[10vh] backdrop-blur-[2px]"
       onMouseDown={(e) => e.target === e.currentTarget && onClose()}
+      role="dialog"
+      aria-modal="true"
     >
       <div className="toast-in w-[560px] max-w-[92vw] overflow-hidden rounded-(--radius-card) border border-line2 bg-bg1 shadow-[0_24px_80px_-20px_rgba(0,0,0,0.9)]">
         <div className="border-b border-line px-4 py-3 text-[13px] font-semibold">
@@ -295,10 +311,10 @@ function BriefEditor({ existing, onClose }: { existing: BriefRow | null; onClose
               </select>
             </Field>
             <Field label="Max grabs per run">
-              <TextInput mono value={String(maxGrabs)} onChange={(v) => setMaxGrabs(Math.max(1, Number(v) || 1))} />
+              <NumInput value={maxGrabs} integer min={1} max={10} onCommit={setMaxGrabs} />
             </Field>
             <Field label="Max GB per run">
-              <TextInput mono value={String(maxGb)} onChange={(v) => setMaxGb(Math.max(1, Number(v) || 1))} />
+              <NumInput value={maxGb} min={1} max={200} onCommit={setMaxGb} />
             </Field>
           </div>
 
@@ -335,12 +351,24 @@ function BriefEditor({ existing, onClose }: { existing: BriefRow | null; onClose
             <Button
               variant="danger"
               onClick={async () => {
-                await api.briefDelete(existing.id);
-                onClose();
+                if (!confirmDelete) {
+                  setConfirmDelete(true);
+                  return;
+                }
+                setDeleting(true);
+                try {
+                  await api.briefDelete(existing.id);
+                  onClose();
+                } catch (e) {
+                  toast(String(e), "bad");
+                  setConfirmDelete(false);
+                } finally {
+                  setDeleting(false);
+                }
               }}
               className="px-2.5 py-1 text-[11.5px]"
             >
-              <Trash2 size={12} /> Delete
+              <Trash2 size={12} /> {deleting ? "Deleting…" : confirmDelete ? "Really delete?" : "Delete"}
             </Button>
           ) : (
             <span />

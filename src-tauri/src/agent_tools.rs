@@ -113,7 +113,14 @@ impl RunCtx {
 /// string that originated on an indexer before it reaches model, DB, or UI.
 pub fn clean_text(s: &str, max: usize) -> String {
     s.chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| match c {
+            c if c.is_control() => ' ',
+            // angle brackets could forge/close the untrusted-data fence the
+            // agent prompt relies on — neutralize to lookalikes
+            '<' => '\u{2039}',
+            '>' => '\u{203A}',
+            c => c,
+        })
         .collect::<String>()
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -177,7 +184,6 @@ async fn search_releases(state: &AppState, ctx: &mut RunCtx, args: &Value) -> Va
     if ctx.searches_used >= ctx.max_searches {
         return err("search budget exhausted — judge what you already found or conclude");
     }
-    ctx.searches_used += 1;
 
     let query = match args.get("query").and_then(|q| q.as_str()) {
         Some(q) if !q.trim().is_empty() => clean_text(q, 80),
@@ -192,6 +198,9 @@ async fn search_releases(state: &AppState, ctx: &mut RunCtx, args: &Value) -> Va
         Ok(r) => r,
         Err(e) => return err(format!("search failed: {e}")),
     };
+    // only a search that actually reached the indexers costs budget — a broken
+    // Prowlarr must not burn all 8 attempts and report "nothing new"
+    ctx.searches_used += 1;
 
     // Same pipeline as manual search (parse/rank/relevance) — then the plan's
     // hard constraints, so the model never even sees out-of-scope releases.
@@ -213,7 +222,7 @@ async fn search_releases(state: &AppState, ctx: &mut RunCtx, args: &Value) -> Va
             title: clean_text(&r.release.title, 140),
             size: r.release.size,
             seeders,
-            indexer: r.release.indexer.clone(),
+            indexer: r.release.indexer.clone().map(|i| clean_text(&i, 40)),
             resolution: r.parsed.resolution.clone(),
             source: r.parsed.source.clone(),
             codec: r.parsed.codec.clone(),

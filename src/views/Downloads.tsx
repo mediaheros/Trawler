@@ -22,15 +22,22 @@ export default function DownloadsView() {
 
   useEffect(() => {
     let alive = true;
+    let inFlight = false;
+    let seq = 0;
     const tick = async () => {
+      if (inFlight) return; // a slow qBt response must not stack requests
+      inFlight = true;
+      const mine = ++seq;
       try {
         const d = await api.downloads(scope === "all");
-        if (alive) {
+        if (alive && mine === seq) {
           setData(d);
           setError(null);
         }
       } catch (e) {
-        if (alive) setError(String(e));
+        if (alive && mine === seq) setError(String(e));
+      } finally {
+        inFlight = false;
       }
     };
     void tick();
@@ -123,6 +130,7 @@ function TorrentCard({
 }) {
   const kind = stateKind(t.state);
   const pct = Math.min(100, t.progress * 100);
+  const [confirmRemove, setConfirmRemove] = useState(false);
   const stopped = t.state.startsWith("paused") || t.state.startsWith("stopped");
 
   return (
@@ -191,10 +199,18 @@ function TorrentCard({
           <Button
             variant="ghost"
             className="px-2 py-1.5 hover:text-bad"
-            title="Remove (keeps files)"
-            onClick={() => onAction("delete", t)}
+            title={confirmRemove ? "Click again to remove (keeps files)" : "Remove (keeps files)"}
+            onClick={() => {
+              if (!confirmRemove) {
+                setConfirmRemove(true);
+                window.setTimeout(() => setConfirmRemove(false), 2500);
+                return;
+              }
+              setConfirmRemove(false);
+              onAction("delete", t);
+            }}
           >
-            <Trash2 size={14} />
+            {confirmRemove ? <span className="text-[10.5px] font-semibold text-bad">sure?</span> : <Trash2 size={14} />}
           </Button>
         </div>
 

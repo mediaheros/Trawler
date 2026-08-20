@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Loader2, X } from "lucide-react";
 import { seederHealth } from "../lib/format";
 import { useStore } from "../store";
@@ -266,6 +267,56 @@ export function Field({
       {children}
       {hint && <div className="mt-1 text-[11px] text-faint">{hint}</div>}
     </label>
+  );
+}
+
+export function NumInput({
+  value,
+  onCommit,
+  min,
+  max,
+  integer,
+}: {
+  value: number;
+  onCommit: (n: number) => void;
+  min?: number;
+  max?: number;
+  integer?: boolean;
+}) {
+  const [text, setText] = useState(String(value));
+  const focused = useRef(false);
+  useEffect(() => {
+    if (!focused.current) setText(String(value));
+  }, [value]);
+  const commit = () => {
+    let n = Number(text);
+    if (!Number.isFinite(n)) n = value;
+    if (integer) n = Math.trunc(n);
+    if (min !== undefined) n = Math.max(min, n);
+    if (max !== undefined) n = Math.min(max, n);
+    onCommit(n);
+    setText(String(n));
+  };
+  return (
+    <input
+      value={text}
+      onChange={(e) => setText(e.target.value)}
+      onFocus={() => {
+        focused.current = true;
+      }}
+      onBlur={() => {
+        focused.current = false;
+        commit();
+      }}
+      onKeyDown={(e) => e.key === "Enter" && (e.target as HTMLInputElement).blur()}
+      inputMode="decimal"
+      className={cx(
+        "w-full rounded-(--radius-btn) bg-bg1 border border-line2 px-2.5 py-1.5 text-[12px] text-ink font-mono",
+        "placeholder:text-faint focus:border-accent/50 transition-colors",
+      )}
+      spellCheck={false}
+      autoComplete="off"
+    />
   );
 }
 

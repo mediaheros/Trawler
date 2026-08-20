@@ -65,6 +65,15 @@ impl<'a> QbitClient<'a> {
     }
 
     pub async fn login(&self) -> Result<()> {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        // bad credentials + the 2s Downloads poll would otherwise hammer
+        // /auth/login until qBittorrent bans this IP — including localhost
+        static BLOCKED_UNTIL: AtomicI64 = AtomicI64::new(0);
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        if now < BLOCKED_UNTIL.load(Ordering::Relaxed) {
+            return Err(AppError::QbitAuth);
+        }
         let resp = self
             .http
             .post(self.url("/api/v2/auth/login"))
@@ -76,8 +85,10 @@ impl<'a> QbitClient<'a> {
         let body = resp.text().await.unwrap_or_default();
         // qBt answers 200 "Fails." on bad credentials.
         if !ok || body.contains("Fails") {
+            BLOCKED_UNTIL.store(now + 45, Ordering::Relaxed);
             return Err(AppError::QbitAuth);
         }
+        BLOCKED_UNTIL.store(0, Ordering::Relaxed);
         Ok(())
     }
 
@@ -246,11 +257,24 @@ impl<'a> QbitClient<'a> {
     pub async fn torrent_action(&self, action: &str, hash: &str) -> Result<()> {
         match action {
             "stop" | "start" => {
-                self.post_authed(
-                    &format!("/api/v2/torrents/{}", action),
-                    &[("hashes", hash.to_string())],
-                )
-                .await?;
+                // v5 renamed pause/resume -> stop/start; on 4.x the new names
+                // 404, so fall back to the legacy ones
+                let legacy = if action == "stop" { "pause" } else { "resume" };
+                let r = self
+                    .post_authed(
+                        &format!("/api/v2/torrents/{action}"),
+                        &[("hashes", hash.to_string())],
+                    )
+                    .await;
+                if let Err(AppError::Qbit { status: 404, .. }) = &r {
+                    self.post_authed(
+                        &format!("/api/v2/torrents/{legacy}"),
+                        &[("hashes", hash.to_string())],
+                    )
+                    .await?;
+                } else {
+                    r?;
+                }
             }
             "delete" | "deleteWithFiles" => {
                 let del_files = (action == "deleteWithFiles").to_string();

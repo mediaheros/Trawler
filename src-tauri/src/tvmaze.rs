@@ -96,6 +96,12 @@ async fn rate_gate() {
     *last = std::time::Instant::now();
 }
 
+/// Gated GET for arbitrary TVmaze URLs (discover schedules, previews) —
+/// same politeness rules as the typed endpoints.
+pub async fn get_gated(http: &reqwest::Client, url: &str) -> Result<reqwest::Response> {
+    get_with_retry(http, url, &[]).await
+}
+
 /// One polite retry on 429, honoring Retry-After (capped at 15s).
 async fn get_with_retry(http: &reqwest::Client, url: &str, query: &[(&str, &str)]) -> Result<reqwest::Response> {
     for attempt in 0..2 {

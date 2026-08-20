@@ -674,7 +674,7 @@ const mockProposals: ProposalRow[] = [
 
 /** Simulates the backend's streaming agent-step events for browser dev. */
 async function runMockAgent(text: string) {
-  const runId = "mock-run";
+  const runId = "chat-mock";
   const step = (kind: AgentStep["kind"], payload: AgentStep["payload"] = {}) =>
     emitMockStep({ runId, kind, payload });
   await sleep(400);

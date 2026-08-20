@@ -20,7 +20,7 @@ import { api, inTauri, type Config, type NotifyTestOutcome, type QualityProfile 
 import { sameProfile } from "../lib/format";
 import { checkForUpdate, currentVersion } from "../lib/updater";
 import { useStore } from "../store";
-import { Button, Chip, Field, TextInput, cx } from "../components/ui";
+import { Button, Chip, Field, NumInput, TextInput, cx } from "../components/ui";
 import IndexerManager from "../components/IndexerManager";
 
 type TabId = "connections" | "indexers" | "grabbing" | "following" | "notifications" | "agent" | "app";
@@ -210,11 +210,7 @@ export default function SettingsView() {
             </Field>
             {draft.seedPolicy === "ratio" && (
               <Field label="Stop at ratio" hint="1.0 = give back what you took">
-                <TextInput
-                  mono
-                  value={String(draft.seedRatio)}
-                  onChange={(v) => set({ seedRatio: Math.max(0, Number(v) || 0) })}
-                />
+                <NumInput value={draft.seedRatio} min={0} onCommit={(n) => set({ seedRatio: n })} />
               </Field>
             )}
           </div>
@@ -291,19 +287,19 @@ export default function SettingsView() {
               </select>
             </Field>
             <Field label="Max size per episode" hint="0 = no limit. Packs get size × episodes.">
-              <TextInput
-                mono
-                value={draft.defaultQuality.maxSizeGb ? String(draft.defaultQuality.maxSizeGb) : "0"}
-                onChange={(v) =>
-                  set({ defaultQuality: { ...draft.defaultQuality, maxSizeGb: Number(v) || 0 } })
-                }
+              <NumInput
+                value={draft.defaultQuality.maxSizeGb}
+                min={0}
+                onCommit={(n) => set({ defaultQuality: { ...draft.defaultQuality, maxSizeGb: n } })}
               />
             </Field>
             <Field label="Check every (minutes)" hint="5 minutes minimum">
-              <TextInput
-                mono
-                value={String(draft.schedulerMinutes)}
-                onChange={(v) => set({ schedulerMinutes: Math.trunc(Number(v)) || 0 })}
+              <NumInput
+                value={draft.schedulerMinutes}
+                integer
+                min={5}
+                max={1440}
+                onCommit={(n) => set({ schedulerMinutes: n })}
               />
             </Field>
           </div>
@@ -324,10 +320,12 @@ export default function SettingsView() {
               </span>
             </label>
             <Field label="Sweep every (minutes)" hint="10 minimum — be kind to indexers">
-              <TextInput
-                mono
-                value={String(draft.rssMinutes)}
-                onChange={(v) => set({ rssMinutes: Math.trunc(Number(v)) || 0 })}
+              <NumInput
+                value={draft.rssMinutes}
+                integer
+                min={10}
+                max={120}
+                onCommit={(n) => set({ rssMinutes: n })}
               />
             </Field>
           </div>
@@ -350,10 +348,12 @@ export default function SettingsView() {
             {draft.upgradeScoutEnabled && (
               <div className="space-y-2">
                 <Field label="Look back (days)" hint="1–365 · how recent a download must be to qualify">
-                  <TextInput
-                    mono
-                    value={String(draft.upgradeWindowDays)}
-                    onChange={(v) => set({ upgradeWindowDays: Math.trunc(Number(v)) || 0 })}
+                  <NumInput
+                    value={draft.upgradeWindowDays}
+                    integer
+                    min={1}
+                    max={365}
+                    onCommit={(n) => set({ upgradeWindowDays: n })}
                   />
                 </Field>
                 <ScanNowButton />
@@ -479,7 +479,7 @@ export default function SettingsView() {
             </Field>
             <Field label="Free-disk floor" hint="Agent refuses to grab below this">
               <div className="flex items-center gap-1.5">
-                <TextInput mono value={String(draft.agentMinFreeDiskGb)} onChange={(v) => set({ agentMinFreeDiskGb: Number(v) || 0 })} />
+                <NumInput value={draft.agentMinFreeDiskGb} min={0} onCommit={(n) => set({ agentMinFreeDiskGb: n })} />
                 <span className="shrink-0 text-[12px] text-dim">GB</span>
               </div>
             </Field>

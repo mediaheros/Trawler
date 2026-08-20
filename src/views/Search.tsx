@@ -16,11 +16,23 @@ import { useStore, type SortKey } from "../store";
 import { Badge, Button, CenterMessage, Chip, SeederDot, Segmented, cx } from "../components/ui";
 
 export default function SearchView() {
-  const {
-    query, setQuery, kind, setKind, sort, setSort, sortThen, setSortThen,
-    searching, hasSearched, results, searchError, runSearch,
-    showHidden, setShowHidden, filters, setFilter,
-  } = useStore();
+  const query = useStore((s) => s.query);
+  const setQuery = useStore((s) => s.setQuery);
+  const kind = useStore((s) => s.kind);
+  const setKind = useStore((s) => s.setKind);
+  const sort = useStore((s) => s.sort);
+  const setSort = useStore((s) => s.setSort);
+  const sortThen = useStore((s) => s.sortThen);
+  const setSortThen = useStore((s) => s.setSortThen);
+  const searching = useStore((s) => s.searching);
+  const hasSearched = useStore((s) => s.hasSearched);
+  const results = useStore((s) => s.results);
+  const searchError = useStore((s) => s.searchError);
+  const runSearch = useStore((s) => s.runSearch);
+  const showHidden = useStore((s) => s.showHidden);
+  const setShowHidden = useStore((s) => s.setShowHidden);
+  const filters = useStore((s) => s.filters);
+  const setFilter = useStore((s) => s.setFilter);
   const toast = useStore((s) => s.toast);
   const [addingStarters, setAddingStarters] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -66,27 +78,29 @@ export default function SearchView() {
     const filteredCount = before - rel.length;
     const raw = (key: SortKey, r: Release): number => {
       switch (key) {
-        case "seeders": return r.seeders ?? 0;
+        case "seeders": return Math.max(0, r.seeders ?? 0);
         case "size": return r.size;
-        case "age": return -ageDays(r);
+        case "age": return -Math.max(0, ageDays(r));
         default: return r.score;
       }
     };
     // With a secondary sort, the primary is BANDED (seeder health bands,
     // rough size classes, whole days) — otherwise exact values almost never
     // tie and the secondary would never speak.
-    const band = (key: SortKey, r: Release): number => {
+    const band = (key: Exclude<SortKey, "score">, r: Release): number => {
       switch (key) {
         case "seeders": return Math.floor(Math.log(Math.max(0, r.seeders ?? 0) + 1) / Math.log(3));
-        case "size": return Math.floor(Math.log2(r.size / 5e8 + 1));
-        case "age": return -Math.floor(ageDays(r));
-        default: return r.score;
+        case "size": return Math.floor(Math.log2(Math.max(0, r.size) / 5e8 + 1));
+        case "age": return -Math.floor(Math.max(0, ageDays(r)));
       }
     };
+    // secondary truthy guarantees sort !== "score" — banding only exists for
+    // the three measurable keys
     const secondary = sort !== "score" && sortThen && sortThen !== sort ? sortThen : null;
     rel.sort((a, b) => {
       if (secondary) {
-        const p = band(sort, b) - band(sort, a);
+        const key = sort as Exclude<SortKey, "score">;
+        const p = band(key, b) - band(key, a);
         if (p !== 0) return p;
         return raw(secondary, b) - raw(secondary, a);
       }
@@ -207,7 +221,7 @@ export default function SearchView() {
         )}
 
         {!landing && results && !searching && (
-          <div className="flex w-full items-center justify-between text-[11.5px] text-faint">
+          <div className="flex w-full flex-wrap items-center justify-between gap-x-4 gap-y-2 text-[11.5px] text-faint">
             <div className="flex items-center gap-1.5">
               <span>
                 {sorted.length} release{sorted.length === 1 ? "" : "s"}
@@ -258,7 +272,7 @@ export default function SearchView() {
                 ]}
               />
               {sort !== "score" && (
-                <span className="flex items-center gap-1" title="Break near-ties in the first sort with a second one — e.g. Seeds then Newest = the freshest of the well-seeded">
+                <span className="flex items-center gap-1" title="Groups the first sort into rough bands, then orders each band by the second — e.g. Seeds then Newest = the freshest among the similarly-seeded">
                   <span className="text-faint">then</span>
                   {(
                     [

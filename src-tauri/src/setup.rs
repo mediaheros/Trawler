@@ -53,10 +53,54 @@ fn managed_prowlarr_data() -> PathBuf {
 }
 
 fn qbt_exe_candidates() -> Vec<PathBuf> {
-    vec![
-        PathBuf::from(r"C:\Program Files\qBittorrent\qbittorrent.exe"),
-        PathBuf::from(r"C:\Program Files (x86)\qBittorrent\qbittorrent.exe"),
-    ]
+    let mut out = vec![];
+    // honor real environment paths, not a hardcoded C: drive
+    for var in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "LOCALAPPDATA"] {
+        if let Ok(base) = std::env::var(var) {
+            out.push(PathBuf::from(base).join("qBittorrent").join("qbittorrent.exe"));
+        }
+    }
+    out.push(PathBuf::from(r"C:\Program Files\qBittorrent\qbittorrent.exe"));
+    out.push(PathBuf::from(r"C:\Program Files (x86)\qBittorrent\qbittorrent.exe"));
+    // last resort: ask Windows where the running/registered copy lives
+    if let Some(p) = qbt_exe_from_registry() {
+        out.insert(0, p);
+    }
+    out.dedup();
+    out
+}
+
+/// InstallLocation from qBittorrent's uninstall key (HKCU then HKLM).
+fn qbt_exe_from_registry() -> Option<PathBuf> {
+    for root in ["HKCU", "HKLM"] {
+        let mut cmd = std::process::Command::new("reg");
+        cmd.args([
+            "query",
+            &format!(r"{root}\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\qBittorrent"),
+            "/v",
+            "InstallLocation",
+        ]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000);
+        }
+        if let Ok(out) = cmd.output() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if let Some(line) = text.lines().find(|l| l.contains("InstallLocation")) {
+                if let Some(idx) = line.find("REG_SZ") {
+                    let dir = line[idx + 6..].trim();
+                    if !dir.is_empty() {
+                        let exe = PathBuf::from(dir).join("qbittorrent.exe");
+                        if exe.exists() {
+                            return Some(exe);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn qbt_ini_path() -> PathBuf {
@@ -164,11 +208,11 @@ pub async fn status(state: &AppState) -> SetupStatus {
     };
 
     let agent = if cfg.agent_enabled {
-        let ok = crate::llm::LlmClient::new(&cfg.agent_base_url, &cfg.agent_model)
-            .models()
-            .await
-            .is_ok();
-        if ok { "ok" } else { "unreachable" }
+        let client = crate::llm::LlmClient::new(&cfg.agent_base_url, &cfg.agent_model);
+        match tokio::time::timeout(std::time::Duration::from_secs(4), client.models()).await {
+            Ok(Ok(_)) => "ok",
+            _ => "unreachable",
+        }
     } else {
         "unreachable"
     };
@@ -327,7 +371,16 @@ pub async fn install_prowlarr(app: &AppHandle) -> Result<String> {
         .ok_or_else(|| AppError::Other("could not find a Prowlarr Windows build".into()))?;
 
     emit(app, "prowlarr", "log", json!({ "message": "Downloading Prowlarr…" }));
-    let resp = state.http.get(&asset_url).send().await?;
+    // ~100 MB: the client's 60s TOTAL deadline would abort this on any
+    // connection under ~15 Mbps, mid-wizard, with a confusing error
+    let resp = state
+        .http
+        .get(&asset_url)
+        .timeout(std::time::Duration::from_secs(1800))
+        .send()
+        .await?
+        .error_for_status()
+        .map_err(|e| AppError::Other(format!("Prowlarr download failed: {e}")))?;
     let total = resp.content_length().unwrap_or(0);
     let mut bytes: Vec<u8> = Vec::with_capacity(total as usize);
     let mut stream = resp;
@@ -423,9 +476,15 @@ fn qbt_password_blob(password: &str) -> String {
 /// didn't exist — i.e. the install the user explicitly clicked for; without
 /// it qBittorrent halts ALL startup, WebUI included, behind a modal).
 pub fn ensure_qbt_ini(ini: &str, credentials: Option<(&str, &str)>, fresh: bool) -> String {
+    ensure_qbt_ini_port(ini, credentials, fresh, 8080)
+}
+
+/// Same, but honoring a caller-supplied WebUI port (from cfg.qbit_url) —
+/// forcing 8080 onto someone who runs the WebUI on 9090 broke their setup.
+pub fn ensure_qbt_ini_port(ini: &str, credentials: Option<(&str, &str)>, fresh: bool, port: u16) -> String {
     let mut wanted: Vec<(String, String)> = vec![
         (r"WebUI\Enabled".into(), "true".into()),
-        (r"WebUI\Port".into(), "8080".into()),
+        (r"WebUI\Port".into(), port.to_string()),
         (r"WebUI\LocalHostAuth".into(), "false".into()),
     ];
     // never clobber a password the user already has
@@ -490,7 +549,19 @@ pub fn ensure_qbt_ini(ini: &str, credentials: Option<(&str, &str)>, fresh: bool)
 /// Enable the WebUI and (re)launch qBittorrent. If it's running we close it
 /// ourselves — its X button only hides to tray, so "close it first" was a
 /// trap users couldn't escape.
-pub async fn configure_and_launch_qbt() -> Result<()> {
+pub async fn configure_and_launch_qbt(qbit_url: &str) -> Result<()> {
+    let qbit_port: u16 = url::Url::parse(qbit_url)
+        .ok()
+        .and_then(|u| u.port_or_known_default())
+        .unwrap_or(8080);
+    // resolve BEFORE killing anything: a custom install path used to mean we
+    // force-closed the user's client and then failed to relaunch it
+    let exe = qbt_exe_candidates()
+        .into_iter()
+        .find(|p| p.exists())
+        .ok_or_else(|| AppError::Other(
+            "couldn't find qBittorrent's program folder — install it from qbittorrent.org, or set its Web UI up manually in Settings".into(),
+        ))?;
     if process_running("qbittorrent.exe") {
         let mut kill = std::process::Command::new("taskkill");
         kill.args(["/IM", "qbittorrent.exe", "/F"]);
@@ -510,19 +581,25 @@ pub async fn configure_and_launch_qbt() -> Result<()> {
             return Err(AppError::Other("couldn't close qBittorrent — try quitting it from its tray icon".into()));
         }
     }
-    let exe = qbt_exe_candidates()
-        .into_iter()
-        .find(|p| p.exists())
-        .ok_or_else(|| AppError::Other("qBittorrent doesn't appear to be installed".into()))?;
-
     let ini_path = qbt_ini_path();
-    let current = std::fs::read_to_string(&ini_path).unwrap_or_default();
-    let fresh = current.trim().is_empty();
+    let (current, fresh) = match std::fs::read_to_string(&ini_path) {
+        Ok(s) => {
+            let fresh = s.trim().is_empty();
+            (s, fresh)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (String::new(), true),
+        Err(e) => {
+            return Err(AppError::Other(format!(
+                "couldn't read qBittorrent's settings at {} ({e}) — close qBittorrent and try again",
+                ini_path.display()
+            )))
+        }
+    };
     // random password nobody ever needs to see — localhost API access is
     // exempted from auth; qBittorrent just requires that credentials EXIST
     let password = random_api_key();
     let blob = qbt_password_blob(&password);
-    let updated = ensure_qbt_ini(&current, Some(("admin", &blob)), fresh);
+    let updated = ensure_qbt_ini_port(&current, Some(("admin", &blob)), fresh, qbit_port);
     if let Some(parent) = ini_path.parent() {
         std::fs::create_dir_all(parent)?;
     }

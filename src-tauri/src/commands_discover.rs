@@ -123,7 +123,7 @@ async fn fetch_schedule_day(http: &reqwest::Client, kind: &str, date: &str) -> V
         "web" => format!("https://api.tvmaze.com/schedule/web?date={date}"),
         _ => format!("https://api.tvmaze.com/schedule?country=US&date={date}"),
     };
-    match http.get(&url).timeout(std::time::Duration::from_secs(10)).send().await {
+    match crate::tvmaze::get_gated(http, &url).await {
         Ok(r) if r.status().is_success() => r.json::<Vec<Value>>().await.unwrap_or_default(),
         _ => vec![],
     }
@@ -227,6 +227,7 @@ pub async fn discover(state: State<'_, AppState>, force: Option<bool>) -> Result
         }
     }
 
+    let week_empty = week_raw.is_empty();
     let tonight = sort_by_weight(dedupe_by_show(tonight_raw)).into_iter().take(24).collect::<Vec<_>>();
     let premieres = sort_by_weight(dedupe_by_show(
         week_raw
@@ -241,7 +242,9 @@ pub async fn discover(state: State<'_, AppState>, force: Option<bool>) -> Result
     let popular = sort_by_weight(dedupe_by_show(week_raw)).into_iter().take(24).collect::<Vec<_>>();
 
     let out = json!({ "tonight": tonight, "premieres": premieres, "popular": popular });
-    {
+    // cache only real data: if every fetch failed (offline, TVmaze down) the
+    // next visit should retry, not stare at an empty Discover for six hours
+    if !week_empty {
         let mut cache = state.discover_cache.lock().await;
         *cache = Some((db::now(), out.clone()));
     }
@@ -328,12 +331,7 @@ pub fn strip_html(s: &str) -> String {
 #[tauri::command]
 pub async fn show_preview(state: State<'_, AppState>, tvmaze_id: i64) -> Result<Value> {
     let url = format!("https://api.tvmaze.com/shows/{tvmaze_id}?embed[]=episodes&embed[]=cast");
-    let resp = state
-        .http
-        .get(&url)
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await?;
+    let resp = crate::tvmaze::get_gated(&state.http, &url).await?;
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Err(AppError::Other("TVmaze doesn't know this show anymore".into()));
     }

@@ -45,10 +45,12 @@ export default function AgentView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // pin to bottom as content streams in
+  // pin to bottom as content streams in — but never yank the user back down
+  // while they're scrolled up reading an earlier answer
+  const pinned = useRef(true);
   useEffect(() => {
     const el = scrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (el && pinned.current) el.scrollTop = el.scrollHeight;
   }, [chat, liveSteps, agentThinking]);
 
   const send = () => {
@@ -58,7 +60,8 @@ export default function AgentView() {
     void sendToAgent(text);
   };
 
-  const empty = chatLoaded && chat.length === 0;
+  // pending proposals ARE content: briefs/medic/scout file them with no chat
+  const empty = chatLoaded && chat.length === 0 && proposals.length === 0;
 
   return (
     <div className="flex h-full">
@@ -93,7 +96,14 @@ export default function AgentView() {
         </div>
 
         {/* transcript */}
-        <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto px-6">
+        <div
+          ref={scrollRef}
+          className="min-h-0 flex-1 overflow-y-auto px-6"
+          onScroll={(e) => {
+            const el = e.currentTarget;
+            pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+          }}
+        >
           <div className={cx("mx-auto flex max-w-[720px] flex-col pb-6", empty && !agentBusy && "min-h-full justify-center")}>
             {empty && !agentBusy ? (
               <EmptyState onPick={(s) => { setInput(s); inputRef.current?.focus(); }} />
@@ -125,7 +135,7 @@ export default function AgentView() {
                   ),
                 )}
                 {/* live run */}
-                {(liveSteps.length > 0 || agentThinking) && agentBusy && (
+                {(liveSteps.length > 0 || agentThinking) && (
                   <div className="mb-5 flex gap-3">
                     <AgentAvatar pulse />
                     <div className="min-w-0 flex-1 space-y-1.5 pt-1">
@@ -310,13 +320,18 @@ export function ProposalCard({
   onResolve,
 }: {
   p: ProposalRow;
-  onResolve: (id: number, approve: boolean) => void;
+  onResolve: (id: number, approve: boolean) => Promise<void> | void;
 }) {
   const r = p.result;
   const [resolving, setResolving] = useState<"grab" | "skip" | null>(null);
-  const resolve = (approve: boolean) => {
+  const resolve = async (approve: boolean) => {
     setResolving(approve ? "grab" : "skip");
-    onResolve(p.id, approve);
+    try {
+      await onResolve(p.id, approve);
+    } finally {
+      // a failed grab leaves the card mounted — it must stay usable
+      setResolving(null);
+    }
   };
   return (
     <div className="overflow-hidden rounded-(--radius-card) border border-warn/25 bg-bg1">
@@ -343,7 +358,7 @@ export function ProposalCard({
         <div className="mt-2.5 flex gap-1.5">
           <Button
             variant="primary"
-            onClick={() => resolve(true)}
+            onClick={() => void resolve(true)}
             busy={resolving === "grab"}
             disabled={resolving !== null}
             className="px-3 py-1 text-[11.5px]"
@@ -352,7 +367,7 @@ export function ProposalCard({
           </Button>
           <Button
             variant="ghost"
-            onClick={() => resolve(false)}
+            onClick={() => void resolve(false)}
             busy={resolving === "skip"}
             disabled={resolving !== null}
             className="px-2.5 py-1 text-[11.5px]"

@@ -164,10 +164,23 @@ pub fn config_path() -> PathBuf {
 
 pub fn load() -> Config {
     let path = config_path();
-    let mut cfg: Config = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
+    let raw = std::fs::read_to_string(&path).ok();
+    let parsed = raw.as_deref().map(|s| serde_json::from_str::<Config>(s));
+    let mut cfg: Config = match parsed {
+        Some(Ok(c)) => c,
+        Some(Err(e)) => {
+            // an unparseable config must never be silently replaced by
+            // defaults — keep it so the user's keys can be recovered
+            let backup = path.with_extension(format!("corrupt-{}.json", crate::db::now()));
+            let _ = std::fs::copy(&path, &backup);
+            eprintln!(
+                "[trawler] config.json could not be read ({e}); kept a copy at {} and started with defaults",
+                backup.display()
+            );
+            Config::default()
+        }
+        None => Config::default(),
+    };
     // migration: an install configured before the wizard existed counts as set up
     if !cfg.setup_completed && !cfg.prowlarr_api_key.is_empty() {
         cfg.setup_completed = true;
@@ -181,6 +194,15 @@ pub fn save(cfg: &Config) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(&path, serde_json::to_string_pretty(cfg)?)?;
+    // atomic: a crash mid-write must not truncate the user's settings
+    let tmp = path.with_extension("json.tmp");
+    {
+        let json = serde_json::to_string_pretty(cfg)?;
+        let mut f = std::fs::File::create(&tmp)?;
+        use std::io::Write;
+        f.write_all(json.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, &path)?;
     Ok(())
 }

@@ -45,7 +45,8 @@ pub async fn setup_install_qbit(app: tauri::AppHandle) -> Result<()> {
 
 #[tauri::command]
 pub async fn setup_configure_qbit(state: State<'_, AppState>) -> Result<()> {
-    setup::configure_and_launch_qbt().await?;
+    let qbit_url = state.config.read().await.qbit_url.clone();
+    setup::configure_and_launch_qbt(&qbit_url).await?;
     // don't declare victory until the WebUI actually answers
     let cfg = state.config.read().await.clone();
     let q = crate::qbit::QbitClient {
@@ -96,6 +97,7 @@ pub async fn setup_starter_indexers(state: State<'_, AppState>) -> Result<Vec<St
 
     let mut added = vec![];
     let mut last_err: Option<AppError> = None;
+    let mut found_in_catalog = 0;
     for name in STARTERS {
         let Some(def) = defs
             .iter()
@@ -103,6 +105,7 @@ pub async fn setup_starter_indexers(state: State<'_, AppState>) -> Result<Vec<St
         else {
             continue; // renamed/removed from Prowlarr's catalog — skip quietly
         };
+        found_in_catalog += 1;
         let mut def = def.clone();
         def["enable"] = serde_json::Value::Bool(true);
         def["appProfileId"] = serde_json::Value::from(1);
@@ -116,6 +119,11 @@ pub async fn setup_starter_indexers(state: State<'_, AppState>) -> Result<Vec<St
         }
     }
     if added.is_empty() {
+        if found_in_catalog == 0 {
+            return Err(AppError::Other(
+                "Prowlarr's catalog doesn't list Trawler's starter indexers — add one yourself under Settings → Indexers".into(),
+            ));
+        }
         if let Some(e) = last_err {
             return Err(AppError::Other(format!("no indexers could be added: {e}")));
         }

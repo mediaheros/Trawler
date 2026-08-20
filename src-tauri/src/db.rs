@@ -107,6 +107,9 @@ pub fn open() -> Result<Connection> {
            first_seen INTEGER NOT NULL,
            last_seen INTEGER NOT NULL
          );
+         DELETE FROM proposals WHERE status = 'pending' AND id NOT IN (
+           SELECT MAX(id) FROM proposals WHERE status = 'pending' GROUP BY content_key
+         );
          CREATE UNIQUE INDEX IF NOT EXISTS idx_proposals_key
            ON proposals(content_key) WHERE status = 'pending';
          CREATE INDEX IF NOT EXISTS idx_proposals_ck_status
@@ -210,8 +213,18 @@ const MEMORY_MAX_KEYS: i64 = 40;
 const MEMORY_MAX_VALUE: usize = 300;
 
 pub fn memory_put(conn: &Connection, brief_id: i64, key: &str, value: &str) {
-    let key: String = key.chars().take(60).collect();
-    let value: String = value.chars().take(MEMORY_MAX_VALUE).collect();
+    let neutral = |s: &str, max: usize| -> String {
+        s.chars()
+            .map(|c| match c {
+                '<' => '\u{2039}',
+                '>' => '\u{203A}',
+                c => c,
+            })
+            .take(max)
+            .collect()
+    };
+    let key: String = neutral(key, 60);
+    let value: String = neutral(value, MEMORY_MAX_VALUE);
     let _ = conn.execute(
         "INSERT INTO brief_memory (brief_id, key, value, ts) VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT(brief_id, key) DO UPDATE SET value = excluded.value, ts = excluded.ts",

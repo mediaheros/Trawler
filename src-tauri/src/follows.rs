@@ -14,7 +14,17 @@ use crate::AppState;
 // ---------- query building ----------
 
 /// Indexers match release names, so strip punctuation that scene names drop.
+/// TVmaze disambiguates same-name shows as "Show (2017)" / "Show (UK)" —
+/// release groups don't, so those suffixes must not become required tokens.
+fn strip_disambiguator(name: &str) -> String {
+    match name.rfind(" (") {
+        Some(i) if name.ends_with(')') => name[..i].to_string(),
+        _ => name.to_string(),
+    }
+}
+
 pub fn clean_show_name(name: &str) -> String {
+    let name = &strip_disambiguator(name);
     let mut out = String::with_capacity(name.len());
     for c in name.chars() {
         match c {

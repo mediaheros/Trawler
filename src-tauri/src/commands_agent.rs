@@ -28,7 +28,7 @@ pub struct ChatRow {
 pub async fn agent_history(state: State<'_, AppState>) -> Result<Vec<ChatRow>> {
     let conn = state.db.lock().await;
     let mut stmt = conn
-        .prepare("SELECT id, ts, role, content, tool_name, tool_payload FROM chat_messages ORDER BY id ASC LIMIT 400")
+        .prepare("SELECT id, ts, role, content, tool_name, tool_payload FROM chat_messages ORDER BY id DESC LIMIT 400")
         .map_err(db::db_err)?;
     let rows = stmt
         .query_map([], |r| {
@@ -243,9 +243,18 @@ pub async fn brief_run_now(app: tauri::AppHandle, state: State<'_, AppState>, id
             .find(|b| b.id == id)
             .ok_or_else(|| AppError::Other("brief not found".into()))?
     };
+    if !brief.enabled {
+        return Err(AppError::Other("this brief is paused — enable it first".into()));
+    }
+    // share the tick's mutual exclusion so a manual run can't overlap the
+    // scheduled run of the same brief (double grabs, interleaved reports)
+    if state.brief_tick_busy.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return Err(AppError::Other("a brief run is already in progress — try again in a moment".into()));
+    }
     tauri::async_runtime::spawn(async move {
         let state = tauri::Manager::state::<AppState>(&app);
         let result = briefs::run_brief(&app, &brief).await;
+        state.brief_tick_busy.store(false, std::sync::atomic::Ordering::SeqCst);
         let conn = state.db.lock().await;
         match result {
             Ok(report) => {

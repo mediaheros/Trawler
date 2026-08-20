@@ -40,8 +40,10 @@ impl Default for HuntPlan {
 }
 
 fn norm_token(s: &str) -> String {
+    // separators become SPACES, never nothing: scene names are dot-separated,
+    // so deleting dots glued "UFC.319.Main.Card" into one unmatchable run
     s.chars()
-        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
         .collect::<String>()
         .to_lowercase()
         .split_whitespace()
@@ -209,6 +211,13 @@ mod tests {
     fn plan_gates_correctly() {
         let p = plan();
         assert!(p.allows("UFC.319.Main.Card.1080p.WEB.h264-VERUM", 4_000_000_000, Some(50)).is_ok());
+        // dot-separated multi-word include now matches (regression: it didn't)
+        {
+            let mut mw = plan();
+            mw.include = vec!["main card".into()];
+            assert!(mw.allows("UFC.319.Main.Card.1080p.WEB", 4_000_000_000, Some(50)).is_ok());
+            assert!(mw.allows("UFC.319.Prelims.1080p.WEB", 4_000_000_000, Some(50)).is_err());
+        }
         // missing required term
         assert!(p.allows("Bellator.300.1080p.WEB", 4_000_000_000, Some(50)).is_err());
         // excluded term
@@ -236,7 +245,7 @@ mod tests {
         }
         .sanitize();
         assert_eq!(p.queries.len(), 6);
-        assert_eq!(p.include, vec!["scriptufcscript"]); // tags neutralized to plain tokens
+        assert_eq!(p.include, vec!["script ufc script"]); // tags → spaces, injection neutralized
         assert_eq!(p.resolutions, vec!["1080p"]);
         assert_eq!(p.max_size_gb, 0.0);
         assert_eq!(p.min_seeders, 1000);

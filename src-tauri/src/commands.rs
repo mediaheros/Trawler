@@ -170,20 +170,54 @@ pub(crate) fn score(r: &ProwlarrRelease, p: &ParsedRelease) -> f64 {
     if p.proper {
         s += 3.0;
     }
+    // Swarm health matters, but it must not outrank quality: a heavily-seeded
+    // CAM used to beat every real release. Logarithmic only — the difference
+    // between 5 and 50 seeders is meaningful, 400 vs 900 is not.
     let seeders = r.seeders.unwrap_or(0).max(0) as f64;
-    s += (seeders.min(500.0)) * 0.3 + (seeders.ln_1p() * 2.0);
+    s += seeders.ln_1p() * 5.0; // ~0-35 across realistic swarm sizes
+    if seeders < 3.0 {
+        s -= 12.0; // barely-alive swarms are a real cost to the user
+    }
     // Suspiciously tiny "movies" are almost always fakes.
     if r.size > 0 && r.size < 80_000_000 {
-        s -= 25.0;
+        s -= 60.0;
     }
     s
+}
+
+/// Fold common accented Latin letters to ASCII so "Kızılcık"/"Shōgun" match
+/// the unaccented spellings release groups actually use.
+pub(crate) fn fold_diacritic(c: char) -> Option<&'static str> {
+    Some(match c {
+        'á' | 'à' | 'â' | 'ä' | 'ã' | 'å' | 'ā' | 'ă' | 'ą' => "a",
+        'ç' | 'ć' | 'č' => "c",
+        'é' | 'è' | 'ê' | 'ë' | 'ē' | 'ė' | 'ę' | 'ě' => "e",
+        'í' | 'ì' | 'î' | 'ï' | 'ī' | 'į' | 'ı' => "i",
+        'ñ' | 'ń' | 'ň' => "n",
+        'ó' | 'ò' | 'ô' | 'ö' | 'õ' | 'ø' | 'ō' | 'ő' => "o",
+        'ś' | 'š' | 'ş' => "s",
+        'ú' | 'ù' | 'û' | 'ü' | 'ū' | 'ů' | 'ű' => "u",
+        'ý' | 'ÿ' => "y",
+        'ž' | 'ź' | 'ż' => "z",
+        'ğ' => "g",
+        'ł' => "l",
+        'ß' => "ss",
+        'æ' => "ae",
+        'œ' => "oe",
+        'þ' => "th",
+        'ð' => "d",
+        _ => return None,
+    })
 }
 
 pub(crate) fn normalize(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut last_space = true;
     for c in s.chars() {
-        if c.is_alphanumeric() {
+        if let Some(folded) = fold_diacritic(c.to_lowercase().next().unwrap_or(c)) {
+            out.push_str(folded);
+            last_space = false;
+        } else if c.is_alphanumeric() {
             out.extend(c.to_lowercase());
             last_space = false;
         } else if !last_space {
@@ -214,8 +248,12 @@ fn dedupe_key(r: &ProwlarrRelease) -> String {
         .title
         .to_lowercase()
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
+        .filter(|c| c.is_alphanumeric())
         .collect();
+    if norm.len() < 4 {
+        // too little signal to fold on — treat the release as unique
+        return format!("guid:{}", r.guid.as_deref().unwrap_or(&r.title));
+    }
     format!("title:{norm}")
 }
 
@@ -661,7 +699,7 @@ pub async fn preview_show_grabs(
             .find(|s| s.tvmaze_id == tvmaze_id)
             .ok_or_else(|| AppError::Other("show not followed".into()))?
     };
-    crate::scheduler::plan_for_show(state.inner(), &show, true).await
+    Ok(crate::scheduler::plan_for_show(state.inner(), &show, true).await?.plans)
 }
 
 // ---------- indexer manager ----------

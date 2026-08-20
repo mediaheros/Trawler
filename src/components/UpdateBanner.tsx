@@ -19,6 +19,13 @@ export default function UpdateBanner() {
   const [phase, setPhase] = useState<Phase>("idle");
   const [pct, setPct] = useState<number | null>(null);
 
+  // a re-check replaces the update object (and frees the old one's bytes) —
+  // phase must not survive that or "Install & restart" acts on a dead handle
+  useEffect(() => {
+    setPhase("idle");
+    setPct(null);
+  }, [update]);
+
   useEffect(() => {
     if (!inTauri) return;
     // no once-guard: the clearTimeout cleanup keeps StrictMode double-mount safe

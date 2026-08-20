@@ -46,7 +46,9 @@ pub struct ToolCall {
 }
 
 fn default_call_id() -> String {
-    "call_0".into()
+    // sentinel; chat() assigns a unique per-index id after parsing, because
+    // two id-less parallel calls colliding on one id corrupts the tool loop
+    String::new()
 }
 fn default_call_type() -> String {
     "function".into()
@@ -113,12 +115,22 @@ impl LlmClient {
             .json()
             .await
             .map_err(|e| AppError::Other(format!("agent model returned malformed response: {e}")))?;
-        parsed
+        let mut msg = parsed
             .choices
             .into_iter()
             .next()
             .map(|c| c.message)
-            .ok_or_else(|| AppError::Other("agent model returned no choices".into()))
+            .ok_or_else(|| AppError::Other("agent model returned no choices".into()))?;
+        // Ollama's shim sometimes omits tool-call ids; give each a unique one
+        // so parallel calls can't collide when results are matched back
+        if let Some(calls) = msg.tool_calls.as_mut() {
+            for (i, call) in calls.iter_mut().enumerate() {
+                if call.id.is_empty() {
+                    call.id = format!("call_{i}");
+                }
+            }
+        }
+        Ok(msg)
     }
 
     /// List models from Ollama's native API (richer than /v1/models).

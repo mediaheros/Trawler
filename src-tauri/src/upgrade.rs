@@ -120,6 +120,17 @@ fn already_have(conn: &rusqlite::Connection, ck: &str) -> (i32, i64) {
 async fn run_pass(app: &tauri::AppHandle) -> crate::error::Result<usize> {
     let state_guard = app.state::<AppState>();
     let state: &AppState = state_guard.inner();
+    // a manual scan and the weekly pass must not run at once
+    if state.scout_busy.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return Ok(0);
+    }
+    struct Guard<'a>(&'a std::sync::atomic::AtomicBool);
+    impl Drop for Guard<'_> {
+        fn drop(&mut self) {
+            self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let _guard = Guard(&state.scout_busy);
     let cfg = state.config.read().await.clone();
     let window_secs = i64::from(cfg.upgrade_window_days.clamp(1, 365)) * 86_400;
 
@@ -214,7 +225,29 @@ async fn run_pass(app: &tauri::AppHandle) -> crate::error::Result<usize> {
         let ck_ep = content_key_for_episode(&c.grabbed_title, c.season, c.number);
         let orig_size = {
             let conn = state.db.lock().await;
-            already_have(&conn, &ck_ep).1
+            let per_ep = already_have(&conn, &ck_ep).1;
+            if per_ep > 0 {
+                per_ep
+            } else {
+                // the grab may have been a season pack under the pack key —
+                // amortize its size over the season for a per-episode baseline
+                let ck_src = crate::briefs::content_key(&c.grabbed_title);
+                let pack = already_have(&conn, &ck_src).1;
+                if pack > 0 && ck_src.ends_with("pack") {
+                    let eps: i64 = conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM episodes e
+                             JOIN shows s ON s.tvmaze_id = e.show_id
+                             WHERE s.name = ?1 AND e.season = ?2",
+                            rusqlite::params![c.show_name, c.season],
+                            |r| r.get::<_, i64>(0),
+                        )
+                        .unwrap_or(0);
+                    pack / eps.max(1)
+                } else {
+                    pack
+                }
+            }
         };
         let size_cap: i64 = if orig_size > 0 {
             (orig_size.saturating_mul(4)).max(3_000_000_000)

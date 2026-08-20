@@ -175,12 +175,22 @@ impl<'a> ProwlarrClient<'a> {
 
     /// Fetch .torrent bytes through Prowlarr's proxy (keeps passkeys server-side).
     pub async fn fetch_torrent(&self, download_url: &str) -> Result<(Vec<u8>, Option<String>)> {
-        let resp = self
-            .http
-            .get(download_url)
-            .header("X-Api-Key", &self.api_key)
-            .send()
-            .await?;
+        // the download_url comes from indexer data — only hand Prowlarr's API
+        // key to Prowlarr itself, never to an arbitrary host it points at
+        let same_host = url::Url::parse(download_url)
+            .ok()
+            .zip(url::Url::parse(&self.base).ok())
+            .map(|(u, b)| u.host_str() == b.host_str() && u.port_or_known_default() == b.port_or_known_default())
+            .unwrap_or(false);
+        // a magnet in the download link is a redirect target — capture it
+        if download_url.starts_with("magnet:") {
+            return Ok((Vec::new(), Some(download_url.to_string())));
+        }
+        let mut req = self.http.get(download_url);
+        if same_host {
+            req = req.header("X-Api-Key", &self.api_key);
+        }
+        let resp = req.send().await?;
         let resp = Self::check(resp).await?;
         // A "torrent" download link can still bounce to a magnet redirect.
         let final_url = resp.url().to_string();

@@ -195,6 +195,10 @@ export const useStore = create<Store>((set, get) => ({
         searchError: null,
         showHidden: false,
         episodeLink: null,
+        filters: { resolution: null, codec: null, source: null },
+        grabState: {},
+        sort: "score",
+        sortThen: null,
       });
     }
   },
@@ -204,7 +208,10 @@ export const useStore = create<Store>((set, get) => ({
   setSort: (sort) =>
     set((st) => ({
       sort,
-      sortThen: sort === "score" || st.sortThen === sort ? null : st.sortThen,
+      // picking the current secondary as the new primary SWAPS them — the
+      // user's crossed intent survives instead of being silently dropped
+      sortThen:
+        sort === "score" ? null : st.sortThen === sort ? (st.sort === "score" ? null : st.sort) : st.sortThen,
     })),
   setSortThen: (sortThen) => set({ sortThen }),
   searching: false,
@@ -217,7 +224,16 @@ export const useStore = create<Store>((set, get) => ({
     const { query, kind } = get();
     if (!query.trim()) return;
     const seq = ++searchSeq;
-    set({ searching: true, hasSearched: true, searchError: null, showHidden: false });
+    set({
+      searching: true,
+      hasSearched: true,
+      searchError: null,
+      showHidden: false,
+      // a chip armed for the last search silently emptying THIS one is the
+      // worst kind of dead end; grab state belongs to a result set, not a session
+      filters: { resolution: null, codec: null, source: null },
+      grabState: {},
+    });
     try {
       const kindParam = kind === "all" ? "all" : kind;
       const results = await api.search(query.trim(), kindParam);
@@ -343,16 +359,24 @@ export const useStore = create<Store>((set, get) => ({
     if (!text.trim() || get().agentBusy) return;
     set({ agentBusy: true, liveSteps: [], agentThinking: true });
     // optimistic: show the user's message instantly
+    const optimisticId = Date.now();
     set((s) => ({
       chat: [
         ...s.chat,
-        { id: Date.now(), ts: Date.now() / 1000, role: "user", content: text, toolName: null, toolPayload: null },
+        { id: optimisticId, ts: optimisticId / 1000, role: "user", content: text, toolName: null, toolPayload: null },
       ],
     }));
     try {
       await api.agentSend(text);
     } catch (e) {
-      set({ agentBusy: false, agentThinking: false });
+      // roll the phantom message back so the transcript matches what the
+      // backend actually stored (a rejected send stored nothing)
+      set((s) => ({
+        chat: s.chat.filter((c) => c.id !== optimisticId),
+        liveSteps: [],
+        agentBusy: false,
+        agentThinking: false,
+      }));
       get().toast(String(e), "bad");
     }
   },
@@ -371,6 +395,9 @@ export const useStore = create<Store>((set, get) => ({
     agentEventsInitialized = true;
     let stepSeq = 1;
     onAgentStep((s: AgentStep) => {
+      // briefs and the medic emit the same event stream under their own run
+      // ids — those must never touch the chat transcript or the busy flag
+      if (!s.runId || !s.runId.startsWith("chat-")) return;
       switch (s.kind) {
         case "thinking":
           set({ agentThinking: true });
@@ -451,7 +478,12 @@ export const useStore = create<Store>((set, get) => ({
   pendingUpdate: null,
   setPendingUpdate: (u) => {
     const old = get().pendingUpdate;
-    // free the Rust-side resource of a replaced update object
+    if (old && u && old !== u && old.version === u.version) {
+      // same version re-checked: keep the object the banner may already have
+      // downloaded, and free the fresh duplicate instead
+      void u.close();
+      return;
+    }
     if (old && old !== u) void old.close();
     set({ pendingUpdate: u });
   },

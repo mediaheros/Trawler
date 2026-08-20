@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Ban,
   ChevronDown,
@@ -41,20 +41,32 @@ export default function ShowDetail({ show, onClose }: { show: ShowRow; onClose: 
     }
   };
 
+  // only the newest fetch may land — a slow response must not clobber
+  // optimistic per-episode edits made after a newer one
+  const loadSeq = useRef(0);
   const load = useCallback(async () => {
+    const mine = ++loadSeq.current;
     try {
-      setEpisodes(await api.getShowEpisodes(show.tvmazeId));
+      const eps = await api.getShowEpisodes(show.tvmazeId);
+      if (mine === loadSeq.current) setEpisodes(eps);
     } catch (e) {
-      toast(String(e), "bad");
+      if (mine === loadSeq.current) toast(String(e), "bad");
     }
   }, [show.tvmazeId, toast]);
 
   useEffect(() => {
     void load();
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+  }, [load]);
+
+  // onClose is an inline closure recreated on every parent render — keep it
+  // in a ref so the listener isn't torn down and rebuilt each store write
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onCloseRef.current();
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [load, onClose]);
+  }, []);
 
   const seasons = useMemo(() => {
     const by = new Map<number, EpisodeRow[]>();
@@ -98,13 +110,32 @@ export default function ShowDetail({ show, onClose }: { show: ShowRow; onClose: 
     }
   };
 
-  const setSeasonState = async (eps: EpisodeRow[], state: EpisodeState) => {
-    for (const e of eps) {
-      if (e.state === "upcoming" || e.state === state) continue;
-      await api.setEpisodeState(e.tvmazeEpId, state);
+  const [seasonBusy, setSeasonBusy] = useState<string | null>(null);
+  const setSeasonState = async (season: number, eps: EpisodeRow[], state: EpisodeState) => {
+    const key = `${season}:${state}`;
+    if (seasonBusy) return;
+    setSeasonBusy(key);
+    // never rewrite a downloaded episode back to wanted — that would silently
+    // queue a re-download of something the user already has
+    const targets = eps.filter(
+      (e) => e.state !== "upcoming" && e.state !== state && !(state === "wanted" && e.state === "downloaded"),
+    );
+    let failed = 0;
+    for (const e of targets) {
+      try {
+        await api.setEpisodeState(e.tvmazeEpId, state);
+      } catch {
+        failed++;
+      }
     }
     await load();
     void loadShows();
+    setSeasonBusy(null);
+    if (failed > 0) {
+      toast(`${failed} of ${targets.length} episodes couldn't be updated`, "bad");
+    } else if (targets.length === 0) {
+      toast("Nothing to change in that season", "info");
+    }
   };
 
   return (
@@ -262,8 +293,16 @@ export default function ShowDetail({ show, onClose }: { show: ShowRow; onClose: 
                     </span>
                   </button>
                   <span className="flex shrink-0 gap-1">
-                    <SeasonAction label="Want all" onClick={() => setSeasonState(eps, "wanted")} />
-                    <SeasonAction label="Ignore all" onClick={() => setSeasonState(eps, "ignored")} />
+                    <SeasonAction
+                      label="Want all"
+                      busy={seasonBusy === `${num}:wanted`}
+                      onClick={() => void setSeasonState(num, eps, "wanted")}
+                    />
+                    <SeasonAction
+                      label="Ignore all"
+                      busy={seasonBusy === `${num}:ignored`}
+                      onClick={() => void setSeasonState(num, eps, "ignored")}
+                    />
                   </span>
                 </div>
                 {open && (
@@ -346,14 +385,23 @@ function QualitySelect({ show }: { show: ShowRow }) {
   );
 }
 
-function SeasonAction({ label, onClick }: { label: string; onClick: () => void }) {
+function SeasonAction({
+  label,
+  onClick,
+  busy,
+}: {
+  label: string;
+  onClick: () => void;
+  busy?: boolean;
+}) {
   return (
     <button
       type="button"
       onClick={onClick}
-      className="cursor-pointer rounded-md bg-bg3 px-1.5 py-0.5 text-[10.5px] text-dim transition-colors hover:bg-bg4 hover:text-ink active:scale-[0.97]"
+      disabled={busy}
+      className="cursor-pointer rounded-md bg-bg3 px-1.5 py-0.5 text-[10.5px] text-dim transition-colors hover:bg-bg4 hover:text-ink active:scale-[0.97] disabled:pointer-events-none disabled:opacity-50"
     >
-      {label}
+      {busy ? "…" : label}
     </button>
   );
 }
