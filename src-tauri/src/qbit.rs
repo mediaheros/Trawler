@@ -146,6 +146,15 @@ impl<'a> QbitClient<'a> {
         unreachable!()
     }
 
+    /// Raw maindata (server_state carries connection/DHT health).
+    pub async fn sync_maindata(&self) -> Result<serde_json::Value> {
+        Ok(self
+            .get_authed("/api/v2/sync/maindata", &[("rid", "0".into())])
+            .await?
+            .json()
+            .await?)
+    }
+
     pub async fn version(&self) -> Result<String> {
         Ok(self.get_authed("/api/v2/app/version", &[]).await?.text().await?)
     }

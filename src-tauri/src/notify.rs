@@ -86,7 +86,7 @@ pub fn dispatch(app: &tauri::AppHandle, kind: Kind, title: String, body: String)
             return;
         }
         if !rate_ok() {
-            eprintln!("[trawler] notification suppressed (over {MAX_PER_HOUR}/hour): {title}");
+            crate::applog::info("notify",format!("notification suppressed (over {MAX_PER_HOUR}/hour): {title}"));
             return;
         }
         let http = {
@@ -95,7 +95,7 @@ pub fn dispatch(app: &tauri::AppHandle, kind: Kind, title: String, body: String)
         };
         if discord {
             if let Err(e) = send_discord(&http, &cfg.discord_webhook, kind, &title, &body).await {
-                eprintln!("[trawler] discord notification failed: {e}");
+                crate::applog::warn("notify",format!("discord notification failed: {e}"));
             }
         }
         if telegram {
@@ -109,7 +109,7 @@ pub fn dispatch(app: &tauri::AppHandle, kind: Kind, title: String, body: String)
             )
             .await
             {
-                eprintln!("[trawler] telegram notification failed: {e}");
+                crate::applog::warn("notify",format!("telegram notification failed: {e}"));
             }
         }
     });

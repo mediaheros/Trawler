@@ -428,8 +428,9 @@ pub async fn sweep(app: &AppHandle) -> Result<SweepStats> {
     }
 
     if episode_grabs + brief_grabs + brief_proposals > 0 {
-        eprintln!(
-            "[trawler] rss sweep: {releases_seen} releases → {episode_grabs} episode grabs, {brief_grabs} brief grabs, {brief_proposals} proposals"
+        crate::applog::info(
+            "rss",
+            format!("rss sweep: {releases_seen} releases → {episode_grabs} episode grabs, {brief_grabs} brief grabs, {brief_proposals} proposals"),
         );
     }
     Ok(SweepStats { releases_seen, episode_grabs, brief_grabs, brief_proposals, skipped: false })
@@ -445,7 +446,7 @@ pub async fn rss_loop(app: AppHandle) {
         };
         if enabled {
             if let Err(e) = sweep(&app).await {
-                eprintln!("[trawler] rss sweep failed: {e}");
+                crate::applog::warn("rss",format!("rss sweep failed: {e}"));
             }
         }
         tokio::time::sleep(std::time::Duration::from_secs(minutes * 60)).await;

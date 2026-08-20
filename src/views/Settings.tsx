@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import {
   AppWindow,
+  ScrollText,
   Bell,
   BellRing,
   CheckCircle2,
@@ -23,8 +24,9 @@ import { isMac } from "../lib/platform";
 import { useStore } from "../store";
 import { Button, Chip, Field, NumInput, TextInput, cx } from "../components/ui";
 import IndexerManager from "../components/IndexerManager";
+import LogConsole from "../components/LogConsole";
 
-type TabId = "connections" | "indexers" | "grabbing" | "following" | "notifications" | "agent" | "app";
+type TabId = "connections" | "indexers" | "grabbing" | "following" | "notifications" | "agent" | "app" | "logs";
 
 const TABS: Array<{ id: TabId; label: string; icon: typeof Plug }> = [
   { id: "connections", label: "Connections", icon: Plug },
@@ -34,6 +36,7 @@ const TABS: Array<{ id: TabId; label: string; icon: typeof Plug }> = [
   { id: "notifications", label: "Notifications", icon: Bell },
   { id: "agent", label: "Agent", icon: Sparkles },
   { id: "app", label: "App", icon: AppWindow },
+  { id: "logs", label: "Logs", icon: ScrollText },
 ];
 
 /** Mirror of the backend's config::default_presets() — used only to restore
@@ -168,6 +171,12 @@ export default function SettingsView() {
           {test && <TestLine ok={test.qOk} text={test.q} />}
         </Card>
         </>)}
+
+        {tab === "logs" && (
+        <Card title="Log console" sub="Live view of everything the app does — your first stop when something misbehaves">
+          <LogConsole />
+        </Card>
+        )}
 
         {tab === "indexers" && (
         <Card title="Indexers" sub="What Trawler searches — managed inside your Prowlarr">
@@ -536,9 +545,11 @@ export default function SettingsView() {
       {/* pinned action bar */}
       <div className="border-t border-line bg-bg1/60 px-6 py-3">
         <div className="flex max-w-[680px] items-center gap-2.5">
-          {tab === "indexers" ? (
+          {tab === "indexers" || tab === "logs" ? (
             <span className="text-[11.5px] text-faint">
-              Indexer changes talk to Prowlarr directly and apply instantly — nothing to save here.
+              {tab === "indexers"
+                ? "Indexer changes talk to Prowlarr directly and apply instantly — nothing to save here."
+                : "The console is read-only — nothing to save."}
             </span>
           ) : (
           <Button variant="primary" disabled={!dirty} onClick={() => saveConfig(draft)}>

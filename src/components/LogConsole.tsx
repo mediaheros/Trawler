@@ -1,0 +1,122 @@
+import { useEffect, useRef, useState } from "react";
+import { ClipboardCopy, Pause, Play } from "lucide-react";
+import { api, onAppLog, type LogEntry } from "../lib/api";
+import { useStore } from "../store";
+import { Button, cx } from "./ui";
+
+const LEVELS = ["all", "info", "warn", "error"] as const;
+type LevelFilter = (typeof LEVELS)[number];
+
+/** Live diagnostic console: what the app is actually doing, copyable in one
+ *  click as a support bundle. The answer to "it's hanging". */
+export default function LogConsole() {
+  const toast = useStore((s) => s.toast);
+  const [entries, setEntries] = useState<LogEntry[]>([]);
+  const [level, setLevel] = useState<LevelFilter>("all");
+  const [paused, setPaused] = useState(false);
+  const [copying, setCopying] = useState(false);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const pinned = useRef(true);
+  const pausedRef = useRef(false);
+  pausedRef.current = paused;
+
+  useEffect(() => {
+    void api.logsRecent().then(setEntries).catch(() => {});
+    return onAppLog((e) => {
+      if (pausedRef.current) return;
+      setEntries((prev) => (prev.length >= 2000 ? [...prev.slice(1), e] : [...prev, e]));
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el && pinned.current) el.scrollTop = el.scrollHeight;
+  }, [entries]);
+
+  const visible = level === "all" ? entries : entries.filter((e) => e.level === level);
+
+  const copyBundle = async () => {
+    setCopying(true);
+    try {
+      const bundle = await api.logsSupportBundle();
+      await navigator.clipboard.writeText(bundle);
+      toast("Support bundle copied — paste it anywhere", "ok");
+    } catch (e) {
+      toast(String(e), "bad");
+    } finally {
+      setCopying(false);
+    }
+  };
+
+  const fmtTime = (ts: number) => {
+    const d = new Date(ts * 1000);
+    return d.toTimeString().slice(0, 8);
+  };
+
+  return (
+    <div>
+      <div className="mb-2 flex items-center gap-1.5">
+        {LEVELS.map((l) => (
+          <button
+            key={l}
+            type="button"
+            onClick={() => setLevel(l)}
+            className={cx(
+              "cursor-pointer rounded-md px-2 py-0.5 text-[11px] transition-colors",
+              level === l ? "bg-accent-soft text-accent" : "bg-bg2 text-faint hover:bg-bg3 hover:text-dim",
+            )}
+          >
+            {l}
+          </button>
+        ))}
+        <button
+          type="button"
+          onClick={() => setPaused(!paused)}
+          className="ml-1 cursor-pointer rounded-md bg-bg2 p-1 text-faint transition-colors hover:bg-bg3 hover:text-dim"
+          title={paused ? "Resume live tail" : "Pause live tail"}
+        >
+          {paused ? <Play size={11} /> : <Pause size={11} />}
+        </button>
+        <div className="ml-auto">
+          <Button onClick={() => void copyBundle()} busy={copying} className="px-2.5 py-1 text-[11.5px]">
+            <ClipboardCopy size={12} /> Copy for support
+          </Button>
+        </div>
+      </div>
+      <div
+        ref={scrollRef}
+        onScroll={(e) => {
+          const el = e.currentTarget;
+          pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+        }}
+        className="h-[420px] overflow-y-auto rounded-(--radius-btn) border border-line bg-bg0/60 p-2 font-mono text-[11px] leading-[1.7]"
+      >
+        {visible.length === 0 ? (
+          <div className="px-1 py-2 text-faint">Nothing logged yet at this level.</div>
+        ) : (
+          visible.map((e, i) => (
+            <div key={`${e.ts}-${i}`} className="flex gap-2 whitespace-pre-wrap break-all px-1">
+              <span className="shrink-0 text-faint">{fmtTime(e.ts)}</span>
+              <span
+                className={cx(
+                  "w-[68px] shrink-0 truncate",
+                  e.level === "error" ? "text-bad" : e.level === "warn" ? "text-warn" : "text-faint",
+                )}
+              >
+                {e.area}
+              </span>
+              <span className={cx(e.level === "error" ? "text-bad" : e.level === "warn" ? "text-warn/90" : "text-dim")}>
+                {e.message}
+              </span>
+            </div>
+          ))
+        )}
+      </div>
+      <p className="mt-1.5 text-[10.5px] text-faint">
+        Everything Trawler does — searches, grabs, scheduler decisions, setup steps. Keys and passkeys are scrubbed
+        before logging. "Copy for support" adds app + qBittorrent health context.
+      </p>
+    </div>
+  );
+}

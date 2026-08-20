@@ -329,7 +329,7 @@ pub async fn perform_search(
                     releases,
                 ),
                 Ok(Err(e)) => {
-                    eprintln!("[trawler] indexer {} failed: {e}", idx.name);
+                    crate::applog::warn("app",format!("indexer {} failed: {e}", idx.name));
                     (
                         IndexerOutcome {
                             id: idx.id,
@@ -375,7 +375,7 @@ pub async fn perform_search(
     }
 
     let total = raw.len();
-    eprintln!("[trawler] search {query:?} kind={kind} -> {total} raw results");
+    crate::applog::info("app",format!("search {query:?} kind={kind} -> {total} raw results"));
 
     // Fold duplicates, keeping the copy with the most seeders as the face of the group.
     let mut groups: HashMap<String, EnrichedRelease> = HashMap::new();
@@ -435,6 +435,23 @@ pub async fn perform_search(
         order.into_iter().filter_map(|k| groups.remove(&k)).collect();
     releases.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
+    {
+        let failed: Vec<String> = indexer_outcomes
+            .iter()
+            .filter(|o| !o.ok)
+            .map(|o| format!("{}{}", o.name, if o.timed_out { " (timeout)" } else { " (error)" }))
+            .collect();
+        crate::applog::info(
+            "prowlarr",
+            format!(
+                "search \"{}\" -> {} releases from {} indexers{}",
+                query,
+                releases.len(),
+                indexer_outcomes.iter().filter(|o| o.ok).count(),
+                if failed.is_empty() { String::new() } else { format!(" · failed: {}", failed.join(", ")) }
+            ),
+        );
+    }
     Ok(SearchResponse {
         releases,
         total_before_dedupe: total,
@@ -901,6 +918,50 @@ pub async fn remove_indexer(state: State<'_, AppState>, id: i32) -> Result<()> {
     prowlarr(&state.http, &cfg)?.delete_indexer(id).await
 }
 
+// ---------- log console ----------
+
+#[tauri::command]
+pub async fn logs_recent() -> Result<Vec<crate::applog::LogEntry>> {
+    Ok(crate::applog::recent())
+}
+
+/// One paste = a full diagnosis: app + OS context, qBittorrent's own view of
+/// the network, and the buffered log — plus the tail of qBt's log file, where
+/// today's port-reservation smoking gun lived.
+#[tauri::command]
+pub async fn logs_support_bundle(state: State<'_, AppState>) -> Result<String> {
+    let cfg = state.config.read().await.clone();
+    let mut out = String::new();
+    out.push_str(&format!(
+        "Trawler {} · {} {}\n",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    ));
+    let q = qbit(&state.http, &cfg);
+    match q.sync_maindata().await {
+        Ok(v) => {
+            let s = v.get("server_state").cloned().unwrap_or_default();
+            out.push_str(&format!(
+                "qBittorrent: connection={} dht_nodes={} dl_speed={}\n",
+                s.get("connection_status").and_then(|x| x.as_str()).unwrap_or("?"),
+                s.get("dht_nodes").and_then(|x| x.as_i64()).unwrap_or(-1),
+                s.get("dl_info_speed").and_then(|x| x.as_i64()).unwrap_or(-1),
+            ));
+        }
+        Err(e) => out.push_str(&format!("qBittorrent: unreachable ({e})\n")),
+    }
+    out.push_str("\n--- Trawler log ---\n");
+    for e in crate::applog::recent() {
+        out.push_str(&format!("{} [{}] {}: {}\n", e.ts, e.level, e.area, e.message));
+    }
+    if let Some(tail) = crate::setup::qbt_log_tail(60) {
+        out.push_str("\n--- qBittorrent log (last 60 lines) ---\n");
+        out.push_str(&tail);
+    }
+    Ok(out)
+}
+
 // ---------- autostart ----------
 
 #[tauri::command]
@@ -930,8 +991,8 @@ pub async fn notify_test(state: State<'_, AppState>) -> Result<crate::notify::Te
 pub async fn upgrade_scan_now(app: tauri::AppHandle) -> Result<()> {
     tauri::async_runtime::spawn(async move {
         match crate::upgrade::scan_now(&app).await {
-            Ok(n) => eprintln!("[trawler] manual upgrade scan done: {n} proposal(s)"),
-            Err(e) => eprintln!("[trawler] manual upgrade scan failed: {e}"),
+            Ok(n) => crate::applog::info("app",format!("manual upgrade scan done: {n} proposal(s)")),
+            Err(e) => crate::applog::warn("app",format!("manual upgrade scan failed: {e}")),
         }
     });
     Ok(())
@@ -942,8 +1003,8 @@ pub async fn upgrade_scan_now(app: tauri::AppHandle) -> Result<()> {
 pub async fn run_scheduler_now(app: tauri::AppHandle) -> Result<()> {
     tauri::async_runtime::spawn(async move {
         match crate::scheduler::run_cycle(&app).await {
-            Ok(n) => eprintln!("[trawler] manual cycle done: {n} grabs"),
-            Err(e) => eprintln!("[trawler] manual cycle failed: {e}"),
+            Ok(n) => crate::applog::info("app",format!("manual cycle done: {n} grabs")),
+            Err(e) => crate::applog::warn("app",format!("manual cycle failed: {e}")),
         }
     });
     Ok(())

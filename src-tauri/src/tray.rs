@@ -35,8 +35,8 @@ pub fn init(app: &App) -> tauri::Result<()> {
                 let handle = app.clone();
                 tauri::async_runtime::spawn(async move {
                     match crate::scheduler::run_cycle(&handle).await {
-                        Ok(n) => eprintln!("[trawler] tray-triggered cycle: {n} grabs"),
-                        Err(e) => eprintln!("[trawler] tray-triggered cycle failed: {e}"),
+                        Ok(n) => crate::applog::info("app",format!("tray-triggered cycle: {n} grabs")),
+                        Err(e) => crate::applog::warn("app",format!("tray-triggered cycle failed: {e}")),
                     }
                 });
             }

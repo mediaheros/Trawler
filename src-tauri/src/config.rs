@@ -173,9 +173,12 @@ pub fn load() -> Config {
             // defaults — keep it so the user's keys can be recovered
             let backup = path.with_extension(format!("corrupt-{}.json", crate::db::now()));
             let _ = std::fs::copy(&path, &backup);
-            eprintln!(
-                "[trawler] config.json could not be read ({e}); kept a copy at {} and started with defaults",
-                backup.display()
+            crate::applog::error(
+                "app",
+                format!(
+                    "config.json could not be read ({e}); kept a copy at {} and started with defaults",
+                    backup.display()
+                ),
             );
             Config::default()
         }

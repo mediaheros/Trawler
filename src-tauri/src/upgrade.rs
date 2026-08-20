@@ -71,11 +71,11 @@ pub async fn scout_loop(app: tauri::AppHandle) {
                     let conn = state.db.lock().await;
                     db::meta_set(&conn, META_KEY, &db::now().to_string());
                     if n > 0 {
-                        eprintln!("[trawler] upgrade scout: {n} proposal(s) filed");
+                        crate::applog::info("scout",format!("upgrade scout: {n} proposal(s) filed"));
                     }
                 }
                 // meta NOT stamped: the 6h tick retries instead of burning a week
-                Err(e) => eprintln!("[trawler] upgrade scout pass failed: {e}"),
+                Err(e) => crate::applog::warn("scout",format!("upgrade scout pass failed: {e}")),
             }
         }
         tokio::time::sleep(std::time::Duration::from_secs(6 * 3600)).await;

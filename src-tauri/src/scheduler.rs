@@ -256,7 +256,7 @@ async fn execute_plan(app: &tauri::AppHandle, state: &AppState, plan: &PlannedGr
                 plan.title.chars().take(70).collect::<String>(),
             );
             db::log_activity(&conn, "grab", Some(plan.show_id), &msg);
-            eprintln!("[trawler] {msg}");
+            crate::applog::info("scheduler",format!("{msg}"));
             if cfg.notify_on_grab {
                 use tauri_plugin_notification::NotificationExt;
                 let _ = app.notification().builder().title("Trawler grabbed").body(&what).show();
@@ -277,7 +277,7 @@ async fn execute_plan(app: &tauri::AppHandle, state: &AppState, plan: &PlannedGr
         Err(e) => {
             let msg = format!("Failed to grab {} S{:02}: {e}", plan.show_name, plan.season);
             db::log_activity(&conn, "error", Some(plan.show_id), &msg);
-            eprintln!("[trawler] {msg}");
+            crate::applog::info("scheduler",format!("{msg}"));
             false
         }
     }
@@ -465,7 +465,7 @@ async fn medic_pass(app: &tauri::AppHandle, state: &AppState, dead: Vec<DeadGrab
                     ctx.grabbed_titles.first().cloned().unwrap_or_default()
                 );
                 db::log_activity(&conn, "agent", None, &msg);
-                eprintln!("[trawler] {msg}");
+                crate::applog::info("scheduler",format!("{msg}"));
                 if cfg.notify_on_grab {
                     use tauri_plugin_notification::NotificationExt;
                     let _ = app
@@ -508,8 +508,8 @@ async fn medic_pass(app: &tauri::AppHandle, state: &AppState, dead: Vec<DeadGrab
                     ),
                 );
             }
-            Ok(Err(e)) => eprintln!("[trawler] medic run failed: {e}"),
-            Err(_) => eprintln!("[trawler] medic run timed out"),
+            Ok(Err(e)) => crate::applog::warn("scheduler",format!("medic run failed: {e}")),
+            Err(_) => crate::applog::warn("scheduler",format!("medic run timed out")),
         }
     }
 }
@@ -544,6 +544,44 @@ async fn completion_pass(app: &tauri::AppHandle, state: &AppState) -> Vec<DeadGr
         Ok(t) => t,
         Err(_) => return vec![],
     };
+    // swarm doctor: a session that reports "disconnected" has no working
+    // sockets at all — on Windows the classic cause is the listen port
+    // landing in a reserved range (WSAEACCES on every bind). Detect it and
+    // fix it by moving the port, instead of letting every torrent sit at
+    // "0 seeds" until someone SSHes in with a debugger.
+    if let Ok(md) = q.sync_maindata().await {
+        let status = md
+            .pointer("/server_state/connection_status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if status == "disconnected" {
+            let new_port = crate::setup::pick_safe_listen_port();
+            let body = format!("{{\"listen_port\": {new_port}}}");
+            let moved = state
+                .http
+                .post(format!("{}/api/v2/app/setPreferences", cfg.qbit_url.trim_end_matches('/')))
+                .form(&[("json", body)])
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false);
+            if moved {
+                crate::applog::warn(
+                    "qbit",
+                    format!("session was disconnected (no working sockets) — moved the listen port to {new_port}"),
+                );
+                let conn = state.db.lock().await;
+                db::log_activity(
+                    &conn,
+                    "system",
+                    None,
+                    &format!("qBittorrent couldn't open its network port — Trawler moved it to {new_port} and the session should recover"),
+                );
+            } else {
+                crate::applog::error("qbit", "session is disconnected and the port move failed — check Settings → Logs");
+            }
+        }
+    }
     let mut done: std::collections::HashSet<String> = torrents
         .iter()
         .filter(|t| t.progress >= 0.999)
@@ -816,18 +854,21 @@ async fn run_cycle_inner(app: &tauri::AppHandle, state: &AppState) -> Result<usi
         }
     };
     if !disk_ok {
-        eprintln!("[trawler] free disk below the floor — no grabs this cycle");
+        crate::applog::info("scheduler",format!("free disk below the floor — no grabs this cycle"));
     }
-    eprintln!(
-        "[trawler] scheduler cycle: {} show(s), {} wanted episode(s)",
-        shows.len(),
-        shows.iter().map(|s| s.wanted).sum::<i64>()
+    crate::applog::info(
+        "scheduler",
+        format!(
+            "cycle: {} show(s), {} wanted episode(s)",
+            shows.len(),
+            shows.iter().map(|s| s.wanted).sum::<i64>()
+        ),
     );
 
     for show in &shows {
         if now - show.refreshed_at > 20 * 3600 && (show.status != "Ended" || show.wanted > 0) {
             if let Err(e) = refresh_show(state, show.tvmaze_id).await {
-                eprintln!("[trawler] refresh {} failed: {e}", show.name);
+                crate::applog::warn("scheduler",format!("refresh {} failed: {e}", show.name));
             }
         }
         if show.status == "Ended" && show.wanted == 0 {
@@ -854,7 +895,7 @@ async fn run_cycle_inner(app: &tauri::AppHandle, state: &AppState) -> Result<usi
                     break;
                 }
             }
-            Err(e) => eprintln!("[trawler] planning {} failed: {e}", show.name),
+            Err(e) => crate::applog::warn("scheduler",format!("planning {} failed: {e}", show.name)),
         }
     }
 
@@ -866,9 +907,9 @@ pub async fn scheduler_loop(app: tauri::AppHandle) {
     tokio::time::sleep(std::time::Duration::from_secs(20)).await;
     loop {
         match run_cycle(&app).await {
-            Ok(n) if n > 0 => eprintln!("[trawler] scheduler cycle done: {n} grabs"),
+            Ok(n) if n > 0 => crate::applog::info("scheduler",format!("scheduler cycle done: {n} grabs")),
             Ok(_) => {}
-            Err(e) => eprintln!("[trawler] scheduler cycle error: {e}"),
+            Err(e) => crate::applog::warn("scheduler",format!("scheduler cycle error: {e}")),
         }
         let minutes = {
             let state = app.state::<AppState>();

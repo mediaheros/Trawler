@@ -13,6 +13,13 @@ use crate::error::{AppError, Result};
 use crate::AppState;
 
 fn emit(app: &AppHandle, component: &str, kind: &str, payload: Value) {
+    if let Some(msg) = payload.get("message").and_then(|m| m.as_str()) {
+        if kind == "error" {
+            crate::applog::error("setup", format!("{component}: {msg}"));
+        } else {
+            crate::applog::info("setup", format!("{component}: {msg}"));
+        }
+    }
     let _ = app.emit(
         "setup-step",
         json!({ "component": component, "kind": kind, "payload": payload }),
@@ -634,6 +641,75 @@ pub async fn install_prowlarr(app: &AppHandle) -> Result<String> {
     Ok(key)
 }
 
+/// Windows silently reserves random port ranges for Hyper-V/WSL/Docker NAT;
+/// binding inside one fails with WSAEACCES and no visible symptom beyond a
+/// permanently dead session (verified live: qBt's random port landed in a
+/// reserved block and every torrent showed 0 seeds forever).
+#[cfg(windows)]
+pub fn excluded_port_ranges() -> Vec<(u16, u16)> {
+    let mut out = vec![];
+    for proto in ["udp", "tcp"] {
+        let mut cmd = std::process::Command::new("netsh");
+        cmd.args(["interface", "ipv4", "show", "excludedportrange", &format!("protocol={proto}")]);
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000);
+        }
+        if let Ok(o) = cmd.output() {
+            for line in String::from_utf8_lossy(&o.stdout).lines() {
+                let nums: Vec<u16> = line
+                    .split_whitespace()
+                    .filter_map(|t| t.parse::<u16>().ok())
+                    .collect();
+                if nums.len() >= 2 {
+                    out.push((nums[0], nums[1]));
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(not(windows))]
+pub fn excluded_port_ranges() -> Vec<(u16, u16)> {
+    vec![]
+}
+
+/// A listen port that is actually bindable: outside every reserved range,
+/// out of the ephemeral zone, deterministic-ish per machine.
+pub fn pick_safe_listen_port() -> u16 {
+    let excluded = excluded_port_ranges();
+    let ok = |p: u16| !excluded.iter().any(|(a, b)| p >= *a && p <= *b);
+    // spread candidates across the classic BT range and below the ephemeral
+    // zone where winnat reservations cluster
+    let mut seed = [0u8; 2];
+    let _ = getrandom::getrandom(&mut seed);
+    let base = 20000 + (u16::from_le_bytes(seed) % 20000);
+    for offset in 0..2000u16 {
+        let p = 20000 + ((base - 20000 + offset * 7) % 20000);
+        if ok(p) {
+            return p;
+        }
+    }
+    28645 // the port that saved the day once already
+}
+
+/// The tail of qBittorrent's own log file — bind failures and session errors
+/// live there and nowhere else.
+pub fn qbt_log_tail(lines: usize) -> Option<String> {
+    #[cfg(windows)]
+    let path = dirs::data_local_dir()?.join("qBittorrent").join("logs").join("qbittorrent.log");
+    #[cfg(target_os = "macos")]
+    let path = dirs::home_dir()?
+        .join("Library/Application Support/qBittorrent/logs/qbittorrent.log");
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    let path = dirs::data_local_dir()?.join("qBittorrent").join("logs").join("qbittorrent.log");
+    let text = std::fs::read_to_string(path).ok()?;
+    let all: Vec<&str> = text.lines().collect();
+    let start = all.len().saturating_sub(lines);
+    Some(all[start..].join("\n"))
+}
+
 // ---------------- flaresolverr (optional) ----------------
 // FlareSolverr is strictly opt-in: the stack runs fine without it, it only
 // unlocks Cloudflare-protected indexers (1337x, EZTV, …) for users who ask.
@@ -1019,6 +1095,12 @@ pub fn ensure_qbt_ini_port(ini: &str, credentials: Option<(&str, &str)>, fresh: 
         (r"WebUI\Port".into(), port.to_string()),
         (r"WebUI\LocalHostAuth".into(), "false".into()),
     ];
+    if fresh {
+        // fresh install: pick a BitTorrent listen port that dodges Windows'
+        // reserved ranges — a random port inside one means a silently dead
+        // session and "0 seeds on everything"
+        wanted.push((r"BitTorrent\Session\Port".into(), pick_safe_listen_port().to_string()));
+    }
     // never clobber a password the user already has
     if !ini.contains(r"WebUI\Password_PBKDF2") {
         if let Some((user, blob)) = credentials {

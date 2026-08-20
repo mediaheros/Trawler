@@ -1,4 +1,5 @@
 mod agent_run;
+mod applog;
 mod agent_tools;
 mod briefs;
 mod commands;
@@ -84,6 +85,8 @@ pub fn run() {
         .manage(state)
         .setup(|app| {
             // a Trawler-managed Prowlarr should come back after reboots
+            applog::attach(app.handle());
+            applog::info("app", format!("Trawler {} starting", env!("CARGO_PKG_VERSION")));
             let boot_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 use tauri::Manager;
@@ -200,6 +203,8 @@ pub fn run() {
             commands_setup::setup_save_prowlarr_key,
             commands_setup::setup_finish,
             commands_setup::rss_sweep_now,
+            commands::logs_recent,
+            commands::logs_support_bundle,
             commands_discover::calendar_range,
             commands_discover::export_ical,
             commands_discover::discover,

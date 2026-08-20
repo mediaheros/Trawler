@@ -143,7 +143,7 @@ pub fn open() -> Result<Connection> {
     if let Err(e) = conn.execute("ALTER TABLE grab_ledger ADD COLUMN ep_ids TEXT", []) {
         let msg = e.to_string();
         if !msg.contains("duplicate column") {
-            eprintln!("[trawler] ep_ids migration failed: {msg}");
+            crate::applog::warn("app",format!("ep_ids migration failed: {msg}"));
         }
     }
     // one-shot backfill: link every healthy in-flight grab to its episodes by
@@ -273,7 +273,7 @@ pub fn set_episodes_state_by_ids(conn: &Connection, ids: &[i64], state: &str, gr
             let _ = conn.execute(&sql, rusqlite::params_from_iter(ids.iter()));
         }
         (other, _) => {
-            eprintln!("[trawler] set_episodes_state_by_ids: unsupported state {other}");
+            crate::applog::info("app",format!("set_episodes_state_by_ids: unsupported state {other}"));
         }
     }
 }

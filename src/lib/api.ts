@@ -108,6 +108,13 @@ export interface FlaresolverrStatus {
   proxied: boolean;
 }
 
+export interface LogEntry {
+  ts: number;
+  level: "info" | "warn" | "error";
+  area: string;
+  message: string;
+}
+
 export interface SetupStep {
   component: string;
   kind: "progress" | "log" | "done" | "error";
@@ -365,6 +372,19 @@ export function onAgentStep(cb: (s: AgentStep) => void): () => void {
   return () => mockStepListeners.delete(cb);
 }
 
+export function onAppLog(cb: (e: LogEntry) => void): () => void {
+  if (inTauri) {
+    const un = tauriListen<LogEntry>("app-log", (e) => cb(e.payload));
+    return () => {
+      void un.then((f) => f());
+    };
+  }
+  mockLogListeners.add(cb);
+  return () => mockLogListeners.delete(cb);
+}
+
+const mockLogListeners = new Set<(e: LogEntry) => void>();
+
 export function onSetupStep(cb: (s: SetupStep) => void): () => void {
   if (inTauri) {
     const un = tauriListen<SetupStep>("setup-step", (e) => cb(e.payload));
@@ -457,6 +477,8 @@ export const api = {
   setupConfigureQbit: () => call<void>("setup_configure_qbit"),
   setupStarterIndexers: () => call<string[]>("setup_starter_indexers"),
   flaresolverrStatus: () => call<FlaresolverrStatus>("flaresolverr_status"),
+  logsRecent: () => call<LogEntry[]>("logs_recent"),
+  logsSupportBundle: () => call<string>("logs_support_bundle"),
   setupFlaresolverr: () => call<string[]>("setup_flaresolverr"),
   disableFlaresolverr: () => call<void>("disable_flaresolverr"),
   setupSaveProwlarrKey: (key: string) => call<void>("setup_save_prowlarr_key", { key }),
@@ -927,6 +949,20 @@ async function mock(cmd: string, args?: Record<string, unknown>): Promise<unknow
       return ["YTS", "The Pirate Bay", "LimeTorrents", "Knaben"];
     case "setup_finish":
       return;
+    case "logs_recent": {
+      const now = Date.now() / 1000;
+      return [
+        { ts: now - 340, level: "info", area: "app", message: "Trawler 0.4.0 starting" },
+        { ts: now - 335, level: "info", area: "setup", message: "prowlarr: Running and connected" },
+        { ts: now - 190, level: "info", area: "prowlarr", message: 'search "ufc 319" -> 41 releases from 6 indexers · failed: TPB (timeout)' },
+        { ts: now - 186, level: "info", area: "qbit", message: "grab sent: UFC.319.Main.Card.1080p.WEB.h264-VERUM (magnet)" },
+        { ts: now - 90, level: "warn", area: "scheduler", message: "planning The Expanse failed: indexers unreachable" },
+        { ts: now - 30, level: "error", area: "qbit", message: "listen port 57643 blocked by a reserved range — moved to 28645" },
+        { ts: now - 5, level: "info", area: "rss", message: "rss sweep: 214 releases → 1 episode grab, 0 brief grabs, 0 proposals" },
+      ] as LogEntry[];
+    }
+    case "logs_support_bundle":
+      return "Trawler 0.4.0 · windows x86_64\nqBittorrent: connection=connected dht_nodes=198\n\n--- Trawler log ---\n(mock)";
     case "flaresolverr_status":
       return { installed: mockFs.done, running: mockFs.done, proxied: mockFs.done };
     case "disable_flaresolverr":
