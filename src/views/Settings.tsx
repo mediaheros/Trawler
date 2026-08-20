@@ -22,7 +22,7 @@ import { sameProfile } from "../lib/format";
 import { checkForUpdate, currentVersion } from "../lib/updater";
 import { isMac } from "../lib/platform";
 import { useStore } from "../store";
-import { Button, Chip, Field, NumInput, TextInput, cx } from "../components/ui";
+import { Button, Chip, Field, NumInput, Segmented, TextInput, cx } from "../components/ui";
 import IndexerManager from "../components/IndexerManager";
 import LogConsole from "../components/LogConsole";
 
@@ -170,6 +170,11 @@ export default function SettingsView() {
           </div>
           {test && <TestLine ok={test.qOk} text={test.q} />}
         </Card>
+
+        <BitportCard
+          backend={draft.downloadBackend}
+          onBackend={(b) => set({ downloadBackend: b })}
+        />
         </>)}
 
         {tab === "logs" && (
@@ -841,5 +846,109 @@ function TestLine({ ok, text }: { ok: boolean; text: string }) {
       {ok ? <CheckCircle2 size={13} /> : <XCircle size={13} />}
       <span className="min-w-0 truncate" title={text}>{text}</span>
     </div>
+  );
+}
+
+/** The optional cloud backend: torrenting happens on Bitport's servers, files
+ *  arrive over HTTPS. Connect once; the token lasts a decade. */
+function BitportCard({ backend, onBackend }: { backend: string; onBackend: (b: string) => void }) {
+  const toast = useStore((s) => s.toast);
+  const [status, setStatus] = useState<import("../lib/api").BitportStatus | null>(null);
+  const [code, setCode] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    void api.bitportStatus().then(setStatus).catch(() => {});
+  }, []);
+
+  const connect = async () => {
+    setBusy(true);
+    try {
+      const s = await api.bitportConnect(code);
+      setStatus(s);
+      setCode("");
+      toast(`Bitport connected — ${s.quota ? (s.quota.diskAvailable / 1e9).toFixed(0) + " GB free" : "ready"}`, "ok");
+    } catch (e) {
+      toast(String(e), "bad");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Card title="Bitport cloud" sub="Optional — torrents run on Bitport's servers; your network only ever sees HTTPS">
+      {status?.connected ? (
+        <div className="space-y-3">
+          {status.quota && (
+            <div>
+              <div className="flex items-baseline justify-between text-[11.5px]">
+                <span className="text-dim">
+                  Plan <span className="font-medium text-ink">{status.quota.planName}</span>
+                  {status.quota.planExpired && <span className="ml-1 text-bad">expired</span>}
+                </span>
+                <span className="text-faint">
+                  {(status.quota.diskUsed / 1e9).toFixed(0)} / {(status.quota.diskSize / 1e9).toFixed(0)} GB used
+                </span>
+              </div>
+              <div className="mt-1.5 h-[5px] overflow-hidden rounded-full bg-bg3">
+                <div
+                  className={cx("h-full rounded-full", status.quota.diskUsed / status.quota.diskSize > 0.9 ? "bg-bad" : "bg-accent2")}
+                  style={{ width: Math.min(100, (status.quota.diskUsed / status.quota.diskSize) * 100) + "%" }}
+                />
+              </div>
+            </div>
+          )}
+          <Field label="Where do grabs go?" hint="Applies after Save — every grab path honors it">
+            <Segmented
+              value={backend === "bitport" ? "bitport" : "qbittorrent"}
+              onChange={onBackend}
+              options={[
+                { value: "qbittorrent", label: "Local qBittorrent" },
+                { value: "bitport", label: "Bitport cloud" },
+              ]}
+            />
+          </Field>
+          <button
+            type="button"
+            className="cursor-pointer text-[11px] text-faint underline decoration-line2 underline-offset-2 hover:text-bad"
+            onClick={async () => {
+              try {
+                await api.bitportDisconnect();
+                setStatus({ connected: false, quota: null });
+                onBackend("qbittorrent");
+                toast("Bitport disconnected — grabs go to local qBittorrent", "info");
+              } catch (e) {
+                toast(String(e), "bad");
+              }
+            }}
+          >
+            disconnect
+          </button>
+        </div>
+      ) : (
+        <div className="space-y-2.5">
+          <p className="text-[11.5px] leading-snug text-faint">
+            Connect once and Trawler can send grabs to your Bitport account instead of the local
+            client — useful when your network dislikes BitTorrent. Click Connect, approve in the
+            browser, then paste the code from the address bar (everything after <span className="font-mono">code=</span>).
+          </p>
+          <div className="flex items-center gap-2">
+            <Button
+              onClick={async () => {
+                const url = await api.bitportAuthorizeUrl();
+                window.open(url, "_blank");
+              }}
+              className="shrink-0 px-2.5 py-1.5 text-[11.5px]"
+            >
+              Connect Bitport
+            </Button>
+            <TextInput mono value={code} onChange={setCode} placeholder="paste the code here" />
+            <Button variant="primary" busy={busy} disabled={!code.trim()} onClick={() => void connect()} className="shrink-0 px-2.5 py-1.5 text-[11.5px]">
+              Link
+            </Button>
+          </div>
+        </div>
+      )}
+    </Card>
   );
 }

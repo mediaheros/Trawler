@@ -11,6 +11,7 @@ mod config;
 mod db;
 mod error;
 mod follows;
+mod bitport;
 mod grab;
 mod llm;
 mod notify;
@@ -225,6 +226,11 @@ pub fn run() {
             commands_setup::setup_save_prowlarr_key,
             commands_setup::setup_finish,
             commands_setup::rss_sweep_now,
+            commands::bitport_authorize_url,
+            commands::bitport_connect,
+            commands::bitport_status,
+            commands::bitport_disconnect,
+            commands::bitport_delete,
             commands::logs_recent,
             commands::logs_support_bundle,
             commands_discover::calendar_range,

@@ -109,6 +109,27 @@ pub(crate) fn scrub(msg: &str) -> String {
         rest = &val[value_end(val, header_style)..];
     }
 
+    // pass 1.5: known credential-bearing hosts whose first path segment IS the
+    // secret (Bitport's HTTPS directory key is 16 alphanumerics — not hex, so
+    // the generic pass below can't see it)
+    let out = {
+        let mut o = String::with_capacity(out.len());
+        let mut rest = out.as_str();
+        const HOST: &str = "dir.bitport.io/";
+        while let Some(i) = rest.find(HOST) {
+            let end = i + HOST.len();
+            o.push_str(&rest[..end]);
+            o.push_str("•••");
+            let tail = &rest[end..];
+            let stop = tail
+                .find(|c: char| c == '/' || c.is_whitespace() || c == '"' || c == '\'')
+                .unwrap_or(tail.len());
+            rest = &tail[stop..];
+        }
+        o.push_str(rest);
+        o
+    };
+
     // pass 2: URL path segments of >=16 hex-ish chars (tracker passkeys live
     // in the PATH, not the query) and any bare >=20-char hex run
     let bytes: Vec<char> = out.chars().collect();
@@ -217,5 +238,10 @@ mod tests {
         assert!(!multi.contains("hunter2"));
         // short hex stays (episode hashes in titles etc. under 16 chars)
         assert_eq!(scrub("group CAFE12 fine"), "group CAFE12 fine");
+        // Bitport HTTPS-directory keys are the whole secret
+        assert_eq!(
+            scrub("fetch https://dir.bitport.io/qszik7hip9xqfj26/My%20Files/x.mkv done"),
+            "fetch https://dir.bitport.io/•••/My%20Files/x.mkv done"
+        );
     }
 }

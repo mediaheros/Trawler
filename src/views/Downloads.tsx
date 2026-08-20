@@ -12,6 +12,7 @@ import { api, type DownloadsView as DL, type QbitTorrent } from "../lib/api";
 import { fmtBytes, fmtEta, fmtSpeed, qbitStateLabel, stateKind } from "../lib/format";
 import { useStore } from "../store";
 import { Button, CenterMessage, Segmented, cx } from "../components/ui";
+import { Cloud } from "lucide-react";
 
 export default function DownloadsView() {
   const [data, setData] = useState<DL | null>(null);
@@ -99,7 +100,7 @@ export default function DownloadsView() {
               <div key={i} className="skeleton h-[74px] rounded-(--radius-card)" />
             ))}
           </div>
-        ) : data.torrents.length === 0 ? (
+        ) : data.torrents.length === 0 && data.cloud.length === 0 ? (
           <CenterMessage
             icon={<HardDrive size={28} />}
             title={scope === "trawler" ? "Nothing grabbed yet" : "No torrents"}
@@ -114,6 +115,16 @@ export default function DownloadsView() {
             {data.torrents.map((t) => (
               <TorrentCard key={t.hash} t={t} onAction={act} />
             ))}
+            {data.cloud.length > 0 && (
+              <>
+                <div className="flex items-center gap-1.5 pt-3 pb-1 text-[11.5px] font-medium text-dim">
+                  <Cloud size={13} className="text-accent2" /> In your Bitport cloud
+                </div>
+                {data.cloud.map((c) => (
+                  <CloudCard key={c.token} c={c} onDeleted={() => setData((d) => (d ? { ...d, cloud: d.cloud.filter((x) => x.token !== c.token) } : d))} />
+                ))}
+              </>
+            )}
           </div>
         )}
       </div>
@@ -235,6 +246,62 @@ function TorrentCard({
           style={{ width: `${pct}%` }}
         />
       </div>
+    </div>
+  );
+}
+
+/** A transfer living on Bitport's servers — progress is theirs, bytes arrive
+ *  over HTTPS whenever the user wants them locally. */
+function CloudCard({ c, onDeleted }: { c: import("../lib/api").BitportTransfer; onDeleted: () => void }) {
+  const toast = useStore((s) => s.toast);
+  const [confirm, setConfirm] = useState(false);
+  const done = c.status === "finished";
+  const pct = done ? 100 : c.progress;
+  return (
+    <div className="rounded-(--radius-card) border border-line bg-bg1 px-4 py-3">
+      <div className="flex items-center gap-2.5">
+        <Cloud size={14} className={done ? "shrink-0 text-ok" : "shrink-0 text-accent2"} />
+        <div className="min-w-0 flex-1">
+          <div className="truncate font-mono text-[12px] text-ink">{c.name}</div>
+          <div className="mt-0.5 flex items-center gap-2 text-[10.5px] text-faint">
+            <span>{done ? "finished — in your cloud" : c.substatus || c.status}</span>
+            {!done && <span>{pct.toFixed(0)}%</span>}
+          </div>
+        </div>
+        <a
+          href="https://bitport.io/my-files"
+          target="_blank"
+          rel="noreferrer"
+          className="shrink-0 rounded-md bg-bg2 px-2 py-1 text-[11px] text-dim transition-colors hover:bg-bg3 hover:text-ink"
+        >
+          Open in Bitport
+        </a>
+        <button
+          type="button"
+          className="shrink-0 cursor-pointer rounded-md px-2 py-1 text-[11px] text-faint transition-colors hover:text-bad"
+          onClick={async () => {
+            if (!confirm) {
+              setConfirm(true);
+              window.setTimeout(() => setConfirm(false), 2500);
+              return;
+            }
+            try {
+              await api.bitportDelete(c.token);
+              onDeleted();
+              toast("Removed from your cloud", "info");
+            } catch (e) {
+              toast(String(e), "bad");
+            }
+          }}
+        >
+          {confirm ? "sure?" : "remove"}
+        </button>
+      </div>
+      {!done && (
+        <div className="mt-2 h-[3px] overflow-hidden rounded-full bg-bg3">
+          <div className="h-full rounded-full bg-accent2 transition-[width] duration-500" style={{ width: pct + "%" }} />
+        </div>
+      )}
     </div>
   );
 }

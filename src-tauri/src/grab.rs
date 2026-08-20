@@ -90,9 +90,30 @@ pub async fn dispatch(
     let http = state.http.clone();
     let cfg = state.config.read().await.clone();
     let title = order.title.clone();
+    // the ADDITIVE cloud backend: same claim, same ledger, same episode
+    // linkage — only the transport differs. Chosen per config, never forced.
+    let use_bitport = cfg.download_backend == "bitport" && !cfg.bitport_token.is_empty();
+    let backend: &'static str = if use_bitport { "bitport" } else { "qbittorrent" };
     let handle = tauri::async_runtime::spawn(async move {
         let _claim = claim; // released when the grab settles, even on panic
-        perform_grab_core(&http, &cfg, &order).await?;
+        if use_bitport {
+            // Bitport takes a magnet (or a URL to a .torrent). The magnet is
+            // preferred; a Prowlarr download_url resolves to a magnet via the
+            // redirect handling in fetch_torrent for most public indexers.
+            let src = match order.magnet_url.clone().or_else(|| order.download_url.clone()) {
+                Some(s) => s,
+                None => {
+                    return Err(crate::error::AppError::Other(
+                        "this release offers no magnet or download link".into(),
+                    ))
+                }
+            };
+            let bp = crate::bitport::BitportClient { http: &http, token: cfg.bitport_token.clone() };
+            bp.add_transfer(&src).await?;
+            crate::applog::info("bitport", format!("sent to cloud: {}", order.title.chars().take(70).collect::<String>()));
+        } else {
+            perform_grab_core(&http, &cfg, &order).await?;
+        }
         // A fresh connection, not AppState's: this task must outlive callers
         // that can be dropped mid-await, and the shared connection is not
         // 'static. If recording fails after qBittorrent accepted the add,
@@ -110,6 +131,7 @@ pub async fn dispatch(
                     order.info_hash.as_deref(),
                     order.size,
                     &ep_ids,
+                    backend,
                 )?;
                 if !ep_ids.is_empty() {
                     if let Err(e) = db::mark_grabbed(&conn, &ep_ids, &order.title) {
@@ -128,7 +150,7 @@ pub async fn dispatch(
             Err(e) => {
                 crate::applog::error(
                     "grab",
-                    format!("qBittorrent took \"{title}\" but the ledger write failed: {e}"),
+                    format!("{backend} took \"{title}\" but the ledger write failed: {e}"),
                 );
                 Err(e)
             }

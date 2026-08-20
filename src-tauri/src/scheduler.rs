@@ -541,6 +541,62 @@ pub(crate) fn magnet_hash(magnet: Option<&str>) -> Option<String> {
     }
 }
 
+/// Cloud-side completion: a Bitport transfer reporting "finished" flips its
+/// ledger row and linked episodes exactly like a finished local torrent —
+/// matched by the btih from the transfer's source magnet, title as fallback.
+async fn bitport_completion_pass(app: &tauri::AppHandle, state: &AppState) {
+    let cfg = state.config.read().await.clone();
+    if cfg.bitport_token.is_empty() {
+        return;
+    }
+    let bp = crate::bitport::BitportClient { http: &state.http, token: cfg.bitport_token.clone() };
+    let transfers = match bp.transfers().await {
+        Ok(t) => t,
+        Err(e) => {
+            crate::applog::warn("bitport", format!("transfer poll failed: {e}"));
+            return;
+        }
+    };
+    let done_hashes: std::collections::HashSet<String> = transfers
+        .iter()
+        .filter(|t| t.status == "finished")
+        .filter_map(crate::bitport::transfer_hash)
+        .collect();
+    let done_norms: std::collections::HashSet<String> = transfers
+        .iter()
+        .filter(|t| t.status == "finished")
+        .map(|t| normalize(&t.name))
+        .collect();
+    if done_hashes.is_empty() && done_norms.is_empty() {
+        return;
+    }
+    let conn = state.db.lock().await;
+    let rows: Vec<(i64, String, Option<String>, Option<String>)> = conn
+        .prepare("SELECT id, title, info_hash, ep_ids FROM grab_ledger WHERE state = 'grabbed' AND backend = 'bitport'")
+        .ok()
+        .map(|mut stmt| {
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .map(|it| it.flatten().collect::<Vec<_>>())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    for (id, title, info_hash, ep_ids_raw) in rows {
+        let hash_done = info_hash
+            .map(|h| done_hashes.contains(&h.to_ascii_lowercase()))
+            .unwrap_or(false);
+        if hash_done || done_norms.contains(&normalize(&title)) {
+            let _ = conn.execute("UPDATE grab_ledger SET state = 'completed' WHERE id = ?1", [id]);
+            db::set_episodes_state_by_ids(&conn, &db::parse_ep_ids(ep_ids_raw.as_deref()), "downloaded", None);
+            db::log_activity(
+                &conn,
+                "complete",
+                None,
+                &format!("Finished in the cloud: {}", title.chars().take(60).collect::<String>()),
+            );
+        }
+    }
+}
+
 /// Flip grabbed → downloaded by matching qBittorrent's finished torrents.
 /// Returns any dead grabs detected, for the medic.
 async fn completion_pass(app: &tauri::AppHandle, state: &AppState) -> Vec<DeadGrab> {
@@ -671,7 +727,7 @@ async fn completion_pass(app: &tauri::AppHandle, state: &AppState) -> Vec<DeadGr
             torrents.iter().map(|t| t.hash.to_ascii_lowercase()).collect();
         let cutoff = db::now() - 5 * 60; // covers the add-to-listing gap; a magnet mid-metaDL is already listed
         let rows: Vec<(i64, String, Option<String>, Option<String>)> = conn
-            .prepare("SELECT id, title, info_hash, ep_ids FROM grab_ledger WHERE state = 'grabbed' AND ts < ?1")
+            .prepare("SELECT id, title, info_hash, ep_ids FROM grab_ledger WHERE state = 'grabbed' AND ts < ?1 AND backend = 'qbittorrent'")
             .ok()
             .map(|mut stmt| {
                 stmt.query_map([cutoff], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
@@ -766,7 +822,7 @@ async fn completion_pass(app: &tauri::AppHandle, state: &AppState) -> Vec<DeadGr
     let running_hashes: std::collections::HashSet<String> =
         torrents.iter().filter(|t| t.progress < 0.999).map(|t| t.hash.to_ascii_lowercase()).collect();
     let open_ledger: Vec<(i64, String, i64, Option<String>, Option<String>)> = conn
-        .prepare("SELECT id, title, ts, info_hash, ep_ids FROM grab_ledger WHERE state = 'grabbed'")
+        .prepare("SELECT id, title, ts, info_hash, ep_ids FROM grab_ledger WHERE state = 'grabbed' AND backend = 'qbittorrent'")
         .ok()
         .map(|mut stmt| {
             stmt.query_map([], |r| {
@@ -880,6 +936,7 @@ async fn run_cycle_inner(app: &tauri::AppHandle, state: &AppState) -> Result<usi
     // pack whose episodes still read as wanted
     let dead = completion_pass(app, state).await;
     medic_pass(app, state, dead).await;
+    bitport_completion_pass(app, state).await;
 
     let now = db::now();
     let mut grabs = 0usize;

@@ -36,6 +36,8 @@ export interface Config {
   setupCompleted: boolean;
   rssEnabled: boolean;
   rssMinutes: number;
+  downloadBackend: string;
+  bitportToken: string;
   upgradeScoutEnabled: boolean;
   upgradeWindowDays: number;
 }
@@ -230,9 +232,35 @@ export interface QbitTorrent {
   content_path: string;
 }
 
+export interface BitportQuota {
+  planName: string;
+  planExpired: boolean;
+  diskSize: number;
+  diskAvailable: number;
+  diskUsed: number;
+}
+
+export interface BitportStatus {
+  connected: boolean;
+  quota: BitportQuota | null;
+}
+
+export interface BitportTransfer {
+  token: string;
+  name: string;
+  status: string;
+  substatus: string | null;
+  progress: number;
+  size: number | null;
+  fileId: string | null;
+  folderId: string | null;
+  src: string | null;
+}
+
 export interface DownloadsView {
   torrents: QbitTorrent[];
   transfer: { dl_info_speed: number; up_info_speed: number } | null;
+  cloud: BitportTransfer[];
 }
 
 export interface GrabResult {
@@ -477,6 +505,11 @@ export const api = {
   setupConfigureQbit: () => call<void>("setup_configure_qbit"),
   setupStarterIndexers: () => call<string[]>("setup_starter_indexers"),
   flaresolverrStatus: () => call<FlaresolverrStatus>("flaresolverr_status"),
+  bitportAuthorizeUrl: () => call<string>("bitport_authorize_url"),
+  bitportConnect: (code: string) => call<BitportStatus>("bitport_connect", { code }),
+  bitportStatus: () => call<BitportStatus>("bitport_status"),
+  bitportDisconnect: () => call<void>("bitport_disconnect"),
+  bitportDelete: (token: string) => call<void>("bitport_delete", { token }),
   logsRecent: () => call<LogEntry[]>("logs_recent"),
   logsSupportBundle: () => call<string>("logs_support_bundle"),
   setupFlaresolverr: () => call<string[]>("setup_flaresolverr"),
@@ -676,6 +709,7 @@ const mockEpisodes: EpisodeRow[] = Array.from({ length: 19 }, (_, i) => {
 const mockChat: ChatRow[] = [];
 
 const mockFs = { done: false };
+const mockBp = { connected: false };
 const mockSetup: SetupStatus = {
   qbit: "missing",
   prowlarr: "missing",
@@ -769,7 +803,9 @@ async function mock(cmd: string, args?: Record<string, unknown>): Promise<unknow
         setupCompleted: !new URLSearchParams(window.location.search).has("wizard"),
         rssEnabled: true,
         rssMinutes: 15,
-        upgradeScoutEnabled: false,
+        downloadBackend: "qbittorrent",
+  bitportToken: "",
+  upgradeScoutEnabled: false,
         upgradeWindowDays: 30,
       } satisfies Config;
     case "set_config":
@@ -816,7 +852,16 @@ async function mock(cmd: string, args?: Record<string, unknown>): Promise<unknow
           ? { ...t, progress: Math.min(1, t.progress + 0.01), eta: Math.max(0, t.eta - 2) }
           : t,
       );
-      return { torrents: mockTorrents, transfer: { dl_info_speed: 8.4e6, up_info_speed: 1.3e6 } } satisfies DownloadsView;
+      return {
+        torrents: mockTorrents,
+        transfer: { dl_info_speed: 8.4e6, up_info_speed: 1.3e6 },
+        cloud: mockBp.connected
+          ? [
+              { token: "bp1", name: "UFC.Fight.Night.720p.WEBRip.x265-PSA.mkv", status: "finished", substatus: null, progress: 100, size: null, fileId: "f1", folderId: null, src: null },
+              { token: "bp2", name: "Lioness.S03E04.1080p.WEB.h264.mkv", status: "downloading", substatus: null, progress: 61, size: null, fileId: null, folderId: null, src: null },
+            ]
+          : [],
+      } satisfies DownloadsView;
     case "torrent_action":
       return;
     case "search_tvmaze": {
@@ -953,6 +998,21 @@ async function mock(cmd: string, args?: Record<string, unknown>): Promise<unknow
       mockSetup.prowlarrHasIndexers = true;
       return ["YTS", "The Pirate Bay", "LimeTorrents", "Knaben"];
     case "setup_finish":
+      return;
+    case "bitport_authorize_url":
+      return "https://api.bitport.io/v2/oauth2/authorize?response_type=code&client_id=mock";
+    case "bitport_connect":
+      await sleep(700);
+      mockBp.connected = true;
+      return { connected: true, quota: { planName: "big", planExpired: false, diskSize: 1073741824000, diskAvailable: 343501989179, diskUsed: 730239834821 } };
+    case "bitport_status":
+      return mockBp.connected
+        ? { connected: true, quota: { planName: "big", planExpired: false, diskSize: 1073741824000, diskAvailable: 343501989179, diskUsed: 730239834821 } }
+        : { connected: false, quota: null };
+    case "bitport_disconnect":
+      mockBp.connected = false;
+      return;
+    case "bitport_delete":
       return;
     case "logs_recent": {
       const now = Date.now() / 1000;

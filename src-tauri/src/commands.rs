@@ -584,6 +584,7 @@ pub async fn perform_grab_core(
 pub struct DownloadsView {
     pub torrents: Vec<QbitTorrent>,
     pub transfer: Option<TransferInfo>,
+    pub cloud: Vec<crate::bitport::BitportTransfer>,
 }
 
 #[tauri::command]
@@ -597,7 +598,15 @@ pub async fn downloads(state: State<'_, AppState>, all: bool) -> Result<Download
     };
     let torrents = q.list(category).await?;
     let transfer = q.transfer_info().await.ok();
-    Ok(DownloadsView { torrents, transfer })
+    // cloud transfers ride along whenever an account is connected — additive,
+    // and a Bitport hiccup must never blank the local list
+    let cloud = if cfg.bitport_token.is_empty() {
+        vec![]
+    } else {
+        let bp = crate::bitport::BitportClient { http: &state.http, token: cfg.bitport_token.clone() };
+        bp.transfers().await.unwrap_or_default()
+    };
+    Ok(DownloadsView { torrents, transfer, cloud })
 }
 
 #[tauri::command]
@@ -939,6 +948,71 @@ pub async fn toggle_indexer(state: State<'_, AppState>, id: i32, enable: bool) -
 pub async fn remove_indexer(state: State<'_, AppState>, id: i32) -> Result<()> {
     let cfg = state.config.read().await.clone();
     prowlarr(&state.http, &cfg)?.delete_indexer(id).await
+}
+
+// ---------- bitport (cloud backend) ----------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BitportStatus {
+    pub connected: bool,
+    pub quota: Option<crate::bitport::BitportQuota>,
+}
+
+#[tauri::command]
+pub async fn bitport_authorize_url() -> Result<String> {
+    Ok(crate::bitport::authorize_url())
+}
+
+/// Exchange the pasted authorization code and persist the token.
+#[tauri::command]
+pub async fn bitport_connect(state: State<'_, AppState>, code: String) -> Result<BitportStatus> {
+    let code = code.trim().to_string();
+    if code.is_empty() {
+        return Err(AppError::Other("paste the code Bitport showed you".into()));
+    }
+    let token = crate::bitport::exchange_code(&state.http, &code).await?;
+    let bp = crate::bitport::BitportClient { http: &state.http, token: token.clone() };
+    let quota = bp.me().await?; // proves the token before we store it
+    {
+        let mut cfg = state.config.write().await;
+        cfg.bitport_token = token;
+        crate::config::save(&cfg)?;
+    }
+    crate::applog::info("bitport", format!("connected — plan {}, {:.0} GB free", quota.plan_name, quota.disk_available as f64 / 1e9));
+    Ok(BitportStatus { connected: true, quota: Some(quota) })
+}
+
+#[tauri::command]
+pub async fn bitport_status(state: State<'_, AppState>) -> Result<BitportStatus> {
+    let cfg = state.config.read().await.clone();
+    if cfg.bitport_token.is_empty() {
+        return Ok(BitportStatus { connected: false, quota: None });
+    }
+    let bp = crate::bitport::BitportClient { http: &state.http, token: cfg.bitport_token.clone() };
+    match bp.me().await {
+        Ok(q) => Ok(BitportStatus { connected: true, quota: Some(q) }),
+        // connected-but-unreachable still counts as connected; quota just absent
+        Err(_) => Ok(BitportStatus { connected: true, quota: None }),
+    }
+}
+
+#[tauri::command]
+pub async fn bitport_disconnect(state: State<'_, AppState>) -> Result<()> {
+    let mut cfg = state.config.write().await;
+    cfg.bitport_token.clear();
+    if cfg.download_backend == "bitport" {
+        cfg.download_backend = "qbittorrent".into();
+    }
+    crate::config::save(&cfg)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn bitport_delete(state: State<'_, AppState>, token: String) -> Result<()> {
+    let cfg = state.config.read().await.clone();
+    let bp = crate::bitport::BitportClient { http: &state.http, token: cfg.bitport_token.clone() };
+    bp.delete_transfer(&token).await
 }
 
 // ---------- log console ----------

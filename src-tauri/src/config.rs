@@ -109,6 +109,10 @@ pub struct Config {
     /// episodes and briefs within minutes of posting
     pub rss_enabled: bool,
     pub rss_minutes: u32,
+    /// where grabs go: "qbittorrent" (local, default) or "bitport" (cloud)
+    pub download_backend: String,
+    /// Bitport bearer token (empty = not connected); the connect flow mints it
+    pub bitport_token: String,
     /// weekly propose-only re-search for better-quality copies of recent grabs
     pub upgrade_scout_enabled: bool,
     /// how far back a download still counts as "recent" for the scout (days)
@@ -149,6 +153,8 @@ impl Default for Config {
             setup_completed: false,
             rss_enabled: true,
             rss_minutes: 15,
+            download_backend: "qbittorrent".into(),
+            bitport_token: String::new(),
             upgrade_scout_enabled: false,
             upgrade_window_days: 30,
         }
