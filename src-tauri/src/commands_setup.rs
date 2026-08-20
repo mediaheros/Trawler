@@ -53,8 +53,15 @@ pub async fn setup_configure_qbit() -> Result<()> {
 /// surfaces instead of a silent empty success.
 #[tauri::command]
 pub async fn setup_starter_indexers(state: State<'_, AppState>) -> Result<Vec<String>> {
-    const STARTERS: [&str; 6] =
-        ["YTS", "The Pirate Bay", "LimeTorrents", "Knaben", "ExtraTorrent.st", "TorrentsCSV"];
+    const STARTERS: [&str; 7] = [
+        "YTS",
+        "The Pirate Bay",
+        "LimeTorrents",
+        "Knaben",
+        "TorrentsCSV",
+        "TorrentProject2",
+        "MagnetDownload",
+    ];
 
     let cfg = state.config.read().await.clone();
     if cfg.prowlarr_api_key.is_empty() {

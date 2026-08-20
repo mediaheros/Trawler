@@ -12,5 +12,5 @@
 /dl/latest.json
   Cache-Control: no-cache
 
-/dl/Trawler_*
-  Cache-Control: public, max-age=31536000, immutable
+/dl/*
+  Cache-Control: public, max-age=3600

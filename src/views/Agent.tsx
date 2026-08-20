@@ -4,6 +4,7 @@ import {
   Check,
   ChevronDown,
   ClipboardList,
+  CornerDownLeft,
   Eraser,
   Sparkles,
   Wrench,
@@ -140,17 +141,25 @@ export default function AgentView() {
           </div>
         </div>
 
-        {/* composer */}
-        <div className="px-6 pb-5">
+        {/* composer — the transcript fades out underneath it */}
+        <div className="relative px-6 pb-4">
+          <div className="pointer-events-none absolute inset-x-0 -top-10 h-10 bg-gradient-to-t from-bg0 to-transparent" />
           <div className="mx-auto max-w-[720px]">
             <div
               className={cx(
-                "flex items-end gap-2 rounded-2xl border bg-bg2 p-2 pl-4 transition-all duration-200",
+                "group flex items-end gap-2 rounded-(--radius-card) border bg-bg1 p-1.5 pl-3 transition-all duration-200",
                 agentBusy
                   ? "border-line"
-                  : "border-line2 focus-within:border-accent/45 focus-within:shadow-[0_0_28px_-10px_var(--color-accent)]",
+                  : "border-line2 focus-within:border-accent/40 focus-within:shadow-[0_8px_40px_-14px_var(--color-accent)]",
               )}
             >
+              <Sparkles
+                size={15}
+                className={cx(
+                  "mb-[11px] shrink-0 transition-colors duration-200",
+                  agentBusy ? "glow-pulse text-accent" : "text-faint group-focus-within:text-accent",
+                )}
+              />
               <textarea
                 ref={inputRef}
                 value={input}
@@ -160,7 +169,7 @@ export default function AgentView() {
                   e.target.style.height = `${Math.min(140, e.target.scrollHeight)}px`;
                 }}
                 onKeyDown={(e) => {
-                  if ((e.key === "Enter" || e.key === "Return") && !e.shiftKey) {
+                  if (e.key === "Enter" && !e.shiftKey) {
                     e.preventDefault();
                     send();
                   }
@@ -168,14 +177,15 @@ export default function AgentView() {
                 rows={1}
                 placeholder={agentBusy ? "The agent is working…" : "Ask for anything — or describe a standing brief…"}
                 spellCheck={false}
-                className="max-h-[140px] min-h-[24px] flex-1 resize-none bg-transparent py-1.5 text-[13.5px] leading-relaxed text-ink outline-none placeholder:text-faint"
+                className="max-h-[140px] min-h-[24px] flex-1 resize-none bg-transparent py-2 text-[13.5px] leading-relaxed text-ink outline-none placeholder:text-faint"
               />
               <button
                 type="button"
                 onClick={send}
                 disabled={!input.trim() || agentBusy}
+                title="Send (Enter)"
                 className={cx(
-                  "flex size-9 shrink-0 cursor-pointer items-center justify-center rounded-xl transition-all duration-150",
+                  "flex size-9 shrink-0 cursor-pointer items-center justify-center rounded-[10px] transition-all duration-150 active:scale-95",
                   input.trim() && !agentBusy
                     ? "bg-accent text-bg0 shadow-[0_0_18px_-6px_var(--color-accent)] hover:brightness-110"
                     : "bg-bg3 text-faint",
@@ -184,8 +194,11 @@ export default function AgentView() {
                 <ArrowUp size={16} strokeWidth={2.4} />
               </button>
             </div>
-            <div className="mt-1.5 text-center text-[10.5px] text-faint">
-              Grabs stay inside your size caps · new briefs ask before grabbing anything
+            <div className="mt-2 flex items-center justify-between px-1 text-[10.5px] text-faint">
+              <span>Grabs stay inside your size caps · new briefs ask before grabbing anything</span>
+              <span className="hidden items-center gap-1 sm:flex">
+                <CornerDownLeft size={10} /> send · Shift+<CornerDownLeft size={10} /> new line
+              </span>
             </div>
           </div>
         </div>

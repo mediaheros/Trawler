@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowDown,
   ArrowUp,
@@ -10,7 +10,7 @@ import {
   Waves,
   X,
 } from "lucide-react";
-import type { Release } from "../lib/api";
+import { api, type Release } from "../lib/api";
 import { fmtAge, fmtBytes } from "../lib/format";
 import { useStore, type SortKey } from "../store";
 import { Badge, Button, CenterMessage, Chip, SeederDot, Segmented, cx } from "../components/ui";
@@ -21,7 +21,27 @@ export default function SearchView() {
     searching, hasSearched, results, searchError, runSearch,
     showHidden, setShowHidden, filters, setFilter,
   } = useStore();
+  const toast = useStore((s) => s.toast);
+  const [addingStarters, setAddingStarters] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  const addStarters = async () => {
+    setAddingStarters(true);
+    try {
+      const names = await api.setupStarterIndexers();
+      toast(
+        names.length > 0
+          ? `Added ${names.length} indexer${names.length === 1 ? "" : "s"} — searching again`
+          : "No indexers could be added — check Settings \u2192 Connections",
+        names.length > 0 ? "ok" : "bad",
+      );
+      if (names.length > 0) void runSearch();
+    } catch (e) {
+      toast(String(e), "bad");
+    } finally {
+      setAddingStarters(false);
+    }
+  };
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -233,6 +253,23 @@ export default function SearchView() {
               icon={<X size={28} />}
               title="Search failed"
               body={searchError}
+            />
+          ) : results && results.indexers.length === 0 ? (
+            <CenterMessage
+              icon={<Waves size={28} />}
+              title="No indexers to search yet"
+              body={
+                <>
+                  Trawler searches through Prowlarr's indexers, and none are set up.
+                  Add a reliable starter set with one click — or manage them under
+                  Settings → Indexers.
+                  <span className="mt-4 block">
+                    <Button variant="primary" busy={addingStarters} onClick={() => void addStarters()}>
+                      Add starter indexers
+                    </Button>
+                  </span>
+                </>
+              }
             />
           ) : sorted.length === 0 ? (
             <CenterMessage

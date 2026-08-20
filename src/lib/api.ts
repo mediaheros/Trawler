@@ -746,6 +746,10 @@ async function mock(cmd: string, args?: Record<string, unknown>): Promise<unknow
         { id: 4, name: "YTS", enable: true, protocol: "torrent", privacy: "public" },
       ] satisfies Indexer[];
     case "search": {
+      // demo hook: see the no-indexers recovery state in the browser
+      if (String(args?.query ?? "").includes("noindexers")) {
+        return { releases: [], totalBeforeDedupe: 0, indexers: [] } satisfies SearchResponse;
+      }
       const kind = (args?.kind as string) ?? "all";
       const q = ((args?.query as string) ?? "").toLowerCase();
       const rel = mockReleases.filter(
