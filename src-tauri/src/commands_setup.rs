@@ -40,7 +40,7 @@ pub async fn setup_start_prowlarr(state: State<'_, AppState>) -> Result<()> {
 
 #[tauri::command]
 pub async fn setup_install_qbit(app: tauri::AppHandle) -> Result<()> {
-    setup::install_qbt_via_winget(&app).await
+    setup::install_qbt(&app).await
 }
 
 #[tauri::command]

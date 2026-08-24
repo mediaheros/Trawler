@@ -1,12 +1,15 @@
 //! First-run setup: detect qBittorrent / Prowlarr, install and configure what's
 //! missing. Prowlarr becomes a Trawler-managed instance (user-scope, no admin);
-//! qBittorrent installs via winget and gets its WebUI enabled by editing its
-//! ini while it isn't running. Progress streams to the UI as `setup-step` events.
+//! qBittorrent installs from its official release and gets its WebUI enabled by
+//! editing its ini while it isn't running. Progress streams to the UI as
+//! `setup-step` events.
 
 use std::path::PathBuf;
 
 use serde::Serialize;
 use serde_json::{json, Value};
+#[cfg(windows)]
+use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::error::{AppError, Result};
@@ -1489,51 +1492,230 @@ pub async fn install_qbt_macos(app: &AppHandle) -> Result<()> {
     Ok(())
 }
 
-/// Install qBittorrent via winget and babysit it: stream status while the
-/// download / UAC / install runs, return once the exe actually exists. The
-/// caller's button stays busy the whole time instead of going quiet.
-pub async fn install_qbt_via_winget(app: &AppHandle) -> Result<()> {
+#[cfg(any(windows, test))]
+#[derive(Debug)]
+struct QbtWindowsAsset {
+    url: String,
+    sha256: String,
+}
+
+/// Pick qBittorrent's normal x64 installer rather than the alternate lt20
+/// build. qBittorrent does not currently publish an official Windows ARM64
+/// installer, so Windows on ARM runs this payload through x64 emulation.
+#[cfg(any(windows, test))]
+fn qbt_windows_asset(release: &Value) -> Result<QbtWindowsAsset> {
+    let assets = release
+        .get("assets")
+        .and_then(Value::as_array)
+        .ok_or_else(|| AppError::Other("qBittorrent's release had no asset list".into()))?;
+    let matches = |asset: &&Value| {
+        asset
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| name.ends_with("_x64_setup.exe"))
+    };
+    let asset = assets
+        .iter()
+        .filter(matches)
+        .find(|asset| {
+            !asset
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains("_lt20_")
+        })
+        .or_else(|| assets.iter().filter(matches).next())
+        .ok_or_else(|| AppError::Other("could not find qBittorrent's Windows x64 installer".into()))?;
+    let url = asset
+        .get("browser_download_url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::Other("qBittorrent's installer had no download URL".into()))?;
+    if !(url.starts_with("https://github.com/qbittorrent/qBittorrent/")
+        || url.starts_with("https://objects.githubusercontent.com/"))
+    {
+        return Err(AppError::Other(
+            "qBittorrent's release URL looked wrong — not downloading it".into(),
+        ));
+    }
+    let sha256 = asset
+        .get("digest")
+        .and_then(Value::as_str)
+        .and_then(|digest| digest.strip_prefix("sha256:"))
+        .filter(|digest| digest.len() == 64 && digest.chars().all(|c| c.is_ascii_hexdigit()))
+        .ok_or_else(|| AppError::Other("qBittorrent's installer had no valid SHA-256 digest".into()))?;
+    Ok(QbtWindowsAsset {
+        url: url.into(),
+        sha256: sha256.to_ascii_lowercase(),
+    })
+}
+
+#[cfg(windows)]
+async fn install_qbt_windows(app: &AppHandle) -> Result<()> {
+    let state_guard = app.state::<AppState>();
+    let state: &AppState = state_guard.inner();
+
+    emit(app, "qbit", "log", json!({ "message": "Finding the latest qBittorrent release…" }));
+    let api = state
+        .http
+        .get("https://api.github.com/repos/qbittorrent/qBittorrent/releases/latest")
+        .header("User-Agent", "trawler-setup")
+        .send()
+        .await?;
+    if api.status().as_u16() == 403 {
+        return Err(AppError::Other(
+            "GitHub is rate-limiting release lookups from this network — try again in a few minutes".into(),
+        ));
+    }
+    let release: Value = api.error_for_status()?.json().await?;
+    let asset = qbt_windows_asset(&release)?;
+
+    emit(app, "qbit", "log", json!({ "message": "Downloading qBittorrent from its official release…" }));
+    let mut response = state
+        .http
+        .get(&asset.url)
+        .timeout(std::time::Duration::from_secs(1800))
+        .send()
+        .await?
+        .error_for_status()
+        .map_err(|e| AppError::Other(format!("qBittorrent download failed: {e}")))?;
+    let total = response.content_length().unwrap_or(0);
+    let tools = local_app_data().join("TrawlerTools");
+    std::fs::create_dir_all(&tools)?;
+    let installer = tools.join("qbittorrent-download.exe");
+    struct TempFile(PathBuf);
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _guard = TempFile(installer.clone());
+    let mut out = std::fs::File::create(&installer)?;
+    let mut hasher = Sha256::new();
+    let mut downloaded: u64 = 0;
+    while let Some(chunk) = response.chunk().await? {
+        use std::io::Write;
+        out.write_all(&chunk)?;
+        hasher.update(&chunk);
+        downloaded += chunk.len() as u64;
+    }
+    out.sync_all()?;
+    drop(out);
+    if total > 0 && downloaded != total {
+        return Err(AppError::Other(format!(
+            "the download ended early ({downloaded} of {total} bytes) — check the connection and try again"
+        )));
+    }
+    let actual_sha256 = format!("{:x}", hasher.finalize());
+    if actual_sha256 != asset.sha256 {
+        return Err(AppError::Other(
+            "the downloaded qBittorrent installer failed its SHA-256 check — refusing to run it".into(),
+        ));
+    }
+
+    emit(app, "qbit", "log", json!({ "message": "Installing qBittorrent — approve the Windows prompt if one appears…" }));
+    let installer_for_task = installer.clone();
+    let install = tokio::task::spawn_blocking(move || {
+        // CreateProcess cannot elevate an installer by itself. Start-Process
+        // supplies the UAC prompt on desktop Windows and Windows Server alike.
+        let quoted = installer_for_task.to_string_lossy().replace('\'', "''");
+        let script = format!(
+            "$p = Start-Process -FilePath '{quoted}' -ArgumentList '/S' -Verb RunAs -Wait -PassThru; exit $p.ExitCode"
+        );
+        let mut cmd = std::process::Command::new("powershell.exe");
+        cmd.args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &script,
+        ]);
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW — UAC remains visible
+        cmd.output()
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("qBittorrent installer task failed: {e}")))??;
+    if !install.status.success() {
+        let detail = String::from_utf8_lossy(&install.stderr);
+        return Err(AppError::Other(format!(
+            "qBittorrent installation was cancelled or failed: {}",
+            detail.trim().chars().take(240).collect::<String>()
+        )));
+    }
+    for _ in 0..30 {
+        if qbt_exe_candidates().iter().any(|path| path.exists()) {
+            emit(app, "qbit", "done", json!({ "message": "qBittorrent installed" }));
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    Err(AppError::Other(
+        "the qBittorrent installer finished, but the application could not be found".into(),
+    ))
+}
+
+/// Install qBittorrent through the supported path for this operating system.
+pub async fn install_qbt(app: &AppHandle) -> Result<()> {
+    if qbt_exe_candidates().iter().any(|path| path.exists()) {
+        return Ok(());
+    }
     #[cfg(target_os = "macos")]
     {
         return install_qbt_macos(app).await;
     }
-    #[allow(unreachable_code)]
-    if qbt_exe_candidates().iter().any(|p| p.exists()) {
-        return Ok(());
-    }
-    let mut cmd = std::process::Command::new("winget");
-    cmd.args([
-        "install", "--id", "qBittorrent.qBittorrent", "-e",
-        "--accept-source-agreements", "--accept-package-agreements", "--silent",
-    ]);
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW — UAC still prompts
+        return install_qbt_windows(app).await;
     }
-    cmd.spawn()
-        .map_err(|_| AppError::Other("winget isn't available — install qBittorrent from qbittorrent.org, then return here".into()))?;
-
-    emit(app, "qbit", "log", json!({ "message": "Downloading via winget — approve the Windows prompt if one appears…" }));
-    for i in 0..180u32 {
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        if qbt_exe_candidates().iter().any(|p| p.exists()) {
-            emit(app, "qbit", "done", json!({ "message": "qBittorrent installed" }));
-            return Ok(());
-        }
-        if i == 45 {
-            emit(app, "qbit", "log", json!({ "message": "Still installing — winget can take a few minutes…" }));
-        }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = app;
+        Err(AppError::Other(
+            "automatic qBittorrent installation is not available on Linux yet — install it with your distribution's package manager, then return here".into(),
+        ))
     }
-    Err(AppError::Other(
-        "the installer didn't finish within 6 minutes — if you dismissed the Windows prompt, click Install again".into(),
-    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::ensure_qbt_ini;
+    use super::qbt_windows_asset;
     use super::upsert_xml_tag;
+
+    #[test]
+    fn selects_normal_qbt_windows_installer_with_digest() {
+        let release = serde_json::json!({
+            "assets": [
+                {
+                    "name": "qbittorrent_5.2.3_lt20_x64_setup.exe",
+                    "digest": format!("sha256:{}", "a".repeat(64)),
+                    "browser_download_url": "https://github.com/qbittorrent/qBittorrent/releases/download/release-5.2.3/qbittorrent_5.2.3_lt20_x64_setup.exe"
+                },
+                {
+                    "name": "qbittorrent_5.2.3_x64_setup.exe",
+                    "digest": format!("sha256:{}", "b".repeat(64)),
+                    "browser_download_url": "https://github.com/qbittorrent/qBittorrent/releases/download/release-5.2.3/qbittorrent_5.2.3_x64_setup.exe"
+                }
+            ]
+        });
+        let asset = qbt_windows_asset(&release).unwrap();
+        assert!(asset.url.ends_with("qbittorrent_5.2.3_x64_setup.exe"));
+        assert_eq!(asset.sha256, "b".repeat(64));
+    }
+
+    #[test]
+    fn rejects_qbt_installer_without_a_valid_digest() {
+        let release = serde_json::json!({
+            "assets": [{
+                "name": "qbittorrent_5.2.3_x64_setup.exe",
+                "digest": "sha256:not-a-digest",
+                "browser_download_url": "https://github.com/qbittorrent/qBittorrent/releases/download/release-5.2.3/qbittorrent_5.2.3_x64_setup.exe"
+            }]
+        });
+        assert!(qbt_windows_asset(&release).is_err());
+    }
 
     #[test]
     fn xml_upsert_replaces_and_inserts() {
