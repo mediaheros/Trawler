@@ -1,71 +1,46 @@
-name: Release
+name: Windows release
 
+# A release is built only when an explicit version tag is pushed.
 on:
   push:
-    tags: ["v*"]
-  workflow_dispatch:
+    tags:
+      - "v*"
 
 permissions:
   contents: write
 
-jobs:
-  # NOTE: releases are created as DRAFTS. GitHub's /releases/latest excludes
-  # drafts, so the auto-updater manifest is invisible until the draft is
-  # published — publishing IS the release step. Verify afterwards with:
-  #   curl -L https://mediahero.org/dl/latest.json
-  build:
-    strategy:
-      fail-fast: false
-      # the three jobs read-modify-write the same latest.json release asset;
-      # serialize them so no platform entry is lost to the race
-      max-parallel: 1
-      matrix:
-        include:
-          - name: windows-x64
-            os: windows-latest
-            args: ""
-          - name: windows-arm64
-            os: windows-latest
-            # WiX can't produce arm64 MSIs — NSIS only for this target
-            args: "--target aarch64-pc-windows-msvc --bundles nsis"
-            rust-target: aarch64-pc-windows-msvc
-          - name: linux-x64
-            os: ubuntu-latest
-            args: ""
-          # macOS held until wanted: 10x runner minutes + Gatekeeper needs signing.
-          # - name: macos-universal
-          #   os: macos-latest
-          #   args: "--target universal-apple-darwin"
-          #   rust-target: aarch64-apple-darwin,x86_64-apple-darwin
+concurrency:
+  group: trawler-windows-release-${{ github.ref }}
+  cancel-in-progress: false
 
-    runs-on: ${{ matrix.os }}
+jobs:
+  windows-x64:
+    name: Build Windows x64 release
+    runs-on: windows-2022
+    timeout-minutes: 45
+
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+          cache: npm
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.rust-target }}
-
-      - uses: swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri
-          key: ${{ matrix.name }}
-
-      - name: Linux system deps (webkit, tray, bundling)
-        if: runner.os == 'Linux'
+      - name: Select stable Rust
+        shell: pwsh
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
-            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+          rustup update stable --no-self-update
+          rustup default stable
 
-      - name: Install frontend deps
+      - name: Install frontend dependencies
         run: npm ci
 
-      - name: Build and attach to release
+      - name: Run Rust tests
+        working-directory: src-tauri
+        run: cargo test --all-targets
+
+      - name: Build draft Windows release
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -75,14 +50,13 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: "Trawler ${{ github.ref_name }}"
           releaseBody: |
-            ### Downloads
-            - **Windows x64** — `Trawler_*_x64-setup.exe` (installer) or `.msi`
-            - **Windows ARM64** — `Trawler_*_arm64-setup.exe`
-            - **Linux** — `.AppImage` (portable), `.deb`, or `.rpm`
+            ### Windows x64
+            Download `Trawler_*_x64-setup.exe`.
 
-            Unsigned builds: Windows SmartScreen may ask once — *More info → Run anyway*.
+            This build is not Authenticode-signed, so Windows SmartScreen may
+            require **More info → Run anyway** on first launch.
           releaseDraft: true
           prerelease: false
           includeUpdaterJson: true
           updaterJsonPreferNsis: true
-          args: ${{ matrix.args }}
+          args: "--bundles nsis"

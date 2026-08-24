@@ -1,0 +1,51 @@
+name: Windows x64 build
+
+# Intentionally manual-only. Pushes, pull requests, and tags cannot start it.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Repeated clicks cannot create concurrent builds; only the newest run survives.
+concurrency:
+  group: trawler-windows-x64-build
+  cancel-in-progress: true
+
+jobs:
+  windows-x64:
+    name: Build Windows x64 installer
+    runs-on: windows-2022
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Select stable Rust
+        shell: pwsh
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Run Rust tests
+        working-directory: src-tauri
+        run: cargo test --all-targets
+
+      - name: Build Windows x64 NSIS installer
+        run: npm run tauri -- build --ci --bundles nsis --config src-tauri/tauri.windows-ci.conf.json
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Trawler-windows-x64
+          path: src-tauri/target/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+          retention-days: 7
