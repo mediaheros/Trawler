@@ -1,0 +1,47 @@
+name: One-shot Windows x64 build
+
+on:
+  push:
+    tags:
+      - codex-windows-x64-once-20260824
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trawler-windows-x64-once-20260824
+  cancel-in-progress: true
+
+jobs:
+  windows-x64:
+    if: github.ref == 'refs/tags/codex-windows-x64-once-20260824'
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: one-shot-windows-x64
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build Windows x64 NSIS installer
+        run: npm run tauri -- build --ci --bundles nsis --config src-tauri/tauri.windows-ci.conf.json
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Trawler-windows-x64
+          path: src-tauri/target/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+          retention-days: 3
