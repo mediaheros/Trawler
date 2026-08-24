@@ -72,7 +72,7 @@ There is no "season 2" of UFC. Describe a **standing brief** in plain language �
 
 Download from **[mediahero.org](https://mediahero.org/#download)**:
 
-- **Windows 10/11** — `Trawler_x64-setup.exe` (or the `.msi`). The installer fetches the WebView2 runtime automatically if it's missing.
+- **Windows 10/11** — `Trawler_x64-setup.exe`. The installer fetches the WebView2 runtime automatically if it's missing.
 - **macOS 12+** — `Trawler_universal.dmg`, one app for Apple Silicon and Intel. Drag to Applications.
 
 Builds are signed for the auto-updater but carry no OS certificates yet, so the first launch asks for trust once: Windows SmartScreen wants *More info → Run anyway*; macOS Gatekeeper wants a right-click → *Open*. From then on, **Trawler keeps itself up to date** on both platforms.
