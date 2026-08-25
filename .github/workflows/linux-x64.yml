@@ -69,16 +69,20 @@ jobs:
       - name: Verify package structures
         shell: bash
         run: |
-          set -euo pipefail
+          set -euxo pipefail
           shopt -s nullglob
           appimages=(src-tauri/target/release/bundle/appimage/*.AppImage)
-          signatures=(src-tauri/target/release/bundle/appimage/*.AppImage.sig)
+          appimage_signatures=(src-tauri/target/release/bundle/appimage/*.AppImage.sig)
           debs=(src-tauri/target/release/bundle/deb/*.deb)
+          deb_signatures=(src-tauri/target/release/bundle/deb/*.deb.sig)
           rpms=(src-tauri/target/release/bundle/rpm/*.rpm)
+          rpm_signatures=(src-tauri/target/release/bundle/rpm/*.rpm.sig)
           [[ ${#appimages[@]} -eq 1 ]]
-          [[ ${#signatures[@]} -eq 1 ]]
+          [[ ${#appimage_signatures[@]} -eq 1 ]]
           [[ ${#debs[@]} -eq 1 ]]
+          [[ ${#deb_signatures[@]} -eq 1 ]]
           [[ ${#rpms[@]} -eq 1 ]]
+          [[ ${#rpm_signatures[@]} -eq 1 ]]
           appimage_file="$(file "${appimages[0]}")"
           echo "$appimage_file"
           [[ "$appimage_file" == *"ELF 64-bit"* ]]
@@ -87,10 +91,9 @@ jobs:
           mkdir deb-root rpm-root
           dpkg-deb --extract "${debs[0]}" deb-root
           test -x deb-root/usr/bin/trawler
-          (
-            cd rpm-root
-            rpm2cpio "../${rpms[0]}" | cpio -idm --quiet
-          )
+          rpm_path="$(realpath "${rpms[0]}")"
+          rpm2cpio "$rpm_path" >package.cpio
+          (cd rpm-root && cpio -idm --quiet <../package.cpio)
           test -x rpm-root/usr/bin/trawler
 
       - name: Launch the AppImage under Xvfb
@@ -126,6 +129,8 @@ jobs:
             src-tauri/target/release/bundle/appimage/*.AppImage
             src-tauri/target/release/bundle/appimage/*.AppImage.sig
             src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/deb/*.deb.sig
             src-tauri/target/release/bundle/rpm/*.rpm
+            src-tauri/target/release/bundle/rpm/*.rpm.sig
           if-no-files-found: error
           retention-days: 7

@@ -14,6 +14,7 @@
   ![License: MIT](https://img.shields.io/badge/License-MIT-37d4c2)
   ![Windows](https://img.shields.io/badge/Windows-10%2F11-0078D4)
   ![macOS](https://img.shields.io/badge/macOS-12%2B_universal-000000?logo=apple)
+  ![Linux](https://img.shields.io/badge/Linux-x86__64-FCC624?logo=linux&logoColor=black)
 
   [mediahero.org](https://mediahero.org)
 
@@ -75,12 +76,13 @@ Download from **[mediahero.org](https://mediahero.org/#download)**:
 - **Windows 10/11 x64** — `Trawler_*_windows-x64-setup.exe`. The installer fetches the WebView2 runtime automatically if it's missing.
 - **Windows 11 ARM64** — `Trawler_*_windows-arm64-setup.exe`. Trawler runs natively; Prowlarr and qBittorrent use Windows x64 emulation.
 - **macOS 12+** — `Trawler_universal.dmg`, one app for Apple Silicon and Intel. Drag to Applications.
+- **Linux x64** — choose the portable AppImage, Debian `.deb`, or RPM package. For AppImage: `chmod +x Trawler_*.AppImage && ./Trawler_*.AppImage`; if FUSE is unavailable, prefix the launch with `APPIMAGE_EXTRACT_AND_RUN=1`.
 
-Builds carry no OS certificates yet, so the first launch asks for trust once: Windows SmartScreen wants *More info → Run anyway*; on macOS, try to open Trawler once, then choose *System Settings → Privacy & Security → Open Anyway*. The signed updater covers Windows x64, Windows ARM64, and macOS.
+Builds carry no OS certificates yet, so the first launch asks for trust once: Windows SmartScreen wants *More info → Run anyway*; on macOS, try to open Trawler once, then choose *System Settings → Privacy & Security → Open Anyway*. The signed updater covers Windows x64, Windows ARM64, macOS, and Linux AppImage. Debian and RPM installs update by installing the newer package.
 
 ## Five-minute setup
 
-Trawler is the brain; two free apps do the heavy lifting. The **first-run wizard** installs and wires up both for you — on Windows and macOS alike, including enabling qBittorrent's Web UI so you never see a setup form. Prefer doing it by hand?
+Trawler is the brain; two free apps do the heavy lifting. The **first-run wizard** installs and wires up both for you on Windows, macOS, and Linux x64, including enabling qBittorrent's Web UI so you never see a setup form. Prefer doing it by hand?
 
 1. **[qBittorrent](https://www.qbittorrent.org/download)** — the download engine.
    After installing: *Tools → Options → Web UI* → enable **Web User Interface**, port **8080**, and tick **Bypass authentication for clients on localhost**. (If you set a username/password instead, enter them in Trawler's Settings.)
@@ -115,7 +117,7 @@ Trawler deliberately owns **none** of the fragile parts: indexer definitions liv
 
 ## Development
 
-Prereqs: [Prowlarr](https://prowlarr.com) on `:9696`, [qBittorrent](https://www.qbittorrent.org) WebUI on `:8080`, Node 24+, Rust (MSVC). Optional: an Ollama endpoint for the agent.
+Prereqs: [Prowlarr](https://prowlarr.com) on `:9696`, [qBittorrent](https://www.qbittorrent.org) WebUI on `:8080`, Node 24+, and Rust. Windows builds use MSVC; Linux builds also need Tauri's WebKitGTK system packages. Optional: an Ollama endpoint for the agent.
 
 ```bash
 npm install
@@ -125,7 +127,7 @@ npm run tauri build   # production build + installers
 cd src-tauri && cargo test   # parser, matcher, scheduler-pick and rail tests
 ```
 
-Config: `%APPDATA%\trawler\config.json` · State: `%APPDATA%\trawler\trawler.db` · Everything configurable in-app under Settings.
+Config and state use the OS application-data directory (`%APPDATA%\trawler` on Windows and the standard per-user config/data directories on macOS/Linux). Everything is configurable in-app under Settings.
 
 The landing site lives in [`docs/`](docs/) and deploys to [mediahero.org](https://mediahero.org) via Cloudflare Pages. `scripts/shoot.mjs` regenerates every screenshot from the mock UI.
 

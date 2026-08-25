@@ -30,6 +30,10 @@
     "darwin-universal": {
       "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVDdvNU5DYTR2dzhiRU43UWJwMFhFMisyMVFsU1lac1RnbnpGUHIxQ1BZQnMzMjI5enEyQmIvSHR4Zi9CN0swcGVxWVVMTUZuemo5Qys3cHRNSWZkSFVGUkx6UFZRUUFNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg3NjUwMDM5CWZpbGU6VHJhd2xlci5hcHAudGFyLmd6CmdYbEMzWHlsTnB2RWxHM05iNkNBeTdjN2huemNLbXV0MFFmRVAyV0loS2oyWDl5dXBsZ1M4cEgyNnluOVJibjNWSTE0N0MrNUhQVUdQZjFyOUk3dERRPT0K",
       "url": "https://mediahero.org/dl/0.5.1/Trawler.app.tar.gz"
+    },
+    "linux-x86_64-appimage": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVDdvNU5DYTR2d3dHTkJpaDZFMktjZnlBcVFjTFVNbFZEdWVQYUNPZUIzazd6V2dLWDFHTEpKK2c5QTZWRkxpSUhhSGtwbndOTnMyWjVyUVZhL1p0aUNwNVIwVlZDRXc0PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg3NjU1NDI5CWZpbGU6VHJhd2xlcl8wLjUuMV9hbWQ2NC5BcHBJbWFnZQp1QTBxU0lCR2hZcFlTc0Q0cnJzM3JzK2xXYVZqY2p5Q0lBNkxmaHd0NytnTi9HdG5Bb0hNNEdveHpSQ2ZhblpmTEtIdnhsWlFwRWxHWUJrdy9OMXBCZz09Cg==",
+      "url": "https://github.com/mediaheros/Trawler/releases/download/v0.5.1/Trawler_0.5.1_linux-x64.AppImage"
     }
   }
 }
