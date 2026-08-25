@@ -24,6 +24,7 @@ export default function FirstRun({ onDone }: { onDone: () => void }) {
   const [addedIndexers, setAddedIndexers] = useState<string[] | null>(null);
   const [keyDraft, setKeyDraft] = useState("");
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const busyRef = useRef(false);
 
   const poll = useCallback(async () => {
     try {
@@ -49,6 +50,8 @@ export default function FirstRun({ onDone }: { onDone: () => void }) {
   }, [poll]);
 
   const run = async (key: string, fn: () => Promise<unknown>, okMsg?: string) => {
+    if (busyRef.current) return;
+    busyRef.current = true;
     setBusy(key);
     try {
       await fn();
@@ -59,11 +62,13 @@ export default function FirstRun({ onDone }: { onDone: () => void }) {
       setBusy(null);
       setProgress(null);
       setLogLine(null);
+      busyRef.current = false;
       void poll();
     }
   };
 
   const finish = async () => {
+    if (busyRef.current) return;
     try {
       await api.setupFinish();
     } catch {
@@ -108,12 +113,12 @@ export default function FirstRun({ onDone }: { onDone: () => void }) {
             logLine={busy === "qbit-install" ? logLine : null}
           >
             {status?.qbit === "missing" && (
-              <Button variant="primary" busy={busy === "qbit-install"} onClick={() => run("qbit-install", api.setupInstallQbit, "qBittorrent installed — one more click to enable its Web UI")} className="text-[12px]">
+              <Button variant="primary" busy={busy === "qbit-install"} disabled={busy !== null} onClick={() => run("qbit-install", api.setupInstallQbit, "qBittorrent installed — one more click to enable its Web UI")} className="text-[12px]">
                 <Download size={13} /> Install automatically
               </Button>
             )}
             {(status?.qbit === "installed_stopped" || status?.qbit === "running_no_webui") && (
-              <Button variant="primary" busy={busy === "qbit-cfg"} onClick={() => run("qbit-cfg", api.setupConfigureQbit, "qBittorrent configured and launched")} className="text-[12px]">
+              <Button variant="primary" busy={busy === "qbit-cfg"} disabled={busy !== null} onClick={() => run("qbit-cfg", api.setupConfigureQbit, "qBittorrent configured and launched")} className="text-[12px]">
                 <Wrench size={13} /> {status.qbit === "running_no_webui" ? "Restart with Web UI enabled" : "Enable Web UI & launch"}
               </Button>
             )}
@@ -136,12 +141,12 @@ export default function FirstRun({ onDone }: { onDone: () => void }) {
             logLine={busy === "prowlarr-install" ? logLine : null}
           >
             {status?.prowlarr === "missing" && (
-              <Button variant="primary" busy={busy === "prowlarr-install"} onClick={() => run("prowlarr-install", api.setupInstallProwlarr, "Prowlarr installed and connected")} className="text-[12px]">
+              <Button variant="primary" busy={busy === "prowlarr-install"} disabled={busy !== null} onClick={() => run("prowlarr-install", api.setupInstallProwlarr, "Prowlarr installed and connected")} className="text-[12px]">
                 <Download size={13} /> Install automatically
               </Button>
             )}
             {status?.prowlarr === "managed_stopped" && (
-              <Button variant="primary" busy={busy === "prowlarr-start"} onClick={() => run("prowlarr-start", api.setupStartProwlarr, "Prowlarr is up")} className="text-[12px]">
+              <Button variant="primary" busy={busy === "prowlarr-start"} disabled={busy !== null} onClick={() => run("prowlarr-start", api.setupStartProwlarr, "Prowlarr is up")} className="text-[12px]">
                 <Play size={13} /> Start Prowlarr
               </Button>
             )}
@@ -157,7 +162,7 @@ export default function FirstRun({ onDone }: { onDone: () => void }) {
                 <Button
                   variant="primary"
                   busy={busy === "prowlarr-key"}
-                  disabled={!keyDraft.trim()}
+                  disabled={!keyDraft.trim() || busy !== null}
                   onClick={() => run("prowlarr-key", () => api.setupSaveProwlarrKey(keyDraft), "Connected to Prowlarr")}
                   className="text-[12px]"
                 >
@@ -172,6 +177,7 @@ export default function FirstRun({ onDone }: { onDone: () => void }) {
               <Button
                 variant="primary"
                 busy={busy === "indexers"}
+                disabled={busy !== null}
                 onClick={() =>
                   run("indexers", async () => {
                     const names = await api.setupStarterIndexers();
@@ -210,18 +216,19 @@ export default function FirstRun({ onDone }: { onDone: () => void }) {
 
         {/* footer */}
         <div className="msg-in mt-8 flex items-center justify-center gap-3">
-          <Button variant="ghost" onClick={finish} className="text-[12.5px]">
+          <Button variant="ghost" disabled={busy !== null} onClick={finish} className="text-[12.5px]">
             Skip — I'll set up manually
           </Button>
-          <Button variant="primary" disabled={!ready} onClick={finish} className="px-5 text-[13px]">
+          <Button variant="primary" disabled={!ready || busy !== null} onClick={finish} className="px-5 text-[13px]">
             {ready ? "Start hunting" : "Waiting for the crew…"}
           </Button>
         </div>
         {!ready && (
           <button
             type="button"
+            disabled={busy !== null}
             onClick={() => void poll()}
-            className="mx-auto mt-3 flex cursor-pointer items-center gap-1.5 text-[11px] text-faint hover:text-dim"
+            className="mx-auto mt-3 flex cursor-pointer items-center gap-1.5 text-[11px] text-faint hover:text-dim disabled:pointer-events-none disabled:opacity-50"
           >
             <RefreshCw size={10} /> re-check now
           </button>

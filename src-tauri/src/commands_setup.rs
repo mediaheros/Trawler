@@ -18,24 +18,7 @@ pub async fn setup_install_prowlarr(app: tauri::AppHandle) -> Result<String> {
 
 #[tauri::command]
 pub async fn setup_start_prowlarr(state: State<'_, AppState>) -> Result<()> {
-    setup::start_managed_prowlarr()?;
-    // opportunistically reconnect once it's up
-    let state = state.inner();
-    for _ in 0..30 {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        let ok = state
-            .http
-            .get("http://127.0.0.1:9696/ping")
-            .timeout(std::time::Duration::from_secs(2))
-            .send()
-            .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false);
-        if ok {
-            return Ok(());
-        }
-    }
-    Err(AppError::Other("Prowlarr didn't come up within 30 seconds".into()))
+    setup::start_managed_prowlarr(state.inner()).await
 }
 
 #[tauri::command]

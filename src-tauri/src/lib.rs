@@ -44,6 +44,8 @@ pub struct AppState {
     pub scout_busy: AtomicBool,
     /// one FlareSolverr install/setup at a time
     pub flaresolverr_busy: AtomicBool,
+    /// one managed Prowlarr install/start operation at a time
+    pub prowlarr_busy: AtomicBool,
     /// content keys with a grab in flight (see grab::dispatch)
     pub grab_claims: std::sync::Arc<grab::GrabClaims>,
     /// (fetched_at, payload) for the discovery rows
@@ -71,6 +73,7 @@ pub fn run() {
         rss_busy: AtomicBool::new(false),
         scout_busy: AtomicBool::new(false),
         flaresolverr_busy: AtomicBool::new(false),
+        prowlarr_busy: AtomicBool::new(false),
         grab_claims: std::sync::Arc::new(grab::GrabClaims::default()),
         discover_cache: Mutex::new(None),
     };
@@ -107,7 +110,7 @@ pub fn run() {
                         .map(|r| r.status().is_success())
                         .unwrap_or(false);
                     if !up {
-                        let _ = setup::start_managed_prowlarr();
+                        let _ = setup::start_managed_prowlarr(state.inner()).await;
                     }
                 }
                 // FlareSolverr is opt-in; but once opted in, it should come

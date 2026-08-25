@@ -5,10 +5,11 @@
 //! `setup-step` events.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use fs2::FileExt;
 use serde::Serialize;
 use serde_json::{json, Value};
-#[cfg(any(windows, target_os = "linux"))]
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -480,7 +481,7 @@ pub async fn status(state: &AppState) -> SetupStatus {
 
 // ---------------- prowlarr: managed install ----------------
 
-fn spawn_detached(exe: &PathBuf, args: &[String]) -> Result<()> {
+fn spawn_detached(exe: &PathBuf, args: &[String]) -> Result<u32> {
     let mut cmd = std::process::Command::new(exe);
     cmd.args(args);
     #[cfg(target_os = "linux")]
@@ -510,11 +511,12 @@ fn spawn_detached(exe: &PathBuf, args: &[String]) -> Result<()> {
     let mut child = cmd
         .spawn()
         .map_err(|e| AppError::Other(format!("failed to start {}: {e}", exe.display())))?;
+    let pid = child.id();
     // reap on a detached thread so an exited child never lingers as a zombie
     std::thread::spawn(move || {
         let _ = child.wait();
     });
-    Ok(())
+    Ok(pid)
 }
 
 /// 32 hex chars from OS entropy (RandomState seeds from the OS CSPRNG).
@@ -613,7 +615,162 @@ fn sign_prowlarr_tree(target: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-pub fn start_managed_prowlarr() -> Result<()> {
+struct ProwlarrLifecycleGuard<'a> {
+    flag: &'a AtomicBool,
+    lock_file: std::fs::File,
+}
+
+impl Drop for ProwlarrLifecycleGuard<'_> {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.lock_file);
+        self.flag.store(false, Ordering::Release);
+    }
+}
+
+fn prowlarr_lifecycle_lock_path() -> PathBuf {
+    local_app_data().join("TrawlerTools").join(".prowlarr-lifecycle.lock")
+}
+
+fn claim_prowlarr_lifecycle_at<'a>(
+    flag: &'a AtomicBool,
+    lock_path: &Path,
+) -> Result<ProwlarrLifecycleGuard<'a>> {
+    if flag
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(AppError::Other("Prowlarr setup is already in progress".into()));
+    }
+
+    let result = (|| {
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let lock_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(lock_path)?;
+        lock_file.try_lock_exclusive().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                AppError::Other("Prowlarr setup is already in progress in another Trawler window".into())
+            } else {
+                AppError::Other(format!("couldn't lock Prowlarr's lifecycle: {error}"))
+            }
+        })?;
+        Ok(ProwlarrLifecycleGuard { flag, lock_file })
+    })();
+    if result.is_err() {
+        flag.store(false, Ordering::Release);
+    }
+    result
+}
+
+fn claim_prowlarr_lifecycle(flag: &AtomicBool) -> Result<ProwlarrLifecycleGuard<'_>> {
+    claim_prowlarr_lifecycle_at(flag, &prowlarr_lifecycle_lock_path())
+}
+
+fn managed_prowlarr_pid_path() -> PathBuf {
+    managed_prowlarr_data().join(".trawler-prowlarr.pid")
+}
+
+fn record_managed_prowlarr_pid(pid: u32) -> Result<()> {
+    let path = managed_prowlarr_pid_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, pid.to_string())?;
+    Ok(())
+}
+
+fn clear_managed_prowlarr_pid(pid: u32) {
+    let path = managed_prowlarr_pid_path();
+    let matches = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        == Some(pid);
+    if matches {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(windows)]
+fn process_command(pid: u32) -> Option<String> {
+    let script = format!(
+        "$p=Get-CimInstance Win32_Process -Filter \"ProcessId = {pid}\"; if ($null -ne $p) {{ [Console]::OutputEncoding=[Text.UTF8Encoding]::new(); [Console]::WriteLine($p.ExecutablePath); [Console]::WriteLine($p.CommandLine) }}"
+    );
+    let mut command = std::process::Command::new("powershell.exe");
+    command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let output = command.output().ok()?;
+    output.status.success().then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[cfg(not(windows))]
+fn process_command(pid: u32) -> Option<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-ww", "-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .ok()?;
+    output.status.success().then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn process_command_matches_managed(command: &str, exe: &Path, data: &Path) -> bool {
+    #[cfg(windows)]
+    let normalize = |value: &str| value.replace('\\', "/").to_ascii_lowercase();
+    #[cfg(not(windows))]
+    let normalize = |value: &str| value.to_string();
+
+    let command = normalize(command);
+    let exe = normalize(&exe.to_string_lossy());
+    let data_arg = normalize(&format!("-data={}", data.display()));
+    command.contains(&exe) && command.contains(&data_arg)
+}
+
+fn managed_prowlarr_pid() -> Option<u32> {
+    let path = managed_prowlarr_pid_path();
+    let pid = std::fs::read_to_string(&path).ok()?.trim().parse::<u32>().ok()?;
+    let matches = process_command(pid).is_some_and(|command| {
+        process_command_matches_managed(
+            &command,
+            &managed_prowlarr_exe(),
+            &managed_prowlarr_data(),
+        )
+    });
+    if matches {
+        Some(pid)
+    } else {
+        clear_managed_prowlarr_pid(pid);
+        None
+    }
+}
+
+fn terminate_managed_prowlarr_pid(pid: u32, force: bool) -> bool {
+    if managed_prowlarr_pid() != Some(pid) {
+        return false;
+    }
+    #[cfg(windows)]
+    let status = {
+        let mut command = std::process::Command::new("taskkill");
+        command.args(["/PID", &pid.to_string()]);
+        if force {
+            command.arg("/F");
+        }
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+        command.status()
+    };
+    #[cfg(not(windows))]
+    let status = std::process::Command::new("kill")
+        .args([if force { "-KILL" } else { "-TERM" }, &pid.to_string()])
+        .status();
+    status.map(|status| status.success()).unwrap_or(false)
+}
+
+fn spawn_managed_prowlarr() -> Result<()> {
     let exe = managed_prowlarr_exe();
     if !exe.exists() {
         return Err(AppError::Other("no managed Prowlarr install found".into()));
@@ -626,7 +783,14 @@ pub fn start_managed_prowlarr() -> Result<()> {
     }
     seed_managed_prowlarr_config()?;
     let data = managed_prowlarr_data();
-    spawn_detached(&exe, &[format!("-data={}", data.display())])
+    let pid = spawn_detached(&exe, &[format!("-data={}", data.display())])?;
+    if let Err(error) = record_managed_prowlarr_pid(pid) {
+        crate::applog::error(
+            "setup",
+            format!("Prowlarr started as PID {pid}, but its ownership record could not be saved: {error}"),
+        );
+    }
+    Ok(())
 }
 
 /// Does the process answering on :9696 authenticate with OUR seeded API
@@ -660,6 +824,89 @@ async fn wait_for_prowlarr(state: &AppState, secs: u64) -> bool {
     false
 }
 
+async fn start_managed_prowlarr_inner(state: &AppState) -> Result<()> {
+    // Give an already-starting managed instance a short chance to identify
+    // itself before launching anything. This covers the first upgrade from a
+    // version that did not yet persist its managed PID.
+    if wait_for_prowlarr(state, 5).await {
+        return Ok(());
+    }
+
+    // A PID is trusted only when its command line contains both our managed
+    // executable and our managed data directory. Foreign Prowlarr processes
+    // neither block startup nor become termination targets.
+    if let Some(pid) = managed_prowlarr_pid() {
+        for _ in 0..40 {
+            if wait_for_prowlarr(state, 1).await {
+                return Ok(());
+            }
+            if managed_prowlarr_pid() != Some(pid) {
+                break;
+            }
+        }
+        if managed_prowlarr_pid() == Some(pid) {
+            return Err(AppError::Other(format!(
+                "the managed Prowlarr process (PID {pid}) is running but did not become ready on :9696"
+            )));
+        }
+    }
+
+    spawn_managed_prowlarr()?;
+    if wait_for_prowlarr(state, 45).await {
+        Ok(())
+    } else {
+        Err(AppError::Other(
+            "Prowlarr started but didn't come up on :9696 within 45 seconds".into(),
+        ))
+    }
+}
+
+async fn stop_managed_prowlarr(state: &AppState, key: &str) -> Result<()> {
+    let response = state
+        .http
+        .post("http://127.0.0.1:9696/api/v1/system/shutdown")
+        .header("X-Api-Key", key)
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+        .map_err(|error| AppError::Other(format!("couldn't ask managed Prowlarr to stop: {error}")))?;
+    if !response.status().is_success() {
+        return Err(AppError::Other(format!(
+            "managed Prowlarr rejected its authenticated shutdown request ({})",
+            response.status()
+        )));
+    }
+
+    for _ in 0..30 {
+        if !prowlarr_is_ours(state, key).await && managed_prowlarr_pid().is_none() {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    // The API shutdown is the normal path. Escalation is allowed only for the
+    // recorded PID after its executable and -data argument are revalidated.
+    if let Some(pid) = managed_prowlarr_pid() {
+        if terminate_managed_prowlarr_pid(pid, true) {
+            for _ in 0..20 {
+                if !prowlarr_is_ours(state, key).await && managed_prowlarr_pid().is_none() {
+                    clear_managed_prowlarr_pid(pid);
+                    return Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        }
+    }
+    Err(AppError::Other(
+        "managed Prowlarr did not stop; its existing files were left untouched".into(),
+    ))
+}
+
+pub async fn start_managed_prowlarr(state: &AppState) -> Result<()> {
+    let _lifecycle = claim_prowlarr_lifecycle(&state.prowlarr_busy)?;
+    start_managed_prowlarr_inner(state).await
+}
+
 fn read_prowlarr_api_key() -> Option<String> {
     let xml = std::fs::read_to_string(managed_prowlarr_data().join("config.xml")).ok()?;
     let start = xml.find("<ApiKey>")? + "<ApiKey>".len();
@@ -668,11 +915,275 @@ fn read_prowlarr_api_key() -> Option<String> {
     if key.is_empty() { None } else { Some(key) }
 }
 
+#[derive(Debug)]
+struct ProwlarrAsset {
+    url: String,
+    sha256: String,
+}
+
+fn prowlarr_asset(release: &Value, suffix: &str) -> Result<ProwlarrAsset> {
+    let asset = release
+        .get("assets")
+        .and_then(Value::as_array)
+        .and_then(|assets| {
+            assets.iter().find(|asset| {
+                asset
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| name.ends_with(suffix))
+            })
+        })
+        .ok_or_else(|| AppError::Other("could not find a Prowlarr build for this platform".into()))?;
+    let url = asset
+        .get("browser_download_url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::Other("Prowlarr's release asset had no download URL".into()))?;
+    if !(url.starts_with("https://github.com/Prowlarr/Prowlarr/")
+        || url.starts_with("https://objects.githubusercontent.com/"))
+    {
+        return Err(AppError::Other(
+            "Prowlarr's release URL looked wrong — not downloading it".into(),
+        ));
+    }
+    let sha256 = asset
+        .get("digest")
+        .and_then(Value::as_str)
+        .and_then(|digest| digest.strip_prefix("sha256:"))
+        .filter(|digest| digest.len() == 64 && digest.chars().all(|c| c.is_ascii_hexdigit()))
+        .ok_or_else(|| AppError::Other("Prowlarr's release asset had no valid SHA-256 digest".into()))?;
+    Ok(ProwlarrAsset {
+        url: url.into(),
+        sha256: sha256.to_ascii_lowercase(),
+    })
+}
+
+struct StagingDirectory(Option<PathBuf>);
+
+impl StagingDirectory {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for StagingDirectory {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
+
+fn unique_sibling_path(target: &Path, purpose: &str) -> Result<PathBuf> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| AppError::Other("Prowlarr's install path had no parent directory".into()))?;
+    let name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Prowlarr");
+    for _ in 0..32 {
+        let candidate = parent.join(format!(".{name}.{purpose}-{}", random_api_key()));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(AppError::Other(format!(
+        "couldn't reserve a unique Prowlarr {purpose} path"
+    )))
+}
+
+fn create_unique_staging_dir(target: &Path) -> Result<PathBuf> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| AppError::Other("Prowlarr's install path had no parent directory".into()))?;
+    std::fs::create_dir_all(parent)?;
+    for _ in 0..32 {
+        let candidate = unique_sibling_path(target, "stage")?;
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(AppError::Other(
+        "couldn't create a unique Prowlarr staging directory".into(),
+    ))
+}
+
+#[derive(Debug)]
+struct PendingDirectoryActivation {
+    backup: Option<PathBuf>,
+}
+
+impl PendingDirectoryActivation {
+    fn backup_path(&self) -> Option<&Path> {
+        self.backup.as_deref()
+    }
+
+    fn commit(mut self) {
+        if let Some(backup) = self.backup.take() {
+            if let Err(error) = std::fs::remove_dir_all(&backup) {
+                crate::applog::error(
+                    "setup",
+                    format!(
+                        "Prowlarr updated, but its old backup at {} could not be removed: {error}",
+                        backup.display()
+                    ),
+                );
+            }
+        }
+    }
+}
+
+fn replace_directory_rollback_safe(
+    staged: &Path,
+    final_target: &Path,
+) -> Result<PendingDirectoryActivation> {
+    if !staged.is_dir() {
+        return Err(AppError::Other(format!(
+            "Prowlarr's staged install is missing: {}",
+            staged.display()
+        )));
+    }
+    if !final_target.exists() {
+        std::fs::rename(staged, final_target).map_err(|error| {
+            AppError::Other(format!("couldn't activate the staged Prowlarr install: {error}"))
+        })?;
+        return Ok(PendingDirectoryActivation { backup: None });
+    }
+
+    let backup = unique_sibling_path(final_target, "backup")?;
+    std::fs::rename(final_target, &backup).map_err(|error| {
+        AppError::Other(format!(
+            "couldn't move the existing Prowlarr aside; its files may still be in use ({error})"
+        ))
+    })?;
+    if let Err(activate_error) = std::fs::rename(staged, final_target) {
+        return match std::fs::rename(&backup, final_target) {
+            Ok(()) => Err(AppError::Other(format!(
+                "couldn't activate the staged Prowlarr install; the previous install was restored ({activate_error})"
+            ))),
+            Err(rollback_error) => Err(AppError::Other(format!(
+                "couldn't activate the staged Prowlarr install ({activate_error}), and couldn't restore the previous install from {} ({rollback_error})",
+                backup.display()
+            ))),
+        };
+    }
+
+    Ok(PendingDirectoryActivation {
+        backup: Some(backup),
+    })
+}
+
+#[cfg(any(windows, test))]
+fn verify_extracted_files(target: &Path, manifest: &[(PathBuf, u64)]) -> Result<()> {
+    if manifest.is_empty() {
+        return Err(AppError::Other("the Prowlarr archive contained no files".into()));
+    }
+    for (relative, expected_size) in manifest {
+        let path = target.join(relative);
+        let metadata = std::fs::metadata(&path).map_err(|error| {
+            AppError::Other(format!(
+                "Prowlarr extraction was incomplete: {} is missing ({error})",
+                relative.display()
+            ))
+        })?;
+        if !metadata.is_file() || metadata.len() != *expected_size {
+            return Err(AppError::Other(format!(
+                "Prowlarr extraction was incomplete: {} should be {expected_size} bytes but is {}",
+                relative.display(),
+                metadata.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn extract_windows_prowlarr(bytes: Vec<u8>, target: &Path) -> Result<()> {
+    use std::collections::HashSet;
+    use std::ffi::OsStr;
+    use std::path::Component;
+
+    let cursor = std::io::Cursor::new(bytes);
+    let mut archive =
+        zip::ZipArchive::new(cursor).map_err(|e| AppError::Other(format!("bad archive: {e}")))?;
+    let mut manifest = Vec::new();
+    let mut seen = HashSet::new();
+    for i in 0..archive.len() {
+        let mut file = archive
+            .by_index(i)
+            .map_err(|e| AppError::Other(format!("archive read: {e}")))?;
+        if file.is_symlink() {
+            return Err(AppError::Other(format!(
+                "Prowlarr's archive contained a symbolic link: {}",
+                file.name()
+            )));
+        }
+        let path = file.enclosed_name().ok_or_else(|| {
+            AppError::Other(format!("Prowlarr's archive contained an unsafe path: {}", file.name()))
+        })?;
+        let mut components = path.components();
+        if !matches!(components.next(), Some(Component::Normal(root)) if root == OsStr::new("Prowlarr"))
+        {
+            return Err(AppError::Other(format!(
+                "Prowlarr's archive had an unexpected top-level path: {}",
+                path.display()
+            )));
+        }
+        let stripped: PathBuf = components.collect();
+        if stripped.as_os_str().is_empty() {
+            continue;
+        }
+        let out = target.join(&stripped);
+        if file.is_dir() {
+            std::fs::create_dir_all(&out)?;
+            continue;
+        }
+        if !seen.insert(stripped.clone()) {
+            return Err(AppError::Other(format!(
+                "Prowlarr's archive contained a duplicate file: {}",
+                stripped.display()
+            )));
+        }
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let expected_size = file.size();
+        let mut writer = std::fs::File::create(&out)?;
+        let written = std::io::copy(&mut file, &mut writer)?;
+        if written != expected_size {
+            return Err(AppError::Other(format!(
+                "Prowlarr extraction ended early for {} ({written} of {expected_size} bytes)",
+                stripped.display()
+            )));
+        }
+        manifest.push((stripped, expected_size));
+    }
+    verify_extracted_files(target, &manifest)
+}
+
+fn verify_staged_prowlarr(target: &Path) -> Result<()> {
+    #[cfg(windows)]
+    const EXE: &str = "Prowlarr.exe";
+    #[cfg(not(windows))]
+    const EXE: &str = "Prowlarr";
+    let exe = target.join(EXE);
+    if !exe.is_file() {
+        return Err(AppError::Other(format!(
+            "Prowlarr extraction completed without its main executable ({})",
+            exe.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Download the latest Prowlarr, extract it user-scope, start it, capture the
 /// API key, and write it into Trawler's config. No admin rights involved.
 pub async fn install_prowlarr(app: &AppHandle) -> Result<String> {
     let state_guard = app.state::<AppState>();
     let state: &AppState = state_guard.inner();
+    let _lifecycle = claim_prowlarr_lifecycle(&state.prowlarr_busy)?;
 
     emit(app, "prowlarr", "log", json!({ "message": "Finding the latest release…" }));
     let api = state
@@ -700,32 +1211,14 @@ pub async fn install_prowlarr(app: &AppHandle) -> Result<String> {
     const ASSET_SUFFIX: &str = "linux-core-arm64.tar.gz";
     #[cfg(all(target_os = "linux", target_arch = "arm"))]
     const ASSET_SUFFIX: &str = "linux-core-arm.tar.gz";
-    let asset_url = release
-        .get("assets")
-        .and_then(|a| a.as_array())
-        .and_then(|assets| {
-            assets.iter().find_map(|a| {
-                let name = a.get("name")?.as_str()?;
-                if name.ends_with(ASSET_SUFFIX) {
-                    a.get("browser_download_url")?.as_str().map(String::from)
-                } else {
-                    None
-                }
-            })
-        })
-        .ok_or_else(|| AppError::Other("could not find a Prowlarr build for this platform".into()))?;
-    if !(asset_url.starts_with("https://github.com/Prowlarr/")
-        || asset_url.starts_with("https://objects.githubusercontent.com/"))
-    {
-        return Err(AppError::Other("Prowlarr's release URL looked wrong — not downloading it".into()));
-    }
+    let asset = prowlarr_asset(&release, ASSET_SUFFIX)?;
 
     emit(app, "prowlarr", "log", json!({ "message": "Downloading Prowlarr…" }));
     // ~100 MB: the client's 60s TOTAL deadline would abort this on any
     // connection under ~15 Mbps, mid-wizard, with a confusing error
     let resp = state
         .http
-        .get(&asset_url)
+        .get(&asset.url)
         .timeout(std::time::Duration::from_secs(1800))
         .send()
         .await?
@@ -733,9 +1226,11 @@ pub async fn install_prowlarr(app: &AppHandle) -> Result<String> {
         .map_err(|e| AppError::Other(format!("Prowlarr download failed: {e}")))?;
     let total = resp.content_length().unwrap_or(0);
     let mut bytes: Vec<u8> = Vec::with_capacity(total as usize);
+    let mut hasher = Sha256::new();
     let mut stream = resp;
     let mut last_pct = 0u32;
     while let Some(chunk) = stream.chunk().await? {
+        hasher.update(&chunk);
         bytes.extend_from_slice(&chunk);
         if total > 0 {
             let pct = (bytes.len() as u64 * 100 / total) as u32;
@@ -745,47 +1240,28 @@ pub async fn install_prowlarr(app: &AppHandle) -> Result<String> {
             }
         }
     }
+    if total > 0 && bytes.len() as u64 != total {
+        return Err(AppError::Other(format!(
+            "the Prowlarr download ended early ({} of {total} bytes)",
+            bytes.len()
+        )));
+    }
+    if format!("{:x}", hasher.finalize()) != asset.sha256 {
+        return Err(AppError::Other(
+            "the downloaded Prowlarr archive failed its SHA-256 check — refusing to install it"
+                .into(),
+        ));
+    }
 
     emit(app, "prowlarr", "log", json!({ "message": "Extracting…" }));
     // stage + swap: a failed extract or signing pass must never leave a
     // half-install that looks installed to status probes and boot hooks
     let final_target = managed_prowlarr_dir();
-    let target = final_target.with_extension("new");
-    let _ = std::fs::remove_dir_all(&target);
-    std::fs::create_dir_all(&target)?;
-    struct StagingDir(PathBuf);
-    impl Drop for StagingDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-    let staging_guard = StagingDir(target.clone());
+    let target = create_unique_staging_dir(&final_target)?;
+    let mut staging_guard = StagingDirectory(Some(target.clone()));
     #[cfg(windows)]
     {
-        let cursor = std::io::Cursor::new(bytes);
-        let mut archive =
-            zip::ZipArchive::new(cursor).map_err(|e| AppError::Other(format!("bad archive: {e}")))?;
-        // the zip contains a single top-level "Prowlarr/" folder — strip it
-        for i in 0..archive.len() {
-            let mut file = archive
-                .by_index(i)
-                .map_err(|e| AppError::Other(format!("archive read: {e}")))?;
-            let Some(path) = file.enclosed_name() else { continue };
-            let stripped: PathBuf = path.components().skip(1).collect();
-            if stripped.as_os_str().is_empty() {
-                continue;
-            }
-            let out = target.join(&stripped);
-            if file.is_dir() {
-                std::fs::create_dir_all(&out)?;
-            } else {
-                if let Some(parent) = out.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                let mut w = std::fs::File::create(&out)?;
-                std::io::copy(&mut file, &mut w)?;
-            }
-        }
+        extract_windows_prowlarr(bytes, &target)?;
     }
     #[cfg(not(windows))]
     {
@@ -813,6 +1289,7 @@ pub async fn install_prowlarr(app: &AppHandle) -> Result<String> {
             sign_prowlarr_tree(&target)?;
         }
     }
+    verify_staged_prowlarr(&target)?;
 
     // extraction + signing succeeded — stop any running instance of OURS
     // before swapping its files (Windows locks a running exe; unix keeps the
@@ -823,59 +1300,55 @@ pub async fn install_prowlarr(app: &AppHandle) -> Result<String> {
         if let Some(key) = read_prowlarr_api_key() {
             if prowlarr_is_ours(state, &key).await {
                 emit(app, "prowlarr", "log", json!({ "message": "Stopping the running Prowlarr…" }));
-                // the managed Prowlarr is a detached console process with no
-                // windows — the polite close can't reach it, so wait briefly
-                // then force. The key is re-verified before forcing so it is
-                // only ever aimed at a process proven to be ours.
-                kill_process("Prowlarr");
-                for _ in 0..8 {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    if !prowlarr_is_ours(state, &key).await {
-                        break;
-                    }
-                }
-                if prowlarr_is_ours(state, &key).await {
-                    kill_process_force("Prowlarr");
-                    for _ in 0..12 {
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        if !prowlarr_is_ours(state, &key).await {
-                            break;
-                        }
-                    }
-                }
+                stop_managed_prowlarr(state, &key).await?;
             }
         }
     }
+    if let Some(pid) = managed_prowlarr_pid() {
+        return Err(AppError::Other(format!(
+            "managed Prowlarr is still starting as PID {pid}; its existing files were left untouched — retry when it is ready"
+        )));
+    }
 
-    // swap the staged tree into place — a swap failure must be loud and
-    // leave no silently half-deleted install behind
-    if let Err(e) = std::fs::remove_dir_all(&final_target) {
-        if final_target.exists() {
-            return Err(AppError::Other(format!(
-                "couldn't replace the existing Prowlarr — its files look in use; close Prowlarr and retry ({e})"
-            )));
+    // Activate only after the complete staged tree has been verified. The old
+    // install is moved aside, never recursively deleted in place; activation
+    // failure restores it.
+    let activation = replace_directory_rollback_safe(&target, &final_target)?;
+    staging_guard.disarm();
+
+    let setup_result: Result<String> = async {
+        // Seed config BEFORE first boot: our own API key, localhost-only, no
+        // browser popup, no admin-login form. First impressions matter.
+        emit(app, "prowlarr", "log", json!({ "message": "Configuring…" }));
+        let key = seed_managed_prowlarr_config()?;
+
+        emit(app, "prowlarr", "log", json!({ "message": "Starting Prowlarr…" }));
+        start_managed_prowlarr_inner(state).await?;
+
+        {
+            let mut cfg = state.config.write().await;
+            cfg.prowlarr_url = "http://127.0.0.1:9696".into();
+            cfg.prowlarr_api_key = key.clone();
+            crate::config::save(&cfg)?;
         }
+        Ok(key)
     }
-    std::fs::rename(&target, &final_target)?;
-    std::mem::forget(staging_guard);
-
-    // Seed config BEFORE first boot: our own API key, localhost-only, no
-    // browser popup, no admin-login form. First impressions matter.
-    emit(app, "prowlarr", "log", json!({ "message": "Configuring…" }));
-    let key = seed_managed_prowlarr_config()?;
-
-    emit(app, "prowlarr", "log", json!({ "message": "Starting Prowlarr…" }));
-    start_managed_prowlarr()?;
-    if !wait_for_prowlarr(state, 45).await {
-        return Err(AppError::Other("Prowlarr installed but didn't come up on :9696".into()));
-    }
-
-    {
-        let mut cfg = state.config.write().await;
-        cfg.prowlarr_url = "http://127.0.0.1:9696".into();
-        cfg.prowlarr_api_key = key.clone();
-        crate::config::save(&cfg)?;
-    }
+    .await;
+    let key = match setup_result {
+        Ok(key) => {
+            activation.commit();
+            key
+        }
+        Err(error) => {
+            if let Some(backup) = activation.backup_path() {
+                return Err(AppError::Other(format!(
+                    "{error}; the previous Prowlarr executables were retained at {}",
+                    backup.display()
+                )));
+            }
+            return Err(error);
+        }
+    };
     emit(app, "prowlarr", "done", json!({ "message": "Prowlarr is running and connected" }));
     Ok(key)
 }
@@ -1036,7 +1509,7 @@ pub fn start_flaresolverr() -> Result<()> {
         if !exe.exists() {
             return Err(AppError::Other("FlareSolverr isn't installed".into()));
         }
-        spawn_detached(&exe, &[])
+        spawn_detached(&exe, &[]).map(|_| ())
     }
 }
 
@@ -1570,7 +2043,7 @@ pub async fn configure_and_launch_qbt(qbit_url: &str) -> Result<()> {
         return Ok(());
     }
     #[allow(unreachable_code)]
-    spawn_detached(&exe, &[])
+    spawn_detached(&exe, &[]).map(|_| ())
 }
 
 /// Install qBittorrent on macOS: official dmg from SourceForge, mounted and
@@ -2067,12 +2540,197 @@ pub async fn install_qbt(app: &AppHandle) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+    use std::sync::atomic::AtomicBool;
+
+    use super::claim_prowlarr_lifecycle;
+    use super::claim_prowlarr_lifecycle_at;
+    use super::create_unique_staging_dir;
     use super::ensure_qbt_ini;
+    use super::extract_windows_prowlarr;
     use super::folder_write_probe;
     use super::parse_windows_sid;
+    use super::prowlarr_asset;
+    use super::process_command_matches_managed;
     use super::qbt_linux_asset;
     use super::qbt_windows_asset;
+    use super::replace_directory_rollback_safe;
     use super::upsert_xml_tag;
+    use super::verify_extracted_files;
+
+    fn temp_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "trawler-{label}-{}",
+            super::random_api_key()
+        ))
+    }
+
+    #[test]
+    fn prowlarr_lifecycle_rejects_overlap_and_releases_on_drop() {
+        let busy = AtomicBool::new(false);
+        let first = claim_prowlarr_lifecycle(&busy).unwrap();
+        assert!(claim_prowlarr_lifecycle(&busy).is_err());
+        drop(first);
+        assert!(claim_prowlarr_lifecycle(&busy).is_ok());
+    }
+
+    #[test]
+    fn prowlarr_lifecycle_file_lock_rejects_a_second_process() {
+        let root = temp_path("prowlarr-lifecycle-lock");
+        let lock_path = root.join("lifecycle.lock");
+        let first_process_flag = AtomicBool::new(false);
+        let second_process_flag = AtomicBool::new(false);
+        let first = claim_prowlarr_lifecycle_at(&first_process_flag, &lock_path).unwrap();
+        assert!(claim_prowlarr_lifecycle_at(&second_process_flag, &lock_path).is_err());
+        drop(first);
+        assert!(claim_prowlarr_lifecycle_at(&second_process_flag, &lock_path).is_ok());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn managed_process_match_requires_our_executable_and_data_paths() {
+        let exe = std::path::Path::new("/managed/TrawlerTools/Prowlarr/Prowlarr");
+        let data = std::path::Path::new("/managed/TrawlerTools/ProwlarrData");
+        assert!(process_command_matches_managed(
+            "/managed/TrawlerTools/Prowlarr/Prowlarr -data=/managed/TrawlerTools/ProwlarrData",
+            exe,
+            data,
+        ));
+        assert!(!process_command_matches_managed(
+            "/user/Prowlarr/Prowlarr -data=/user/ProwlarrData",
+            exe,
+            data,
+        ));
+        assert!(!process_command_matches_managed(
+            "/managed/TrawlerTools/Prowlarr/Prowlarr -data=/user/ProwlarrData",
+            exe,
+            data,
+        ));
+    }
+
+    #[test]
+    fn selects_prowlarr_asset_only_with_trusted_url_and_digest() {
+        let release = serde_json::json!({
+            "assets": [{
+                "name": "Prowlarr.master.2.5.2.5491.windows-core-x64.zip",
+                "digest": format!("sha256:{}", "a".repeat(64)),
+                "browser_download_url": "https://github.com/Prowlarr/Prowlarr/releases/download/v2.5.2.5491/Prowlarr.master.2.5.2.5491.windows-core-x64.zip"
+            }]
+        });
+        let asset = prowlarr_asset(&release, "windows-core-x64.zip").unwrap();
+        assert_eq!(asset.sha256, "a".repeat(64));
+
+        let mut bad_digest = release.clone();
+        bad_digest["assets"][0]["digest"] = serde_json::json!("sha256:not-valid");
+        assert!(prowlarr_asset(&bad_digest, "windows-core-x64.zip").is_err());
+
+        let mut bad_host = release;
+        bad_host["assets"][0]["browser_download_url"] =
+            serde_json::json!("https://example.invalid/Prowlarr.zip");
+        assert!(prowlarr_asset(&bad_host, "windows-core-x64.zip").is_err());
+    }
+
+    #[test]
+    fn staging_directories_are_unique_siblings() {
+        let root = temp_path("prowlarr-staging");
+        let final_target = root.join("Prowlarr");
+        let first = create_unique_staging_dir(&final_target).unwrap();
+        let second = create_unique_staging_dir(&final_target).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), final_target.parent());
+        assert!(first.is_dir() && second.is_dir());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn windows_zip_extraction_writes_every_archived_file() {
+        let cursor = std::io::Cursor::new(Vec::new());
+        let mut archive = zip::ZipWriter::new(cursor);
+        let options = zip::write::SimpleFileOptions::default();
+        archive.add_directory("Prowlarr/", options).unwrap();
+        archive.start_file("Prowlarr/Prowlarr.exe", options).unwrap();
+        archive.write_all(b"exe").unwrap();
+        archive.start_file("Prowlarr/AngleSharp.dll", options).unwrap();
+        archive.write_all(b"anglesharp").unwrap();
+        let bytes = archive.finish().unwrap().into_inner();
+
+        let target = temp_path("prowlarr-extract");
+        std::fs::create_dir_all(&target).unwrap();
+        extract_windows_prowlarr(bytes, &target).unwrap();
+        assert_eq!(std::fs::read(target.join("Prowlarr.exe")).unwrap(), b"exe");
+        assert_eq!(
+            std::fs::read(target.join("AngleSharp.dll")).unwrap(),
+            b"anglesharp"
+        );
+        std::fs::remove_dir_all(target).unwrap();
+    }
+
+    #[test]
+    fn extracted_manifest_rejects_missing_or_truncated_files() {
+        let target = temp_path("prowlarr-manifest");
+        std::fs::create_dir_all(&target).unwrap();
+        let manifest = vec![(std::path::PathBuf::from("AngleSharp.dll"), 10)];
+        assert!(verify_extracted_files(&target, &manifest).is_err());
+        std::fs::write(target.join("AngleSharp.dll"), b"short").unwrap();
+        assert!(verify_extracted_files(&target, &manifest).is_err());
+        std::fs::write(target.join("AngleSharp.dll"), b"0123456789").unwrap();
+        assert!(verify_extracted_files(&target, &manifest).is_ok());
+        std::fs::remove_dir_all(target).unwrap();
+    }
+
+    #[test]
+    fn directory_activation_replaces_complete_tree_and_removes_backup() {
+        let root = temp_path("prowlarr-activate");
+        let final_target = root.join("Prowlarr");
+        let staged = root.join("stage");
+        std::fs::create_dir_all(&final_target).unwrap();
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::write(final_target.join("old.dll"), b"old").unwrap();
+        std::fs::write(staged.join("new.dll"), b"new").unwrap();
+
+        let activation = replace_directory_rollback_safe(&staged, &final_target).unwrap();
+        let backup = activation.backup_path().unwrap().to_path_buf();
+        assert!(!final_target.join("old.dll").exists());
+        assert_eq!(std::fs::read(final_target.join("new.dll")).unwrap(), b"new");
+        assert_eq!(std::fs::read(backup.join("old.dll")).unwrap(), b"old");
+        activation.commit();
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_readiness_keeps_previous_executable_tree() {
+        let root = temp_path("prowlarr-readiness-failure");
+        let final_target = root.join("Prowlarr");
+        let staged = root.join("stage");
+        std::fs::create_dir_all(&final_target).unwrap();
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::write(final_target.join("old.dll"), b"old").unwrap();
+        std::fs::write(staged.join("new.dll"), b"new").unwrap();
+
+        let activation = replace_directory_rollback_safe(&staged, &final_target).unwrap();
+        let backup = activation.backup_path().unwrap().to_path_buf();
+        drop(activation); // simulates config/readiness failing before commit
+        assert_eq!(std::fs::read(backup.join("old.dll")).unwrap(), b"old");
+        assert_eq!(std::fs::read(final_target.join("new.dll")).unwrap(), b"new");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn directory_activation_restores_old_tree_when_staged_rename_fails() {
+        let root = temp_path("prowlarr-rollback");
+        let final_target = root.join("Prowlarr");
+        let staged = final_target.join("stage");
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::write(final_target.join("old.dll"), b"old").unwrap();
+        std::fs::write(staged.join("new.dll"), b"new").unwrap();
+
+        let error = replace_directory_rollback_safe(&staged, &final_target).unwrap_err();
+        assert!(error.to_string().contains("previous install was restored"));
+        assert_eq!(std::fs::read(final_target.join("old.dll")).unwrap(), b"old");
+        assert!(final_target.join("stage/new.dll").is_file());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn write_probe_checks_create_write_and_delete() {
