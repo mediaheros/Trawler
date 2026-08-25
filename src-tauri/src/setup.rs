@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use serde_json::{json, Value};
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -219,7 +219,22 @@ fn qbt_exe_candidates() -> Vec<PathBuf> {
 
 #[cfg(not(any(windows, target_os = "macos")))]
 fn qbt_exe_candidates() -> Vec<PathBuf> {
-    vec![PathBuf::from("/usr/bin/qbittorrent"), PathBuf::from("/usr/local/bin/qbittorrent")]
+    let mut out = vec![managed_qbt_appimage()];
+    out.extend([
+        PathBuf::from("/usr/bin/qbittorrent"),
+        PathBuf::from("/usr/local/bin/qbittorrent"),
+        PathBuf::from("/usr/bin/qbittorrent-nox"),
+        PathBuf::from("/usr/local/bin/qbittorrent-nox"),
+    ]);
+    out
+}
+
+#[cfg(target_os = "linux")]
+fn managed_qbt_appimage() -> PathBuf {
+    local_app_data()
+        .join("TrawlerTools")
+        .join("qBittorrent")
+        .join("qbittorrent.AppImage")
 }
 
 /// InstallLocation from qBittorrent's uninstall key (HKCU then HKLM).
@@ -313,6 +328,30 @@ fn process_running(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn qbt_process_running() -> bool {
+    if process_running("qbittorrent.exe") {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    return process_running("qbittorrent-nox");
+    #[allow(unreachable_code)]
+    false
+}
+
+fn stop_qbt(force: bool) {
+    if force {
+        kill_process_force("qbittorrent.exe");
+    } else {
+        kill_process("qbittorrent.exe");
+    }
+    #[cfg(target_os = "linux")]
+    if force {
+        kill_process_force("qbittorrent-nox");
+    } else {
+        kill_process("qbittorrent-nox");
+    }
+}
+
 /// Ask a process to stop, per-platform, POLITELY — the target gets to flush
 /// its state (qBittorrent only writes qBittorrent.ini on a clean exit, so a
 /// force-kill here silently reverts the user's preferences). Callers that
@@ -363,7 +402,7 @@ pub async fn status(state: &AppState) -> SetupStatus {
     };
     let qbit = if q.version().await.is_ok() {
         "ok"
-    } else if process_running("qbittorrent.exe") {
+    } else if qbt_process_running() {
         "running_no_webui"
     } else if qbt_exe_candidates().iter().any(|p| p.exists()) {
         "installed_stopped"
@@ -444,6 +483,13 @@ pub async fn status(state: &AppState) -> SetupStatus {
 fn spawn_detached(exe: &PathBuf, args: &[String]) -> Result<()> {
     let mut cmd = std::process::Command::new(exe);
     cmd.args(args);
+    #[cfg(target_os = "linux")]
+    if exe.extension().and_then(|ext| ext.to_str()) == Some("AppImage") {
+        // Keep the user-scope qBittorrent route working where FUSE is absent.
+        // The runtime extracts once for this long-lived process and cleans up
+        // when qBittorrent exits.
+        cmd.env("APPIMAGE_EXTRACT_AND_RUN", "1");
+    }
     // children must not inherit our stdout/stderr — a chatty child writing
     // into a pipe nobody drains (Trawler launched by a launcher) blocks
     // forever, and a terminal launch gets log spam
@@ -648,8 +694,12 @@ pub async fn install_prowlarr(app: &AppHandle) -> Result<String> {
     const ASSET_SUFFIX: &str = "osx-core-arm64.tar.gz";
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
     const ASSET_SUFFIX: &str = "osx-core-x64.tar.gz";
-    #[cfg(all(not(windows), not(target_os = "macos")))]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     const ASSET_SUFFIX: &str = "linux-core-x64.tar.gz";
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    const ASSET_SUFFIX: &str = "linux-core-arm64.tar.gz";
+    #[cfg(all(target_os = "linux", target_arch = "arm"))]
+    const ASSET_SUFFIX: &str = "linux-core-arm.tar.gz";
     let asset_url = release
         .get("assets")
         .and_then(|a| a.as_array())
@@ -934,7 +984,18 @@ pub fn qbt_log_tail(lines: usize) -> Option<String> {
 // unlocks Cloudflare-protected indexers (1337x, EZTV, …) for users who ask.
 
 pub fn managed_flaresolverr_exe() -> PathBuf {
-    local_app_data().join("TrawlerTools").join("FlareSolverr").join("flaresolverr.exe")
+    #[cfg(windows)]
+    const EXE: &str = "flaresolverr.exe";
+    #[cfg(not(windows))]
+    const EXE: &str = "flaresolverr";
+    local_app_data().join("TrawlerTools").join("FlareSolverr").join(EXE)
+}
+
+fn flaresolverr_process_name() -> &'static str {
+    #[cfg(windows)]
+    return "flaresolverr.exe";
+    #[cfg(not(windows))]
+    return "flaresolverr";
 }
 
 pub async fn flaresolverr_running(state: &AppState) -> bool {
@@ -1002,11 +1063,11 @@ pub fn remove_flaresolverr_local() -> Result<()> {
     }
     #[allow(unreachable_code)]
     {
-        kill_process("flaresolverr.exe");
+        kill_process(flaresolverr_process_name());
         std::thread::sleep(std::time::Duration::from_millis(800));
-        if process_running("flaresolverr.exe") {
+        if process_running(flaresolverr_process_name()) {
             // windowless process — the polite close rarely lands; escalate
-            kill_process_force("flaresolverr.exe");
+            kill_process_force(flaresolverr_process_name());
             std::thread::sleep(std::time::Duration::from_millis(800));
         }
         if let Some(dir) = managed_flaresolverr_exe().parent().map(PathBuf::from) {
@@ -1135,9 +1196,8 @@ pub fn flaresolverr_installed() -> bool {
     managed_flaresolverr_exe().exists()
 }
 
-/// Download the latest FlareSolverr (~350 MB — it bundles a browser), extract
-/// it next to managed Prowlarr, and start it. Opt-in only; never part of the
-/// wizard.
+/// Download the latest FlareSolverr (it bundles a browser), extract it next to
+/// managed Prowlarr, and start it. Opt-in only; never part of the wizard.
 #[cfg(not(target_os = "macos"))]
 pub async fn install_flaresolverr(app: &AppHandle) -> Result<()> {
     let state_guard = app.state::<AppState>();
@@ -1156,20 +1216,37 @@ pub async fn install_flaresolverr(app: &AppHandle) -> Result<()> {
         ));
     }
     let release: Value = api.error_for_status()?.json().await?;
-    let asset_url = release
+    #[cfg(windows)]
+    const ASSET_NAME: &str = "flaresolverr_windows_x64.zip";
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    const ASSET_NAME: &str = "flaresolverr_linux_x64.tar.gz";
+    #[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
+    const ASSET_NAME: &str = "";
+    #[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
+    {
+        return Err(AppError::Other(
+            "FlareSolverr does not publish an official Linux ARM build yet".into(),
+        ));
+    }
+    let asset = release
         .get("assets")
         .and_then(|a| a.as_array())
-        .and_then(|assets| {
-            assets.iter().find_map(|a| {
-                let name = a.get("name")?.as_str()?;
-                if name == "flaresolverr_windows_x64.zip" {
-                    a.get("browser_download_url")?.as_str().map(String::from)
-                } else {
-                    None
-                }
-            })
-        })
-        .ok_or_else(|| AppError::Other("could not find a FlareSolverr Windows build".into()))?;
+        .and_then(|assets| assets.iter().find(|asset| {
+            asset.get("name").and_then(Value::as_str) == Some(ASSET_NAME)
+        }))
+        .ok_or_else(|| AppError::Other("could not find a FlareSolverr build for this platform".into()))?;
+    let asset_url = asset
+        .get("browser_download_url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::Other("FlareSolverr's release asset had no download URL".into()))?
+        .to_string();
+    let expected_sha256 = asset
+        .get("digest")
+        .and_then(Value::as_str)
+        .and_then(|digest| digest.strip_prefix("sha256:"))
+        .filter(|digest| digest.len() == 64 && digest.chars().all(|c| c.is_ascii_hexdigit()))
+        .ok_or_else(|| AppError::Other("FlareSolverr's release asset had no valid SHA-256 digest".into()))?
+        .to_ascii_lowercase();
     // the URL came out of an API response — only fetch a real GitHub asset host
     if !(asset_url.starts_with("https://github.com/FlareSolverr/")
         || asset_url.starts_with("https://objects.githubusercontent.com/"))
@@ -1177,7 +1254,7 @@ pub async fn install_flaresolverr(app: &AppHandle) -> Result<()> {
         return Err(AppError::Other("FlareSolverr release URL looked wrong — not downloading it".into()));
     }
 
-    emit(app, "flaresolverr", "log", json!({ "message": "Downloading FlareSolverr (~350 MB — it bundles a browser)…" }));
+    emit(app, "flaresolverr", "log", json!({ "message": "Downloading FlareSolverr (it bundles a browser)…" }));
     let resp = state
         .http
         .get(&asset_url)
@@ -1191,24 +1268,29 @@ pub async fn install_flaresolverr(app: &AppHandle) -> Result<()> {
     // ~350 MB zip + ~700 MB unpacked: stream to disk, never into RAM
     let tools = local_app_data().join("TrawlerTools");
     std::fs::create_dir_all(&tools)?;
-    let zip_path = tools.join("flaresolverr-download.zip");
-    // the 326 MB temp zip must not survive ANY failure path
+    #[cfg(windows)]
+    let archive_path = tools.join("flaresolverr-download.zip");
+    #[cfg(target_os = "linux")]
+    let archive_path = tools.join("flaresolverr-download.tar.gz");
+    // the large temporary archive must not survive any failure path
     struct TempFile(PathBuf);
     impl Drop for TempFile {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
         }
     }
-    let _zip_guard = TempFile(zip_path.clone());
+    let _archive_guard = TempFile(archive_path.clone());
     let mut downloaded: u64 = 0;
+    let mut hasher = Sha256::new();
     {
-        let mut out = std::fs::File::create(&zip_path)?;
+        let mut out = std::fs::File::create(&archive_path)?;
         let mut stream = resp;
         let mut got: u64 = 0;
         let mut last_pct = 0u32;
         while let Some(chunk) = stream.chunk().await? {
             use std::io::Write;
             out.write_all(&chunk)?;
+            hasher.update(&chunk);
             got += chunk.len() as u64;
             if total > 0 {
                 let pct = (got * 100 / total) as u32;
@@ -1225,6 +1307,11 @@ pub async fn install_flaresolverr(app: &AppHandle) -> Result<()> {
             "the download ended early ({downloaded} of {total} bytes) — check the connection and try again"
         )));
     }
+    if format!("{:x}", hasher.finalize()) != expected_sha256 {
+        return Err(AppError::Other(
+            "the downloaded FlareSolverr archive failed its SHA-256 check — refusing to run it".into(),
+        ));
+    }
 
     emit(app, "flaresolverr", "log", json!({ "message": "Extracting…" }));
     // extract into a staging dir and rename on success — a half-written
@@ -1240,8 +1327,9 @@ pub async fn install_flaresolverr(app: &AppHandle) -> Result<()> {
         }
     }
     let staging_guard = TempDir(staging.clone());
+    #[cfg(windows)]
     {
-        let f = std::fs::File::open(&zip_path)?;
+        let f = std::fs::File::open(&archive_path)?;
         let mut archive =
             zip::ZipArchive::new(f).map_err(|e| AppError::Other(format!("bad archive: {e}")))?;
         // single top-level "flaresolverr/" folder — strip it
@@ -1265,6 +1353,28 @@ pub async fn install_flaresolverr(app: &AppHandle) -> Result<()> {
                 std::io::copy(&mut file, &mut w)?;
             }
         }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let output = std::process::Command::new("tar")
+            .args(["-xzf"])
+            .arg(&archive_path)
+            .args(["--strip-components=1", "-C"])
+            .arg(&staging)
+            .output()
+            .map_err(|e| AppError::Other(format!("couldn't start tar: {e}")))?;
+        if !output.status.success() {
+            return Err(AppError::Other(format!(
+                "couldn't extract FlareSolverr: {}",
+                String::from_utf8_lossy(&output.stderr).chars().take(200).collect::<String>()
+            )));
+        }
+    }
+    let staged_exe = staging.join(managed_flaresolverr_exe().file_name().unwrap_or_default());
+    if !staged_exe.is_file() {
+        return Err(AppError::Other(
+            "the FlareSolverr archive did not contain its expected executable".into(),
+        ));
     }
     let _ = std::fs::remove_dir_all(&target);
     std::fs::rename(&staging, &target)?;
@@ -1394,20 +1504,20 @@ pub async fn configure_and_launch_qbt(qbit_url: &str) -> Result<()> {
         .ok_or_else(|| AppError::Other(
             "couldn't find qBittorrent's program folder — install it from qbittorrent.org, or set its Web UI up manually in Settings".into(),
         ))?;
-    if process_running("qbittorrent.exe") {
-        kill_process("qbittorrent.exe");
+    if qbt_process_running() {
+        stop_qbt(false);
         for _ in 0..10 {
             tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-            if !process_running("qbittorrent.exe") {
+            if !qbt_process_running() {
                 break;
             }
         }
-        if process_running("qbittorrent.exe") {
+        if qbt_process_running() {
             // saving resume data can outlast the polite window — escalate once
-            kill_process_force("qbittorrent.exe");
+            stop_qbt(true);
             tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         }
-        if process_running("qbittorrent.exe") {
+        if qbt_process_running() {
             #[cfg(target_os = "macos")]
             return Err(AppError::Other("couldn't close qBittorrent — quit it from the Dock and try again".into()));
             #[allow(unreachable_code)]
@@ -1622,6 +1732,62 @@ struct QbtWindowsAsset {
     sha256: String,
 }
 
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug)]
+struct QbtLinuxAsset {
+    url: String,
+    sha256: String,
+}
+
+/// Pick qBittorrent's official x86_64 AppImage. This gives Linux a portable,
+/// user-scope install without guessing a distribution or invoking root.
+#[cfg(any(target_os = "linux", test))]
+fn qbt_linux_asset(release: &Value) -> Result<QbtLinuxAsset> {
+    let assets = release
+        .get("assets")
+        .and_then(Value::as_array)
+        .ok_or_else(|| AppError::Other("qBittorrent's release had no asset list".into()))?;
+    let matches = |asset: &&Value| {
+        asset
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| name.ends_with("_x86_64.AppImage"))
+    };
+    let asset = assets
+        .iter()
+        .filter(matches)
+        .find(|asset| {
+            !asset
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains("_lt20")
+        })
+        .or_else(|| assets.iter().filter(matches).next())
+        .ok_or_else(|| AppError::Other("could not find qBittorrent's Linux x86_64 AppImage".into()))?;
+    let url = asset
+        .get("browser_download_url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::Other("qBittorrent's AppImage had no download URL".into()))?;
+    if !(url.starts_with("https://github.com/qbittorrent/qBittorrent/")
+        || url.starts_with("https://objects.githubusercontent.com/"))
+    {
+        return Err(AppError::Other(
+            "qBittorrent's release URL looked wrong — not downloading it".into(),
+        ));
+    }
+    let sha256 = asset
+        .get("digest")
+        .and_then(Value::as_str)
+        .and_then(|digest| digest.strip_prefix("sha256:"))
+        .filter(|digest| digest.len() == 64 && digest.chars().all(|c| c.is_ascii_hexdigit()))
+        .ok_or_else(|| AppError::Other("qBittorrent's AppImage had no valid SHA-256 digest".into()))?;
+    Ok(QbtLinuxAsset {
+        url: url.into(),
+        sha256: sha256.to_ascii_lowercase(),
+    })
+}
+
 /// Pick qBittorrent's normal x64 installer rather than the alternate lt20
 /// build. qBittorrent does not currently publish an official Windows ARM64
 /// installer, so Windows on ARM runs this payload through x64 emulation.
@@ -1779,6 +1945,99 @@ async fn install_qbt_windows(app: &AppHandle) -> Result<()> {
     ))
 }
 
+/// Install qBittorrent's official AppImage under Trawler's user data folder.
+/// The SHA-256 digest comes from upstream's GitHub release metadata.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+async fn install_qbt_linux(app: &AppHandle) -> Result<()> {
+    let state_guard = app.state::<AppState>();
+    let state: &AppState = state_guard.inner();
+    emit(app, "qbit", "log", json!({ "message": "Finding the latest qBittorrent release…" }));
+    let api = state
+        .http
+        .get("https://api.github.com/repos/qbittorrent/qBittorrent/releases/latest")
+        .header("User-Agent", "trawler-setup")
+        .send()
+        .await?;
+    if api.status().as_u16() == 403 {
+        return Err(AppError::Other(
+            "GitHub is rate-limiting release lookups from this network — try again in a few minutes".into(),
+        ));
+    }
+    let release: Value = api.error_for_status()?.json().await?;
+    let asset = qbt_linux_asset(&release)?;
+
+    emit(app, "qbit", "log", json!({ "message": "Downloading qBittorrent's official AppImage…" }));
+    let mut response = state
+        .http
+        .get(&asset.url)
+        .timeout(std::time::Duration::from_secs(1800))
+        .send()
+        .await?
+        .error_for_status()
+        .map_err(|e| AppError::Other(format!("qBittorrent download failed: {e}")))?;
+    let total = response.content_length().unwrap_or(0);
+    let final_path = managed_qbt_appimage();
+    let parent = final_path
+        .parent()
+        .ok_or_else(|| AppError::Other("qBittorrent's managed path had no parent".into()))?;
+    std::fs::create_dir_all(parent)?;
+    let staging = final_path.with_extension("AppImage.new");
+    struct TempFile(PathBuf);
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let staging_guard = TempFile(staging.clone());
+    let mut out = std::fs::File::create(&staging)?;
+    let mut hasher = Sha256::new();
+    let mut downloaded: u64 = 0;
+    let mut last_pct = 0u32;
+    while let Some(chunk) = response.chunk().await? {
+        use std::io::Write;
+        out.write_all(&chunk)?;
+        hasher.update(&chunk);
+        downloaded += chunk.len() as u64;
+        if total > 0 {
+            let pct = (downloaded * 100 / total) as u32;
+            if pct >= last_pct + 5 {
+                last_pct = pct;
+                emit(app, "qbit", "progress", json!({ "pct": pct }));
+            }
+        }
+    }
+    out.sync_all()?;
+    drop(out);
+    if total > 0 && downloaded != total {
+        return Err(AppError::Other(format!(
+            "the download ended early ({downloaded} of {total} bytes) — check the connection and try again"
+        )));
+    }
+    if format!("{:x}", hasher.finalize()) != asset.sha256 {
+        return Err(AppError::Other(
+            "the downloaded qBittorrent AppImage failed its SHA-256 check — refusing to run it".into(),
+        ));
+    }
+    {
+        use std::io::Read;
+        let mut magic = [0u8; 11];
+        std::fs::File::open(&staging)?.read_exact(&mut magic)?;
+        if magic[..4] != [0x7f, b'E', b'L', b'F'] || magic[8..11] != [b'A', b'I', 2] {
+            return Err(AppError::Other(
+                "the downloaded qBittorrent file was not a type-2 AppImage".into(),
+            ));
+        }
+    }
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755))?;
+    }
+    std::fs::rename(&staging, &final_path)?;
+    std::mem::forget(staging_guard);
+    emit(app, "qbit", "done", json!({ "message": "qBittorrent installed" }));
+    Ok(())
+}
+
 /// Install qBittorrent through the supported path for this operating system.
 pub async fn install_qbt(app: &AppHandle) -> Result<()> {
     if qbt_exe_candidates().iter().any(|path| path.exists()) {
@@ -1792,13 +2051,19 @@ pub async fn install_qbt(app: &AppHandle) -> Result<()> {
     {
         return install_qbt_windows(app).await;
     }
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        return install_qbt_linux(app).await;
+    }
+    #[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
     {
         let _ = app;
-        Err(AppError::Other(
-            "automatic qBittorrent installation is not available on Linux yet — install it with your distribution's package manager, then return here".into(),
-        ))
+        return Err(AppError::Other(
+            "qBittorrent does not publish an official Linux ARM AppImage yet — install qbittorrent with your distribution's package manager, then return here".into(),
+        ));
     }
+    #[allow(unreachable_code)]
+    Err(AppError::Other("automatic qBittorrent installation is unavailable on this platform".into()))
 }
 
 #[cfg(test)]
@@ -1806,6 +2071,7 @@ mod tests {
     use super::ensure_qbt_ini;
     use super::folder_write_probe;
     use super::parse_windows_sid;
+    use super::qbt_linux_asset;
     use super::qbt_windows_asset;
     use super::upsert_xml_tag;
 
@@ -1863,6 +2129,39 @@ mod tests {
             }]
         });
         assert!(qbt_windows_asset(&release).is_err());
+    }
+
+    #[test]
+    fn selects_normal_qbt_linux_appimage_with_digest() {
+        let release = serde_json::json!({
+            "assets": [
+                {
+                    "name": "qbittorrent-5.2.3_lt20_x86_64.AppImage",
+                    "digest": format!("sha256:{}", "a".repeat(64)),
+                    "browser_download_url": "https://github.com/qbittorrent/qBittorrent/releases/download/release-5.2.3/qbittorrent-5.2.3_lt20_x86_64.AppImage"
+                },
+                {
+                    "name": "qbittorrent-5.2.3_x86_64.AppImage",
+                    "digest": format!("sha256:{}", "b".repeat(64)),
+                    "browser_download_url": "https://github.com/qbittorrent/qBittorrent/releases/download/release-5.2.3/qbittorrent-5.2.3_x86_64.AppImage"
+                }
+            ]
+        });
+        let asset = qbt_linux_asset(&release).unwrap();
+        assert!(asset.url.ends_with("qbittorrent-5.2.3_x86_64.AppImage"));
+        assert_eq!(asset.sha256, "b".repeat(64));
+    }
+
+    #[test]
+    fn rejects_qbt_linux_appimage_from_an_untrusted_host() {
+        let release = serde_json::json!({
+            "assets": [{
+                "name": "qbittorrent-5.2.3_x86_64.AppImage",
+                "digest": format!("sha256:{}", "b".repeat(64)),
+                "browser_download_url": "https://example.invalid/qbittorrent.AppImage"
+            }]
+        });
+        assert!(qbt_linux_asset(&release).is_err());
     }
 
     #[test]
