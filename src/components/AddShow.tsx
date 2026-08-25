@@ -17,18 +17,25 @@ export default function AddShow({ onClose }: { onClose: () => void }) {
   const [following, setFollowing] = useState<number | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const seq = useRef(0);
+  const followingRef = useRef(false);
 
   useEffect(() => {
     inputRef.current?.focus();
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    const onKey = (e: KeyboardEvent) =>
+      e.key === "Escape" && !followingRef.current && onClose();
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    return () => {
+      ++seq.current;
+      window.removeEventListener("keydown", onKey);
+    };
   }, [onClose]);
 
   // debounced search-as-you-type against TVmaze
   useEffect(() => {
     if (!q.trim()) {
+      ++seq.current;
       setResults([]);
+      setBusy(false);
       return;
     }
     const mySeq = ++seq.current;
@@ -47,6 +54,8 @@ export default function AddShow({ onClose }: { onClose: () => void }) {
   }, [q]);
 
   const follow = async (r: TvmazeResult) => {
+    if (followingRef.current) return;
+    followingRef.current = true;
     setFollowing(r.id);
     try {
       await followShow(r.id, backfill);
@@ -54,6 +63,7 @@ export default function AddShow({ onClose }: { onClose: () => void }) {
     } catch {
       // toast already shown by the store; stay open so the user can retry
     } finally {
+      followingRef.current = false;
       setFollowing(null);
     }
   };
@@ -61,7 +71,9 @@ export default function AddShow({ onClose }: { onClose: () => void }) {
   return (
     <div
       className="fixed inset-0 z-40 flex items-start justify-center bg-black/60 pt-[10vh] backdrop-blur-[2px]"
-      onMouseDown={(e) => e.target === e.currentTarget && onClose()}
+      onMouseDown={(e) =>
+        e.target === e.currentTarget && !followingRef.current && onClose()
+      }
     >
       <div className="toast-in w-[560px] max-w-[92vw] overflow-hidden rounded-(--radius-card) border border-line2 bg-bg1 shadow-[0_24px_80px_-20px_rgba(0,0,0,0.9)]">
         <div className="group relative border-b border-line transition-colors focus-within:border-accent/40">
@@ -80,7 +92,11 @@ export default function AddShow({ onClose }: { onClose: () => void }) {
           {busy ? (
             <Loader2 size={15} className="spin absolute right-4 top-1/2 -translate-y-1/2 text-faint" />
           ) : (
-            <CloseBtn onClick={onClose} className="absolute right-2.5 top-1/2 -translate-y-1/2" />
+            <CloseBtn
+              onClick={onClose}
+              disabled={following !== null}
+              className="absolute right-2.5 top-1/2 -translate-y-1/2"
+            />
           )}
         </div>
 
@@ -123,7 +139,7 @@ export default function AddShow({ onClose }: { onClose: () => void }) {
                   </div>
                   <Button
                     variant={already ? "default" : "primary"}
-                    disabled={already}
+                    disabled={already || following !== null}
                     busy={following === r.id}
                     onClick={() => follow(r)}
                     className="shrink-0 px-2.5 py-1 text-[11.5px]"
@@ -146,6 +162,7 @@ export default function AddShow({ onClose }: { onClose: () => void }) {
           <input
             type="checkbox"
             checked={backfill}
+            disabled={following !== null}
             onChange={(e) => setBackfill(e.target.checked)}
             className="size-3.5 accent-(--color-accent)"
           />

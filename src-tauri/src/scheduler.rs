@@ -343,7 +343,7 @@ fn reopen_dead_grabs(
                  WHERE state = 'grabbed' AND grabbed_title = ?1",
                 [&title],
             );
-            db::set_episodes_state_by_ids(&conn, &linked_ids, "wanted", None);
+            db::set_episodes_state_by_ids(conn, &linked_ids, "wanted", None);
             // A stalled UPGRADE grab (same content key already completed once)
             // needs no medic — the user keeps the copy they already have, and
             // the agent would only refuse "already grabbed" replacements.
@@ -521,7 +521,7 @@ async fn medic_pass(app: &tauri::AppHandle, state: &AppState, dead: Vec<DeadGrab
                 );
             }
             Ok(Err(e)) => crate::applog::warn("scheduler",format!("medic run failed: {e}")),
-            Err(_) => crate::applog::warn("scheduler",format!("medic run timed out")),
+            Err(_) => crate::applog::warn("scheduler", "medic run timed out"),
         }
     }
 }
@@ -529,16 +529,40 @@ async fn medic_pass(app: &tauri::AppHandle, state: &AppState, dead: Vec<DeadGrab
 /// The btih out of a magnet link, lowercased — identity that survives
 /// qBittorrent renaming the torrent once metadata arrives.
 pub(crate) fn magnet_hash(magnet: Option<&str>) -> Option<String> {
-    let m = magnet?;
-    let idx = m.find("btih:")?;
-    let rest = &m[idx + 5..];
-    let end = rest.find('&').unwrap_or(rest.len());
-    let h = &rest[..end];
-    if h.len() == 40 || h.len() == 32 {
-        Some(h.to_ascii_lowercase())
-    } else {
-        None
+    let url = url::Url::parse(magnet?).ok()?;
+    let xt = url
+        .query_pairs()
+        .find(|(key, value)| key == "xt" && value.to_ascii_lowercase().starts_with("urn:btih:"))?
+        .1;
+    let raw = &xt[9..];
+    if raw.len() == 40 && raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Some(raw.to_ascii_lowercase());
     }
+    if raw.len() != 32 {
+        return None;
+    }
+    // qBittorrent reports SHA-1 identities as 40 hex digits even when the
+    // magnet supplied the equivalent 32-character base32 form.
+    let mut decoded = Vec::with_capacity(20);
+    let mut buffer = 0u32;
+    let mut bits = 0u8;
+    for byte in raw.bytes() {
+        let value = match byte.to_ascii_uppercase() {
+            b'A'..=b'Z' => byte.to_ascii_uppercase() - b'A',
+            b'2'..=b'7' => byte - b'2' + 26,
+            _ => return None,
+        } as u32;
+        buffer = (buffer << 5) | value;
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            decoded.push(((buffer >> bits) & 0xff) as u8);
+        }
+    }
+    if decoded.len() != 20 || bits != 0 {
+        return None;
+    }
+    Some(decoded.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 /// Cloud-side completion and reaping. A Bitport transfer reporting
@@ -595,12 +619,14 @@ async fn bitport_completion_pass(app: &tauri::AppHandle, state: &AppState) {
     let recent_cutoff = db::now() - 3 * 86_400; // first cycle after an upgrade may flip a backlog
     let mut completed_display: Vec<String> = vec![];
     let conn = state.db.lock().await;
-    let rows: Vec<(i64, String, Option<String>, Option<String>, Option<String>, i64)> = conn
-        .prepare("SELECT id, title, info_hash, ep_ids, bp_token, ts FROM grab_ledger WHERE state = 'grabbed' AND backend = 'bitport'")
+    type BitportOpenRow =
+        (i64, String, Option<String>, Option<String>, Option<String>, i64, String);
+    let rows: Vec<BitportOpenRow> = conn
+        .prepare("SELECT id, title, info_hash, ep_ids, bp_token, ts, state FROM grab_ledger WHERE state IN ('dispatching','grabbed') AND backend = 'bitport'")
         .ok()
         .map(|mut stmt| {
             stmt.query_map([], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
             })
             .map(|it| it.flatten().collect::<Vec<_>>())
             .unwrap_or_default()
@@ -613,7 +639,7 @@ async fn bitport_completion_pass(app: &tauri::AppHandle, state: &AppState) {
             "transfer listing came back empty while cloud grabs are open — not reaping",
         );
     }
-    for (id, title, info_hash, ep_ids_raw, bp_token, ts) in rows {
+    for (id, title, info_hash, ep_ids_raw, bp_token, ts, ledger_state) in rows {
         let h = info_hash.map(|x| x.to_ascii_lowercase());
         let norm = normalize(&title);
         // a row WITH a token must not complete off an unrelated old transfer
@@ -648,14 +674,45 @@ async fn bitport_completion_pass(app: &tauri::AppHandle, state: &AppState) {
             }
         };
         let mut missing = missing_lock.lock().unwrap_or_else(|p| p.into_inner());
-        if is_present || listing_empty {
+        if is_present {
+            missing.remove(&id);
+            if ledger_state == "dispatching" {
+                if let Err(error) = db::ledger_confirm_present(
+                    &conn,
+                    id,
+                    &title,
+                    &db::parse_ep_ids(ep_ids_raw.as_deref()),
+                ) {
+                    crate::applog::error(
+                        "bitport",
+                        format!("could not recover pending ledger row {id}: {error}"),
+                    );
+                }
+            }
+            continue;
+        }
+        // A wholly empty account response remains too weak to retire normal
+        // grabbed rows. For a dispatching row older than 30 minutes, two
+        // agreeing successful empty polls recover a pre-submission crash.
+        let can_count_absence =
+            !listing_empty || (ledger_state == "dispatching" && ts < db::now() - 30 * 60);
+        if !can_count_absence {
             missing.remove(&id);
             continue;
         }
         if ts < reap_cutoff && missing.contains(&id) {
             missing.remove(&id);
-            let _ = conn.execute("UPDATE grab_ledger SET state = 'removed' WHERE id = ?1", [id]);
-            db::set_episodes_state_by_ids(&conn, &db::parse_ep_ids(ep_ids_raw.as_deref()), "wanted", None);
+            if let Err(error) = db::ledger_confirm_missing(
+                &conn,
+                id,
+                &db::parse_ep_ids(ep_ids_raw.as_deref()),
+            ) {
+                crate::applog::error(
+                    "bitport",
+                    format!("could not retire missing ledger row {id}: {error}"),
+                );
+                continue;
+            }
             db::log_activity(
                 &conn,
                 "system",
@@ -802,10 +859,12 @@ async fn completion_pass(app: &tauri::AppHandle, state: &AppState) -> Vec<DeadGr
             }
         }
     }
-    // Orphan reaping: a 'grabbed' ledger row whose torrent is nowhere in
+    // Orphan reaping: a grabbed ledger row whose torrent is nowhere in
     // qBittorrent means the user deleted it (in our Downloads view before
     // v0.3.7, or in qBittorrent itself). Holding the claim would block their
-    // deliberate re-download forever — retire it and free the episodes.
+    // deliberate re-download forever — retire it and free the episodes. A
+    // stale dispatching row is the crash-between-backend-and-finalize case;
+    // the same authoritative listing either recovers or retires it.
     {
         let all_norms: std::collections::HashSet<String> =
             torrents.iter().map(|t| normalize(&t.name)).collect();
@@ -813,7 +872,7 @@ async fn completion_pass(app: &tauri::AppHandle, state: &AppState) -> Vec<DeadGr
             torrents.iter().map(|t| t.hash.to_ascii_lowercase()).collect();
         let cutoff = db::now() - 5 * 60; // covers the add-to-listing gap; a magnet mid-metaDL is already listed
         let rows: Vec<(i64, String, Option<String>, Option<String>)> = conn
-            .prepare("SELECT id, title, info_hash, ep_ids FROM grab_ledger WHERE state = 'grabbed' AND ts < ?1 AND backend = 'qbittorrent'")
+            .prepare("SELECT id, title, info_hash, ep_ids FROM grab_ledger WHERE state IN ('dispatching','grabbed') AND ts < ?1 AND backend = 'qbittorrent'")
             .ok()
             .map(|mut stmt| {
                 stmt.query_map([cutoff], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
@@ -828,14 +887,23 @@ async fn completion_pass(app: &tauri::AppHandle, state: &AppState) -> Vec<DeadGr
             if hash_present || all_norms.contains(&normalize(&title)) {
                 continue;
             }
-            let _ = conn.execute("UPDATE grab_ledger SET state = 'removed' WHERE id = ?1", [id]);
+            if let Err(error) = db::ledger_confirm_missing(
+                &conn,
+                id,
+                &db::parse_ep_ids(ep_ids_raw.as_deref()),
+            ) {
+                crate::applog::error(
+                    "scheduler",
+                    format!("could not retire missing ledger row {id}: {error}"),
+                );
+                continue;
+            }
             let _ = conn.execute(
                 "UPDATE episodes SET state = 'wanted', grabbed_title = NULL, grabbed_at = NULL,
                         last_searched_at = 0
                  WHERE state = 'grabbed' AND grabbed_title = ?1",
                 [&title],
             );
-            db::set_episodes_state_by_ids(&conn, &db::parse_ep_ids(ep_ids_raw.as_deref()), "wanted", None);
             db::log_activity(
                 &conn,
                 "system",
@@ -907,8 +975,9 @@ async fn completion_pass(app: &tauri::AppHandle, state: &AppState) -> Vec<DeadGr
         torrents.iter().filter(|t| t.progress < 0.999).map(|t| normalize(&t.name)).collect();
     let running_hashes: std::collections::HashSet<String> =
         torrents.iter().filter(|t| t.progress < 0.999).map(|t| t.hash.to_ascii_lowercase()).collect();
-    let open_ledger: Vec<(i64, String, i64, Option<String>, Option<String>)> = conn
-        .prepare("SELECT id, title, ts, info_hash, ep_ids FROM grab_ledger WHERE state = 'grabbed' AND backend = 'qbittorrent'")
+    type QbitOpenRow = (i64, String, i64, Option<String>, Option<String>);
+    let open_ledger: Vec<QbitOpenRow> = conn
+        .prepare("SELECT id, title, ts, info_hash, ep_ids FROM grab_ledger WHERE state IN ('dispatching','grabbed') AND backend = 'qbittorrent'")
         .ok()
         .map(|mut stmt| {
             stmt.query_map([], |r| {
@@ -938,8 +1007,17 @@ async fn completion_pass(app: &tauri::AppHandle, state: &AppState) -> Vec<DeadGr
         // episodes to 'wanted' — put the truth back on the screen (and keep
         // the scheduler from grabbing a duplicate)
         let hash_running = h.as_ref().map(|x| running_hashes.contains(x)).unwrap_or(false);
-        if (hash_running || running_norms.contains(&norm)) && !linked.is_empty() {
-            db::set_episodes_state_by_ids(&conn, &linked, "grabbed", Some(&title));
+        if hash_running || running_norms.contains(&norm) {
+            if let Err(error) = db::ledger_confirm_present(&conn, id, &title, &linked) {
+                crate::applog::error(
+                    "scheduler",
+                    format!("could not recover pending ledger row {id}: {error}"),
+                );
+            } else if !linked.is_empty() {
+                // Also repairs linked episodes after an unfollow/refollow when
+                // the ledger was already finalized before this pass.
+                db::set_episodes_state_by_ids(&conn, &linked, "grabbed", Some(&title));
+            }
         }
     }
 
@@ -1031,19 +1109,22 @@ async fn run_cycle_inner(app: &tauri::AppHandle, state: &AppState) -> Result<usi
     const MAX_GRABS_PER_CYCLE: usize = 6;
     let disk_ok = {
         let cfg = state.config.read().await.clone();
-        let q = crate::qbit::QbitClient {
-            http: &state.http,
-            base: cfg.qbit_url.clone(),
-            username: cfg.qbit_username.clone(),
-            password: cfg.qbit_password.clone(),
-        };
-        match q.free_space().await {
+        match crate::grab::selected_backend_free_bytes(&state.http, &cfg).await {
             Ok(free) => (free as f64) >= cfg.agent_min_free_disk_gb.max(5.0) * 1e9,
-            Err(_) => true, // can't tell — don't block grabs on a hiccup
+            Err(error) => {
+                crate::applog::warn(
+                    "scheduler",
+                    format!("could not verify selected-backend capacity — no automatic grabs this cycle ({error})"),
+                );
+                false
+            }
         }
     };
     if !disk_ok {
-        crate::applog::warn("scheduler", "free disk below the floor — no grabs this cycle");
+        crate::applog::warn(
+            "scheduler",
+            "selected-backend capacity is below the floor or could not be verified — no grabs this cycle",
+        );
     }
     crate::applog::info(
         "scheduler",
@@ -1146,6 +1227,21 @@ mod tests {
             relevant: true,
             parsed,
         }
+    }
+
+    #[test]
+    fn magnet_identity_is_persisted_in_qbittorrents_hex_form() {
+        assert_eq!(
+            magnet_hash(Some(
+                "magnet:?dn=renamed&xt=urn%3Abtih%3A0123456789ABCDEF0123456789ABCDEF01234567"
+            )),
+            Some("0123456789abcdef0123456789abcdef01234567".into())
+        );
+        assert_eq!(
+            magnet_hash(Some("magnet:?xt=urn:btih:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")),
+            Some("0000000000000000000000000000000000000000".into())
+        );
+        assert_eq!(magnet_hash(Some("magnet:?xt=urn:btih:not-a-hash")), None);
     }
 
     #[test]

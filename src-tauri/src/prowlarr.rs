@@ -1,6 +1,15 @@
 use serde::{Deserialize, Serialize};
 use crate::error::{AppError, Result};
 
+const MAX_TORRENT_BYTES: usize = 32 * 1024 * 1024;
+const MAX_DOWNLOAD_REDIRECTS: usize = 5;
+
+fn same_origin(left: &url::Url, right: &url::Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProwlarrRelease {
@@ -339,51 +348,82 @@ impl<'a> ProwlarrClient<'a> {
 
     /// Fetch .torrent bytes through Prowlarr's proxy (keeps passkeys server-side).
     pub async fn fetch_torrent(&self, download_url: &str) -> Result<(Vec<u8>, Option<String>)> {
-        // the download_url comes from indexer data — only hand Prowlarr's API
-        // key to Prowlarr itself, never to an arbitrary host it points at
-        let same_host = url::Url::parse(download_url)
-            .ok()
-            .zip(url::Url::parse(&self.base).ok())
-            .map(|(u, b)| u.host_str() == b.host_str() && u.port_or_known_default() == b.port_or_known_default())
-            .unwrap_or(false);
-        // a magnet in the download link is a redirect target — capture it
-        if download_url.starts_with("magnet:") {
-            return Ok((Vec::new(), Some(download_url.to_string())));
+        let base = url::Url::parse(&self.base)
+            .map_err(|e| AppError::Other(format!("invalid Prowlarr URL: {e}")))?;
+        let mut current = url::Url::parse(download_url)
+            .map_err(|e| AppError::Other(format!("invalid indexer download URL: {e}")))?;
+        if current.scheme() == "magnet" {
+            return Ok((Vec::new(), Some(current.to_string())));
         }
-        let mut req = self.http.get(download_url);
-        if same_host {
-            req = req.header("X-Api-Key", &self.api_key);
+        if !matches!(current.scheme(), "http" | "https") {
+            return Err(AppError::Other(
+                "indexer download URL must use HTTP, HTTPS, or magnet".into(),
+            ));
         }
-        let resp = req.send().await?;
-        // Prowlarr's /download answers with a redirect TO A MAGNET for
-        // magnet-only indexers (Knaben, TPB…). reqwest can't follow a
-        // non-http scheme, so the 3xx surfaces here — the magnet is in the
-        // Location header, not an error. (Seen live: every Knaben grab
-        // without an inline magnet failed with "rejected the request (301)".)
-        if resp.status().is_redirection() {
-            if let Some(loc) = resp
+
+        // The shared client follows redirects automatically, which would also
+        // forward our custom X-Api-Key header. Follow manually so the key is
+        // attached only to Prowlarr's exact origin and never to an indexer.
+        let download_client = reqwest::Client::builder()
+            .cookie_store(true)
+            .redirect(reqwest::redirect::Policy::none())
+            .user_agent(format!("trawler/{}", env!("CARGO_PKG_VERSION")))
+            .timeout(std::time::Duration::from_secs(60))
+            .build()?;
+
+        let mut response = None;
+        for redirects in 0..=MAX_DOWNLOAD_REDIRECTS {
+            let mut request = download_client.get(current.clone());
+            if same_origin(&current, &base) {
+                request = request.header("X-Api-Key", &self.api_key);
+            }
+            let resp = request.send().await?;
+            if !resp.status().is_redirection() {
+                response = Some(Self::check(resp).await?);
+                break;
+            }
+            if redirects == MAX_DOWNLOAD_REDIRECTS {
+                return Err(AppError::Other(format!(
+                    "indexer download exceeded {MAX_DOWNLOAD_REDIRECTS} redirects"
+                )));
+            }
+            let location = resp
                 .headers()
                 .get(reqwest::header::LOCATION)
                 .and_then(|v| v.to_str().ok())
-            {
-                if loc.starts_with("magnet:") {
-                    return Ok((Vec::new(), Some(loc.to_string())));
-                }
+                .ok_or_else(|| AppError::Other("indexer returned a redirect without a valid Location".into()))?;
+            let next = current
+                .join(location)
+                .or_else(|_| url::Url::parse(location))
+                .map_err(|e| AppError::Other(format!("invalid indexer redirect: {e}")))?;
+            if next.scheme() == "magnet" {
+                return Ok((Vec::new(), Some(next.to_string())));
             }
+            if !matches!(next.scheme(), "http" | "https") {
+                return Err(AppError::Other(format!(
+                    "indexer redirected to unsupported scheme {}",
+                    next.scheme()
+                )));
+            }
+            current = next;
         }
-        let resp = Self::check(resp).await?;
-        // A "torrent" download link can still bounce to a magnet redirect.
-        let final_url = resp.url().to_string();
-        if final_url.starts_with("magnet:") {
-            return Ok((Vec::new(), Some(final_url)));
+        let mut resp = response.ok_or_else(|| AppError::Other("indexer download did not return a response".into()))?;
+        if resp.content_length().is_some_and(|n| n > MAX_TORRENT_BYTES as u64) {
+            return Err(AppError::Other(format!(
+                "torrent file is larger than the {} MB safety limit",
+                MAX_TORRENT_BYTES / 1024 / 1024
+            )));
         }
-        let name = resp
-            .headers()
-            .get("content-disposition")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.split("filename=").nth(1))
-            .map(|v| v.trim_matches(['"', '\'', ';', ' ']).to_string());
-        let bytes = resp.bytes().await?.to_vec();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            if bytes.len().saturating_add(chunk.len()) > MAX_TORRENT_BYTES {
+                return Err(AppError::Other(format!(
+                    "torrent file is larger than the {} MB safety limit",
+                    MAX_TORRENT_BYTES / 1024 / 1024
+                )));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
         if bytes.starts_with(b"magnet:") {
             let m = String::from_utf8_lossy(&bytes).trim().to_string();
             return Ok((Vec::new(), Some(m)));
@@ -396,7 +436,81 @@ impl<'a> ProwlarrClient<'a> {
                 String::from_utf8_lossy(&bytes[..bytes.len().min(40)])
             )));
         }
-        let _ = name;
         Ok((bytes, None))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn one_shot_server(response: String) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 8192];
+            let count = socket.read(&mut request).await.unwrap();
+            socket.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8_lossy(&request[..count]).to_string()
+        });
+        (format!("http://{address}"), task)
+    }
+
+    #[tokio::test]
+    async fn redirect_does_not_leak_prowlarr_api_key() {
+        let body = "d3:foo3:bare";
+        let external_response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (external, external_task) = one_shot_server(external_response).await;
+        let prowlarr_response = format!(
+            "HTTP/1.1 302 Found\r\nLocation: {external}/file.torrent\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let (prowlarr, prowlarr_task) = one_shot_server(prowlarr_response).await;
+        let http = reqwest::Client::builder().build().unwrap();
+        let client = ProwlarrClient {
+            http: &http,
+            base: prowlarr.clone(),
+            api_key: "top-secret".into(),
+        };
+
+        let (bytes, magnet) = client
+            .fetch_torrent(&format!("{prowlarr}/download"))
+            .await
+            .unwrap();
+        assert_eq!(bytes, body.as_bytes());
+        assert!(magnet.is_none());
+        assert!(
+            prowlarr_task
+                .await
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("x-api-key: top-secret")
+        );
+        assert!(!external_task.await.unwrap().contains("top-secret"));
+    }
+
+    #[tokio::test]
+    async fn oversized_torrent_is_rejected_before_reading_body() {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            MAX_TORRENT_BYTES + 1
+        );
+        let (server, task) = one_shot_server(response).await;
+        let http = reqwest::Client::builder().build().unwrap();
+        let client = ProwlarrClient {
+            http: &http,
+            base: server.clone(),
+            api_key: "key".into(),
+        };
+        let error = client
+            .fetch_torrent(&format!("{server}/download"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("safety limit"));
+        let _ = task.await.unwrap();
     }
 }

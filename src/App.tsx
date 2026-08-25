@@ -52,9 +52,19 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    void loadConfig().then(refreshStatus);
-    const t = setInterval(refreshStatus, 30_000);
-    return () => clearInterval(t);
+    let active = true;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const poll = async () => {
+      await refreshStatus();
+      if (active) timer = setTimeout(poll, 30_000);
+    };
+    void loadConfig().then(() => {
+      if (active) void poll();
+    });
+    return () => {
+      active = false;
+      if (timer !== null) clearTimeout(timer);
+    };
   }, [loadConfig, refreshStatus]);
 
   useEffect(() => {

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   AppWindow,
   ScrollText,
@@ -20,7 +20,7 @@ import {
 import { api, inTauri, type Config, type NotifyTestOutcome, type QualityProfile } from "../lib/api";
 import { sameProfile } from "../lib/format";
 import { checkForUpdate, currentVersion } from "../lib/updater";
-import { isMac } from "../lib/platform";
+import { desktopPlatform } from "../lib/platform";
 import { useStore } from "../store";
 import { Button, Chip, Field, NumInput, Segmented, TextInput, cx } from "../components/ui";
 import IndexerManager from "../components/IndexerManager";
@@ -58,9 +58,32 @@ export default function SettingsView() {
   const [notifTesting, setNotifTesting] = useState(false);
   const [notifTest, setNotifTest] = useState<NotifyTestOutcome | null>(null);
   const [notifError, setNotifError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
+  const baseConfigRef = useRef<Config | null>(config);
+  const draftRef = useRef<Config | null>(draft);
+  draftRef.current = draft;
 
   useEffect(() => {
-    setDraft(config);
+    if (!config) {
+      setDraft(null);
+      baseConfigRef.current = null;
+      return;
+    }
+    const previousBase = baseConfigRef.current;
+    setDraft((current) => {
+      if (
+        current === null ||
+        JSON.stringify(current) === JSON.stringify(previousBase) ||
+        JSON.stringify(current) === JSON.stringify(config)
+      ) {
+        return config;
+      }
+      // A save response landed after the user made a newer edit. Keep that
+      // edit dirty instead of replacing it with the submitted snapshot.
+      return current;
+    });
+    baseConfigRef.current = config;
   }, [config]);
 
   // a test verdict only describes the credentials it actually tested
@@ -69,21 +92,54 @@ export default function SettingsView() {
     setNotifError(null);
   }, [tab, draft?.discordWebhook, draft?.telegramBotToken, draft?.telegramChatId]);
 
+  useEffect(() => {
+    setTest(null);
+  }, [draft?.prowlarrUrl, draft?.prowlarrApiKey, draft?.qbitUrl, draft?.qbitUsername, draft?.qbitPassword]);
+
   if (!draft) return null;
 
-  const set = (patch: Partial<Config>) => setDraft({ ...draft, ...patch });
+  const set = (patch: Partial<Config>) =>
+    setDraft((current) => (current ? { ...current, ...patch } : current));
   const dirty = JSON.stringify(draft) !== JSON.stringify(config);
+
+  const persist = async (snapshot: Config): Promise<boolean> => {
+    if (savingRef.current) return false;
+    savingRef.current = true;
+    setSaving(true);
+    try {
+      return await saveConfig(snapshot);
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
+    }
+  };
+
+  const connectionFingerprint = (value: Config) =>
+    JSON.stringify([
+      value.prowlarrUrl,
+      value.prowlarrApiKey,
+      value.qbitUrl,
+      value.qbitUsername,
+      value.qbitPassword,
+    ]);
 
   const runTest = async () => {
     setTesting(true);
     setTest(null);
+    const snapshot = draft;
+    const fingerprint = connectionFingerprint(snapshot);
     try {
       // Test with the *draft* values by saving first if dirty — simplest honest behavior.
-      if (dirty && !(await saveConfig(draft))) return; // toast already shown
+      if (dirty && !(await persist(snapshot))) return; // toast already shown
       const s = await api.testConnections();
+      const current = draftRef.current;
+      if (!current || connectionFingerprint(current) !== fingerprint) return;
       setTest({ pOk: s.prowlarrOk, p: s.prowlarrDetail, qOk: s.qbitOk, q: s.qbitDetail });
     } catch (e) {
-      setTest({ pOk: false, p: String(e), qOk: false, q: String(e) });
+      const current = draftRef.current;
+      if (current && connectionFingerprint(current) === fingerprint) {
+        setTest({ pOk: false, p: String(e), qOk: false, q: String(e) });
+      }
     } finally {
       setTesting(false);
     }
@@ -93,11 +149,33 @@ export default function SettingsView() {
     setNotifTesting(true);
     setNotifTest(null);
     setNotifError(null);
+    const snapshot = draft;
+    const fingerprint = JSON.stringify([
+      snapshot.discordWebhook,
+      snapshot.telegramBotToken,
+      snapshot.telegramChatId,
+    ]);
     try {
-      if (dirty && !(await saveConfig(draft))) return; // toast already shown
-      setNotifTest(await api.notifyTest());
+      if (dirty && !(await persist(snapshot))) return; // toast already shown
+      const result = await api.notifyTest();
+      const current = draftRef.current;
+      if (
+        !current ||
+        JSON.stringify([current.discordWebhook, current.telegramBotToken, current.telegramChatId]) !==
+          fingerprint
+      ) {
+        return;
+      }
+      setNotifTest(result);
     } catch (e) {
-      setNotifError(String(e));
+      const current = draftRef.current;
+      if (
+        current &&
+        JSON.stringify([current.discordWebhook, current.telegramBotToken, current.telegramChatId]) ===
+          fingerprint
+      ) {
+        setNotifError(String(e));
+      }
     } finally {
       setNotifTesting(false);
     }
@@ -110,7 +188,11 @@ export default function SettingsView() {
         <p className="mt-0.5 text-[12px] text-faint">
           Stored locally in{" "}
           <span className="font-mono text-[11px]">
-            {isMac ? "~/Library/Application Support/trawler/config.json" : "%APPDATA%\\trawler\\config.json"}
+            {desktopPlatform === "macos"
+              ? "~/Library/Application Support/trawler/config.json"
+              : desktopPlatform === "windows"
+                ? "%APPDATA%\\trawler\\config.json"
+                : "~/.config/trawler/config.json"}
           </span>
         </p>
       </div>
@@ -207,10 +289,10 @@ export default function SettingsView() {
               </label>
             </div>
             <Field label="Movies save path" hint="Blank = qBittorrent default">
-              <TextInput mono value={draft.savePathMovies} onChange={(v) => set({ savePathMovies: v })} placeholder={isMac ? "/Volumes/Media/Movies" : "D:\\Media\\Movies"} />
+              <TextInput mono value={draft.savePathMovies} onChange={(v) => set({ savePathMovies: v })} placeholder={desktopPlatform === "macos" ? "/Volumes/Media/Movies" : desktopPlatform === "windows" ? "D:\\Media\\Movies" : "/mnt/media/Movies"} />
             </Field>
             <Field label="TV save path" hint="Blank = qBittorrent default">
-              <TextInput mono value={draft.savePathTv} onChange={(v) => set({ savePathTv: v })} placeholder={isMac ? "/Volumes/Media/TV" : "D:\\Media\\TV"} />
+              <TextInput mono value={draft.savePathTv} onChange={(v) => set({ savePathTv: v })} placeholder={desktopPlatform === "macos" ? "/Volumes/Media/TV" : desktopPlatform === "windows" ? "D:\\Media\\TV" : "/mnt/media/TV"} />
             </Field>
             <Field
               label="Seeding after download"
@@ -395,7 +477,7 @@ export default function SettingsView() {
         )}
 
         {tab === "notifications" && (<>
-        <Card title={isMac ? "macOS" : "Windows"} sub="Native notifications from the app itself">
+        <Card title={desktopPlatform === "macos" ? "macOS" : desktopPlatform === "windows" ? "Windows" : "Linux"} sub="Native notifications from the app itself">
           <label className="flex cursor-pointer items-center gap-2 text-[12.5px] text-dim">
             <input
               type="checkbox"
@@ -534,7 +616,7 @@ export default function SettingsView() {
           <div className="mt-3 border-t border-line/60 pt-3">
             <Button
               onClick={async () => {
-                await saveConfig({ ...draft, setupCompleted: false });
+                await persist({ ...draft, setupCompleted: false });
               }}
               className="text-[12px]"
               title="Re-check qBittorrent and Prowlarr, install anything missing"
@@ -550,7 +632,7 @@ export default function SettingsView() {
       {/* pinned action bar */}
       <div className="border-t border-line bg-bg1/60 px-6 py-3">
         <div className="flex max-w-[680px] items-center gap-2.5">
-          <Button variant="primary" disabled={!dirty} onClick={() => saveConfig(draft)}>
+          <Button variant="primary" busy={saving} disabled={!dirty || saving} onClick={() => void persist(draft)}>
             Save changes
           </Button>
           {(tab === "indexers" || tab === "logs") && (
@@ -561,7 +643,7 @@ export default function SettingsView() {
             </span>
           )}
           {tab === "connections" && (
-            <Button onClick={runTest} busy={testing}>
+            <Button onClick={runTest} busy={testing} disabled={saving}>
               <PlugZap size={13} />
               {dirty ? "Save & test connections" : "Test connections"}
             </Button>
@@ -570,7 +652,7 @@ export default function SettingsView() {
             <Button
               onClick={runNotifTest}
               busy={notifTesting}
-              disabled={!draft.discordWebhook.trim() && !(draft.telegramBotToken.trim() && draft.telegramChatId.trim())}
+              disabled={saving || (!draft.discordWebhook.trim() && !(draft.telegramBotToken.trim() && draft.telegramChatId.trim()))}
               title="Sends a test message to every configured channel"
             >
               <BellRing size={13} />
@@ -691,7 +773,14 @@ function AutostartToggle() {
     try {
       await api.setAutostart(want);
       setEnabled(want);
-      toast(want ? (isMac ? "Trawler will start at login" : "Trawler will start with Windows") : "Autostart disabled", "ok");
+      toast(
+        want
+          ? desktopPlatform === "windows"
+            ? "Trawler will start with Windows"
+            : "Trawler will start at login"
+          : "Autostart disabled",
+        "ok",
+      );
     } catch (e) {
       toast(String(e), "bad");
     }
@@ -712,7 +801,7 @@ function AutostartToggle() {
         onChange={(e) => flip(e.target.checked)}
         className="size-3.5 accent-(--color-accent)"
       />
-      {isMac ? "Start at login" : "Start with Windows"}
+      {desktopPlatform === "windows" ? "Start with Windows" : "Start at login"}
     </label>
   );
 }

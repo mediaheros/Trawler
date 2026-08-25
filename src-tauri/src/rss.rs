@@ -295,17 +295,18 @@ pub async fn sweep(app: &AppHandle) -> Result<SweepStats> {
         }
     }
 
-    // free-disk floor, checked once per sweep (best effort)
+    // Selected-backend capacity floor, checked once per sweep. Automated grabs fail closed:
+    // an unavailable measurement is not permission to fill an unknown disk.
     let free_disk_ok = {
-        let q = crate::qbit::QbitClient {
-            http: &state.http,
-            base: cfg.qbit_url.clone(),
-            username: cfg.qbit_username.clone(),
-            password: cfg.qbit_password.clone(),
-        };
-        match q.free_space().await {
+        match crate::grab::selected_backend_free_bytes(&state.http, &cfg).await {
             Ok(free) => (free as f64) >= cfg.agent_min_free_disk_gb * 1e9,
-            Err(_) => true,
+            Err(error) => {
+                crate::applog::warn(
+                    "rss",
+                    format!("could not verify selected-backend capacity — no automatic grabs this sweep ({error})"),
+                );
+                false
+            }
         }
     };
 

@@ -44,12 +44,26 @@ pub fn client_secret() -> String {
     std::env::var("TRAWLER_BITPORT_CLIENT_SECRET").unwrap_or_else(|_| CLIENT_SECRET.into())
 }
 
-pub fn authorize_url() -> String {
+pub fn new_oauth_state() -> Result<String> {
+    use base64::Engine;
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|e| AppError::Other(format!("could not create OAuth state: {e}")))?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
+pub fn authorize_url(state: Option<&str>) -> String {
     let redirect: String = url::form_urlencoded::byte_serialize(redirect_uri().as_bytes()).collect();
-    format!(
+    let mut url = format!(
         "https://api.bitport.io/v2/oauth2/authorize?response_type=code&client_id={}&redirect_uri={redirect}",
         client_id()
-    )
+    );
+    if let Some(state) = state {
+        let state: String = url::form_urlencoded::byte_serialize(state.as_bytes()).collect();
+        url.push_str("&state=");
+        url.push_str(&state);
+    }
+    url
 }
 
 /// Claim the callback port BEFORE the browser opens, so a fast approval can
@@ -70,8 +84,19 @@ pub async fn bind_callback() -> Result<tokio::net::TcpListener> {
         })
 }
 
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
 fn callback_page(ok: bool, headline: &str, detail: &str) -> String {
     let accent = if ok { "#2dd4bf" } else { "#f87171" };
+    let headline = html_escape(headline);
+    let detail = html_escape(detail);
     let body = format!(
         "<!doctype html><meta charset=utf-8><title>Trawler</title>\
 <body style=\"margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;\
@@ -92,6 +117,7 @@ background:#0b0f14;color:#e6edf3;font:15px/1.5 -apple-system,Segoe UI,system-ui,
 pub async fn await_code(
     listener: tokio::net::TcpListener,
     timeout: std::time::Duration,
+    expected_state: &str,
 ) -> Result<String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let deadline = tokio::time::Instant::now() + timeout;
@@ -119,13 +145,31 @@ pub async fn await_code(
         let query = target.split_once('?').map(|(_, q)| q).unwrap_or("");
         let mut code: Option<String> = None;
         let mut denied: Option<String> = None;
+        let mut returned_state: Option<String> = None;
         for (k, v) in url::form_urlencoded::parse(query.as_bytes()) {
             match k.as_ref() {
                 "code" => code = Some(v.into_owned()),
                 "error_description" => denied = Some(v.into_owned()),
                 "error" => denied = denied.or_else(|| Some(v.into_owned())),
+                "state" => returned_state = Some(v.into_owned()),
                 _ => {}
             }
+        }
+        if (code.is_some() || denied.is_some())
+            && returned_state.as_deref() != Some(expected_state)
+        {
+            let _ = sock
+                .write_all(
+                    callback_page(
+                        false,
+                        "Not connected",
+                        "This approval did not belong to the current Trawler request. Return to Trawler and try again.",
+                    )
+                    .as_bytes(),
+                )
+                .await;
+            let _ = sock.flush().await;
+            continue;
         }
         if let Some(c) = code.filter(|c| !c.is_empty()) {
             let _ = sock
@@ -253,13 +297,7 @@ impl BitportClient<'_> {
 
     pub async fn transfers(&self) -> Result<Vec<BitportTransfer>> {
         let d = self.get("/transfers").await?;
-        // a shape-drifted response must be an ERROR, not an empty account —
-        // the completion pass reaps rows whose transfers are absent, and a
-        // silent [] here would release every cloud grab at once
-        let arr = d.as_array().ok_or_else(|| {
-            AppError::Other("Bitport transfers: unexpected response shape (not a list)".into())
-        })?;
-        Ok(arr.iter().filter_map(parse_transfer).collect())
+        parse_transfers(&d)
     }
 
     /// Submit a magnet to the cloud; returns the new transfer's token when
@@ -274,8 +312,27 @@ impl BitportClient<'_> {
             .form(&[("torrent", torrent)])
             .timeout(std::time::Duration::from_secs(30))
             .send()
-            .await?;
-        let d = unwrap_envelope(resp.json().await?)?;
+            .await
+            .map_err(|error| {
+                if error.is_connect() || error.is_builder() {
+                    AppError::Http(error)
+                } else {
+                    AppError::DispatchUncertain(format!(
+                        "Bitport may have accepted the transfer, but its response was lost ({error}); Trawler will reconcile it before retrying"
+                    ))
+                }
+            })?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(bitport_add_status_error(status, &body));
+        }
+        let response = resp.json().await.map_err(|error| {
+            AppError::DispatchUncertain(format!(
+                "Bitport may have accepted the transfer, but its response could not be read ({error}); Trawler will reconcile it before retrying"
+            ))
+        })?;
+        let d = unwrap_envelope(response)?;
         Ok(token_from_add_response(&d))
     }
 
@@ -299,6 +356,19 @@ fn token_from_add_response(d: &serde_json::Value) -> Option<String> {
     obj.get("token").and_then(|v| v.as_str()).map(str::to_string)
 }
 
+fn bitport_add_status_error(status: reqwest::StatusCode, body: &str) -> AppError {
+    if status == reqwest::StatusCode::REQUEST_TIMEOUT || status.is_server_error() {
+        AppError::DispatchUncertain(format!(
+            "Bitport may have accepted the transfer before returning {status}; Trawler will reconcile it before retrying"
+        ))
+    } else {
+        AppError::Other(format!(
+            "Bitport rejected the transfer ({status}): {}",
+            body.chars().take(300).collect::<String>()
+        ))
+    }
+}
+
 /// Users paste either the bare authorization code or the whole redirect URL
 /// from the address bar — accept both.
 pub fn extract_code(input: &str) -> String {
@@ -315,9 +385,31 @@ pub fn extract_code(input: &str) -> String {
     }
 }
 
-fn parse_transfer(v: &serde_json::Value) -> Option<BitportTransfer> {
-    Some(BitportTransfer {
-        token: v.get("token")?.as_str()?.to_string(),
+fn parse_transfers(d: &serde_json::Value) -> Result<Vec<BitportTransfer>> {
+    // A partially malformed listing is not authoritative absence. Silently
+    // dropping one item can make reconciliation retire and duplicate the
+    // corresponding live cloud transfer.
+    let arr = d.as_array().ok_or_else(|| {
+        AppError::Other("Bitport transfers: unexpected response shape (not a list)".into())
+    })?;
+    arr.iter()
+        .enumerate()
+        .map(|(index, value)| {
+            parse_transfer(value).map_err(|error| {
+                AppError::Other(format!("Bitport transfers: malformed item {index}: {error}"))
+            })
+        })
+        .collect()
+}
+
+fn parse_transfer(v: &serde_json::Value) -> std::result::Result<BitportTransfer, &'static str> {
+    let token = v
+        .get("token")
+        .and_then(|token| token.as_str())
+        .filter(|token| !token.is_empty())
+        .ok_or("missing transfer token")?;
+    Ok(BitportTransfer {
+        token: token.to_string(),
         name: v.get("name").and_then(|n| n.as_str()).unwrap_or("(unnamed)").to_string(),
         status: v.get("status").and_then(|s| s.as_str()).unwrap_or("unknown").to_string(),
         substatus: v.get("substatus").and_then(|s| s.as_str()).map(String::from),
@@ -368,6 +460,16 @@ mod tests {
     }
 
     #[test]
+    fn oauth_url_carries_state_and_callback_text_is_escaped() {
+        let url = authorize_url(Some("state with + symbols"));
+        assert!(url.contains("state=state+with+%2B+symbols"));
+        let page = callback_page(false, "No <script>", "bad & \"worse\"");
+        assert!(!page.contains("<script>"));
+        assert!(page.contains("No &lt;script&gt;"));
+        assert!(page.contains("bad &amp; &quot;worse&quot;"));
+    }
+
+    #[test]
     fn progress_parses_defensively() {
         use serde_json::json;
         assert_eq!(parse_progress(Some(&json!(""))), 0.0);
@@ -376,6 +478,34 @@ mod tests {
         assert_eq!(parse_progress(Some(&json!(63.5))), 63.5);
         assert_eq!(parse_progress(Some(&json!("150"))), 100.0);
         assert_eq!(parse_progress(None), 0.0);
+    }
+
+    #[test]
+    fn malformed_transfer_items_fail_the_whole_listing() {
+        use serde_json::json;
+        let listing = json!([
+            {"token": "valid", "name": "one", "status": "downloading"},
+            {"name": "missing identity", "status": "downloading"}
+        ]);
+        let error = parse_transfers(&listing).unwrap_err();
+        assert!(error.to_string().contains("malformed item 1"));
+        assert!(error.to_string().contains("missing transfer token"));
+    }
+
+    #[test]
+    fn ambiguous_bitport_statuses_keep_the_durable_claim() {
+        assert!(matches!(
+            bitport_add_status_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, "oops"),
+            AppError::DispatchUncertain(_)
+        ));
+        assert!(matches!(
+            bitport_add_status_error(reqwest::StatusCode::REQUEST_TIMEOUT, "late"),
+            AppError::DispatchUncertain(_)
+        ));
+        assert!(matches!(
+            bitport_add_status_error(reqwest::StatusCode::BAD_REQUEST, "bad magnet"),
+            AppError::Other(_)
+        ));
     }
 
     #[test]

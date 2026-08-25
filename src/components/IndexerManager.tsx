@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, Loader2, Plus, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
 import { api, onSetupStep, type FlaresolverrStatus, type Indexer, type IndexerDef } from "../lib/api";
 import { useStore } from "../store";
@@ -25,19 +25,32 @@ export default function IndexerManager() {
   const [browse, setBrowse] = useState(false);
   const [filter, setFilter] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
+  const [pendingRemove, setPendingRemove] = useState<number | null>(null);
+  const mutationRef = useRef(false);
+  const loadSeq = useRef(0);
 
   const load = useCallback(async () => {
+    const mine = ++loadSeq.current;
     try {
-      setInstalled(await api.listIndexers());
+      const next = await api.listIndexers();
+      if (mine === loadSeq.current) setInstalled(next);
     } catch (e) {
-      setInstalled([]);
-      toast(String(e), "bad");
+      if (mine === loadSeq.current) {
+        setInstalled([]);
+        toast(String(e), "bad");
+      }
     }
   }, [toast]);
 
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    if (pendingRemove === null) return;
+    const timer = window.setTimeout(() => setPendingRemove(null), 3000);
+    return () => window.clearTimeout(timer);
+  }, [pendingRemove]);
 
   useEffect(() => {
     if (browse && defs === null) {
@@ -54,6 +67,9 @@ export default function IndexerManager() {
   );
 
   const add = async (name: string) => {
+    if (mutationRef.current) return;
+    mutationRef.current = true;
+    ++loadSeq.current;
     setBusy(name);
     try {
       const added = await api.addIndexer(name);
@@ -69,11 +85,16 @@ export default function IndexerManager() {
         "bad",
       );
     } finally {
+      mutationRef.current = false;
       setBusy(null);
     }
   };
 
   const toggle = async (ix: Indexer) => {
+    if (mutationRef.current) return;
+    mutationRef.current = true;
+    ++loadSeq.current;
+    setBusy(`toggle:${ix.id}`);
     try {
       await api.toggleIndexer(ix.id, !ix.enable);
       setInstalled((list) =>
@@ -85,16 +106,31 @@ export default function IndexerManager() {
       );
     } catch (e) {
       toast(String(e), "bad");
+    } finally {
+      mutationRef.current = false;
+      setBusy(null);
     }
   };
 
   const remove = async (ix: Indexer) => {
+    if (pendingRemove !== ix.id) {
+      setPendingRemove(ix.id);
+      return;
+    }
+    if (mutationRef.current) return;
+    mutationRef.current = true;
+    ++loadSeq.current;
+    setPendingRemove(null);
+    setBusy(`remove:${ix.id}`);
     try {
       await api.removeIndexer(ix.id);
       toast(`Removed ${ix.name}`, "info");
       await load();
     } catch (e) {
       toast(String(e), "bad");
+    } finally {
+      mutationRef.current = false;
+      setBusy(null);
     }
   };
 
@@ -128,6 +164,7 @@ export default function IndexerManager() {
                 <input
                   type="checkbox"
                   checked={ix.enable}
+                  disabled={busy !== null}
                   onChange={() => toggle(ix)}
                   className="size-3.5 accent-(--color-accent)"
                   title={ix.enable ? "Enabled — searched every query" : "Disabled"}
@@ -138,8 +175,9 @@ export default function IndexerManager() {
                 {ix.privacy ?? "public"}
               </Badge>
               <IconBtn
-                title="Remove from Prowlarr"
+                title={pendingRemove === ix.id ? `Click again to remove ${ix.name}` : "Remove from Prowlarr"}
                 onClick={() => remove(ix)}
+                disabled={busy !== null}
                 danger
                 reveal
                 className="ml-auto"
@@ -162,7 +200,7 @@ export default function IndexerManager() {
               <button
                 key={name}
                 type="button"
-                disabled={have || busy === name}
+                disabled={have || busy !== null}
                 onClick={() => add(name)}
                 className={cx(
                   "inline-flex cursor-pointer items-center gap-1 rounded-lg border px-2 py-1 text-[11.5px] transition-colors",
@@ -218,6 +256,7 @@ export default function IndexerManager() {
                   </div>
                   <Button
                     busy={busy === d.name}
+                    disabled={busy !== null}
                     onClick={() => add(d.name)}
                     className="shrink-0 px-2 py-0.5 text-[11px]"
                   >

@@ -43,13 +43,17 @@ export default function ShowsView() {
   };
 
   useEffect(() => {
-    void loadShows();
-    void loadActivity();
-    const t = setInterval(() => {
-      void loadShows();
-      void loadActivity();
-    }, 15_000);
-    return () => clearInterval(t);
+    let active = true;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const poll = async () => {
+      await Promise.all([loadShows(), loadActivity()]);
+      if (active) timer = setTimeout(poll, 15_000);
+    };
+    void poll();
+    return () => {
+      active = false;
+      if (timer !== null) clearTimeout(timer);
+    };
   }, [loadShows, loadActivity]);
 
   return (

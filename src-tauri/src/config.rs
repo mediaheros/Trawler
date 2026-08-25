@@ -26,17 +26,11 @@ impl Default for QualityProfile {
 }
 
 /// A named, reusable quality profile shown as one-click chips in the UI.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct QualityPreset {
     pub name: String,
     pub profile: QualityProfile,
-}
-
-impl Default for QualityPreset {
-    fn default() -> Self {
-        Self { name: String::new(), profile: QualityProfile::default() }
-    }
 }
 
 pub fn default_presets() -> Vec<QualityPreset> {
@@ -168,28 +162,109 @@ pub fn config_path() -> PathBuf {
     base.join("trawler").join("config.json")
 }
 
-pub fn load() -> Config {
-    let path = config_path();
-    let raw = std::fs::read_to_string(&path).ok();
-    let parsed = raw.as_deref().map(|s| serde_json::from_str::<Config>(s));
-    let mut cfg: Config = match parsed {
+/// The app directory contains credentials, agent conversations, private
+/// tracker URLs, and SQLite WAL files. Restrict the directory itself so even
+/// an old database created with a permissive umask is not traversable by
+/// other local users.
+pub fn ensure_private_app_dir(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn secure_existing_config_artifacts(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(dir) = path.parent() else {
+        return Ok(());
+    };
+    let config_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("config.json");
+    let stem = path.file_stem().and_then(|name| name.to_str()).unwrap_or("config");
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let is_secret_artifact = name == config_name
+            || name.starts_with(&format!("{config_name}.tmp"))
+            || name == format!("{stem}.tmp")
+            || name.starts_with(&format!("{stem}.tmp."))
+            || name.starts_with(&format!("{stem}.corrupt-"))
+            || name.starts_with(&format!("{config_name}.corrupt-"));
+        if is_secret_artifact {
+            std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn secure_existing_config_artifacts(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+fn load_from_path(path: &std::path::Path) -> Config {
+    if let Some(dir) = path.parent() {
+        if let Err(error) = ensure_private_app_dir(dir) {
+            crate::applog::error(
+                "app",
+                format!("could not secure the Trawler data directory: {error}"),
+            );
+        }
+    }
+    // Repair permissions before reading or copying any secret-bearing file.
+    if let Err(error) = secure_existing_config_artifacts(path) {
+        crate::applog::error(
+            "app",
+            format!("could not secure existing Trawler configuration files: {error}"),
+        );
+    }
+    let raw = std::fs::read_to_string(path).ok();
+    let parsed = raw.as_deref().map(serde_json::from_str::<Config>);
+    match parsed {
         Some(Ok(c)) => c,
         Some(Err(e)) => {
             // an unparseable config must never be silently replaced by
             // defaults — keep it so the user's keys can be recovered
-            let backup = path.with_extension(format!("corrupt-{}.json", crate::db::now()));
-            let _ = std::fs::copy(&path, &backup);
+            let backup = path.with_extension(format!(
+                "corrupt-{}-{}.json",
+                crate::db::now(),
+                std::process::id()
+            ));
+            let backup_saved = raw
+                .as_deref()
+                .map(|raw| write_private_file(&backup, raw.as_bytes()))
+                .transpose();
+            let recovery = match backup_saved {
+                Ok(Some(())) => format!("kept a private copy at {}", backup.display()),
+                Ok(None) => "the original file remains in place".into(),
+                Err(error) => format!(
+                    "could not create a backup ({error}); the original file remains at {}",
+                    path.display()
+                ),
+            };
             crate::applog::error(
                 "app",
                 format!(
-                    "config.json could not be read ({e}); kept a copy at {} and started with defaults",
-                    backup.display()
+                    "config.json could not be read ({e}); {recovery}; started with defaults"
                 ),
             );
             Config::default()
         }
         None => Config::default(),
-    };
+    }
+}
+
+pub fn load() -> Config {
+    let path = config_path();
+    let mut cfg = load_from_path(&path);
     // migration: an install configured before the wizard existed counts as set up
     if !cfg.setup_completed && !cfg.prowlarr_api_key.is_empty() {
         cfg.setup_completed = true;
@@ -206,7 +281,7 @@ pub fn save(cfg: &Config) -> Result<()> {
 
     let path = config_path();
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+        ensure_private_app_dir(dir)?;
     }
     // atomic: a crash mid-write must not truncate the user's settings. The
     // tmp name carries the pid so a crashed save can't collide with a later
@@ -214,11 +289,145 @@ pub fn save(cfg: &Config) -> Result<()> {
     let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
     {
         let json = serde_json::to_string_pretty(cfg)?;
-        let mut f = std::fs::File::create(&tmp)?;
-        use std::io::Write;
-        f.write_all(json.as_bytes())?;
-        f.sync_all()?;
+        write_private_file(&tmp, json.as_bytes())?;
     }
-    std::fs::rename(&tmp, &path)?;
+    replace_file(&tmp, &path)?;
     Ok(())
+}
+
+fn write_private_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    // `mode` only applies when the file is first created. A stale temp file
+    // from a crashed save may already exist with broader permissions.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    use std::io::Write;
+    file.write_all(contents)?;
+    file.sync_all()
+}
+
+/// Atomically replace an existing config. POSIX rename overwrites; Windows'
+/// standard-library rename does not, so use the native replace flag there.
+#[cfg(not(windows))]
+fn replace_file(source: &std::path::Path, destination: &std::path::Path) -> std::io::Result<()> {
+    std::fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn replace_file(source: &std::path::Path, destination: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination.as_os_str().encode_wide().chain(Some(0)).collect();
+    let ok = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{load_from_path, replace_file, write_private_file};
+
+    #[test]
+    fn atomic_replace_overwrites_an_existing_file() {
+        let root = std::env::temp_dir().join(format!(
+            "trawler-config-replace-{}-{}",
+            std::process::id(),
+            crate::db::now()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let destination = root.join("config.json");
+        let source = root.join("config.tmp");
+        std::fs::write(&destination, b"old").unwrap();
+        std::fs::write(&source, b"new").unwrap();
+
+        replace_file(&source, &destination).unwrap();
+
+        assert_eq!(std::fs::read(&destination).unwrap(), b"new");
+        assert!(!source.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_temp_file_is_owner_only_even_when_reused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "trawler-config-private-{}-{}",
+            std::process::id(),
+            crate::db::now()
+        ));
+        std::fs::write(&path, b"stale").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_private_file(&path, b"secret").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"secret");
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_repairs_existing_secret_artifact_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "trawler-config-upgrade-{}-{}",
+            std::process::id(),
+            crate::db::now()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = root.join("config.json");
+        let artifacts = [
+            config.clone(),
+            root.join("config.json.tmp"),
+            root.join("config.tmp"),
+            root.join("config.corrupt-old.json"),
+        ];
+        for artifact in &artifacts {
+            std::fs::write(artifact, b"{").unwrap();
+            std::fs::set_permissions(artifact, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        let _ = load_from_path(&config);
+
+        assert_eq!(std::fs::metadata(&root).unwrap().permissions().mode() & 0o777, 0o700);
+        for entry in std::fs::read_dir(&root).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                assert_eq!(
+                    entry.metadata().unwrap().permissions().mode() & 0o777,
+                    0o600,
+                    "{} was not repaired",
+                    entry.path().display()
+                );
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

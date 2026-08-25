@@ -13,6 +13,28 @@ use crate::AppState;
 
 // ---------- chat ----------
 
+struct AgentChatLease<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for AgentChatLease<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+fn claim_agent_chat<'a>(
+    flag: &'a std::sync::atomic::AtomicBool,
+    conflict: &str,
+) -> Result<AgentChatLease<'a>> {
+    flag.compare_exchange(
+        false,
+        true,
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+    )
+    .map_err(|_| AppError::Other(conflict.into()))?;
+    Ok(AgentChatLease(flag))
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatRow {
@@ -55,6 +77,10 @@ pub async fn agent_history(state: State<'_, AppState>) -> Result<Vec<ChatRow>> {
 
 #[tauri::command]
 pub async fn agent_clear(state: State<'_, AppState>) -> Result<()> {
+    let _lease = claim_agent_chat(
+        &state.agent_chat_busy,
+        "wait for the active agent run to finish before clearing the conversation",
+    )?;
     let conn = state.db.lock().await;
     conn.execute("DELETE FROM chat_messages", []).map_err(db::db_err)?;
     Ok(())
@@ -96,7 +122,11 @@ pub async fn agent_send(app: tauri::AppHandle, state: State<'_, AppState>, text:
     if !cfg.agent_enabled {
         return Err(AppError::Other("the agent is disabled in Settings".into()));
     }
-    if state.agent_chat_busy.swap(true, Ordering::SeqCst) {
+    if state
+        .agent_chat_busy
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
         return Err(AppError::Other("the agent is still working on the previous message".into()));
     }
 
@@ -469,6 +499,15 @@ pub async fn proposal_resolve(state: State<'_, AppState>, id: i64, approve: bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_exclusion_is_atomic_and_released_on_drop() {
+        let busy = std::sync::atomic::AtomicBool::new(false);
+        let lease = claim_agent_chat(&busy, "busy").unwrap();
+        assert!(claim_agent_chat(&busy, "busy").is_err());
+        drop(lease);
+        assert!(claim_agent_chat(&busy, "busy").is_ok());
+    }
 
     #[test]
     fn chat_history_is_chronological_within_the_newest_window() {

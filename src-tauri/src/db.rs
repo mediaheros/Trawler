@@ -2,9 +2,23 @@
 //! One connection behind a Mutex — every helper is synchronous and quick;
 //! never hold the lock across an await.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use crate::error::{AppError, Result};
+
+fn add_column(conn: &Connection, sql: &str) -> Result<()> {
+    match conn.execute(sql, []) {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+            if message
+                .to_ascii_lowercase()
+                .contains("duplicate column name") =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(db_err(error)),
+    }
+}
 
 pub fn open() -> Result<Connection> {
     let path = crate::config::config_path()
@@ -12,9 +26,9 @@ pub fn open() -> Result<Connection> {
         .map(|d| d.join("trawler.db"))
         .ok_or_else(|| AppError::Other("cannot resolve data dir".into()))?;
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+        crate::config::ensure_private_app_dir(dir)?;
     }
-    let conn = Connection::open(&path).map_err(db_err)?;
+    let mut conn = Connection::open(&path).map_err(db_err)?;
     // background tasks open their own connections (see open_existing);
     // WAL serializes writers — the timeout makes them wait, not error
     conn.busy_timeout(std::time::Duration::from_secs(5)).map_err(db_err)?;
@@ -137,50 +151,51 @@ pub fn open() -> Result<Connection> {
     )
     .map_err(db_err)?;
 
-    // additive migrations — ignore "duplicate column" on existing databases
-    let _ = conn.execute(
+    // Additive migrations are idempotent, but only the expected duplicate-
+    // column error is harmless. Disk, corruption and schema errors must abort
+    // startup instead of leaving a database that fails much later at runtime.
+    add_column(&conn,
         "ALTER TABLE episodes ADD COLUMN last_searched_at INTEGER NOT NULL DEFAULT 0",
-        [],
-    );
-    let _ = conn.execute("ALTER TABLE shows ADD COLUMN search_alias TEXT", []);
+    )?;
+    add_column(&conn, "ALTER TABLE shows ADD COLUMN search_alias TEXT")?;
     // which episodes a grab belongs to, as a JSON id array — durable linkage
     // that survives unfollow/refollow (grabbed_title matching does not)
-    let _ = conn.execute(
+    add_column(&conn,
         "ALTER TABLE grab_ledger ADD COLUMN backend TEXT NOT NULL DEFAULT 'qbittorrent'",
-        [],
-    );
-    let _ = conn.execute("ALTER TABLE grab_ledger ADD COLUMN bp_token TEXT", []);
-    if let Err(e) = conn.execute("ALTER TABLE grab_ledger ADD COLUMN ep_ids TEXT", []) {
-        let msg = e.to_string();
-        if !msg.contains("duplicate column") {
-            crate::applog::warn("app",format!("ep_ids migration failed: {msg}"));
-        }
-    }
+    )?;
+    add_column(&conn, "ALTER TABLE grab_ledger ADD COLUMN bp_token TEXT")?;
+    add_column(&conn, "ALTER TABLE grab_ledger ADD COLUMN ep_ids TEXT")?;
+    add_column(&conn, "ALTER TABLE shows ADD COLUMN alias_status TEXT")?;
+    add_column(&conn, "ALTER TABLE shows ADD COLUMN seasons_json TEXT")?;
     // one-shot backfill: link every healthy in-flight grab to its episodes by
     // the title match that still works TODAY, so the linkage survives the
     // refollow that would otherwise sever it tomorrow
     let backfilled: Option<String> = conn
         .query_row("SELECT value FROM meta WHERE key = 'ledger_ep_backfill'", [], |r| r.get(0))
-        .ok();
+        .optional()
+        .map_err(db_err)?;
     if backfilled.is_none() {
-        let rows: Vec<(i64, String)> = conn
-            .prepare("SELECT id, title FROM grab_ledger WHERE state IN ('grabbed','completed') AND ep_ids IS NULL")
-            .ok()
-            .map(|mut stmt| {
-                stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-                    .map(|it| it.flatten().collect::<Vec<_>>())
-                    .unwrap_or_default()
-            })
-            .unwrap_or_default();
-        let eps: Vec<(i64, String)> = conn
-            .prepare("SELECT tvmaze_ep_id, grabbed_title FROM episodes WHERE grabbed_title IS NOT NULL")
-            .ok()
-            .map(|mut stmt| {
-                stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-                    .map(|it| it.flatten().collect::<Vec<_>>())
-                    .unwrap_or_default()
-            })
-            .unwrap_or_default();
+        let tx = conn.transaction().map_err(db_err)?;
+        let rows: Vec<(i64, String)> = {
+            let mut stmt = tx
+                .prepare("SELECT id, title FROM grab_ledger WHERE state IN ('grabbed','completed') AND ep_ids IS NULL")
+                .map_err(db_err)?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map_err(db_err)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(db_err)?;
+            rows
+        };
+        let eps: Vec<(i64, String)> = {
+            let mut stmt = tx
+                .prepare("SELECT tvmaze_ep_id, grabbed_title FROM episodes WHERE grabbed_title IS NOT NULL")
+                .map_err(db_err)?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map_err(db_err)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(db_err)?;
+            rows
+        };
         for (id, title) in rows {
             let norm = crate::commands::normalize(&title);
             let linked: Vec<i64> = eps
@@ -189,27 +204,22 @@ pub fn open() -> Result<Connection> {
                 .map(|(e, _)| *e)
                 .collect();
             if !linked.is_empty() {
-                if let Ok(json) = serde_json::to_string(&linked) {
-                    let _ = conn.execute(
-                        "UPDATE grab_ledger SET ep_ids = ?2 WHERE id = ?1",
-                        rusqlite::params![id, json],
-                    );
-                }
+                let json = serde_json::to_string(&linked)
+                    .map_err(|e| AppError::Other(format!("could not encode episode linkage migration: {e}")))?;
+                tx.execute(
+                    "UPDATE grab_ledger SET ep_ids = ?2 WHERE id = ?1",
+                    rusqlite::params![id, json],
+                )
+                .map_err(db_err)?;
             }
         }
-        let _ = conn.execute(
+        tx.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('ledger_ep_backfill', '1')",
             [],
-        );
+        )
+        .map_err(db_err)?;
+        tx.commit().map_err(db_err)?;
     }
-    let _ = conn.execute(
-        "ALTER TABLE shows ADD COLUMN alias_status TEXT",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE shows ADD COLUMN seasons_json TEXT",
-        [],
-    );
     Ok(conn)
 }
 
@@ -220,8 +230,12 @@ pub fn open_existing() -> Result<Connection> {
         .parent()
         .map(|d| d.join("trawler.db"))
         .ok_or_else(|| AppError::Other("cannot resolve data dir".into()))?;
+    if let Some(dir) = path.parent() {
+        crate::config::ensure_private_app_dir(dir)?;
+    }
     let conn = Connection::open(&path).map_err(db_err)?;
     conn.busy_timeout(std::time::Duration::from_secs(5)).map_err(db_err)?;
+    conn.execute_batch("PRAGMA foreign_keys = ON;").map_err(db_err)?;
     Ok(conn)
 }
 
@@ -230,7 +244,7 @@ pub fn open_existing() -> Result<Connection> {
 /// Is this content already satisfied (grabbed or completed)?
 pub fn ledger_satisfied(conn: &Connection, content_key: &str) -> bool {
     conn.query_row(
-        "SELECT COUNT(*) FROM grab_ledger WHERE content_key = ?1 AND state IN ('grabbed','completed')",
+        "SELECT COUNT(*) FROM grab_ledger WHERE content_key = ?1 AND state IN ('dispatching','grabbed','completed')",
         [content_key],
         |r| r.get::<_, i64>(0),
     )
@@ -238,29 +252,161 @@ pub fn ledger_satisfied(conn: &Connection, content_key: &str) -> bool {
     .unwrap_or(false)
 }
 
-pub fn ledger_insert(
+/// Atomically reserve a content key in SQLite before contacting a download
+/// backend. BEGIN IMMEDIATE makes this exclusion work across two Trawler
+/// processes as well as across the app's own async tasks.
+pub struct DispatchClaim<'a> {
+    pub content_key: &'a str,
+    pub brief_id: Option<i64>,
+    pub title: &'a str,
+    pub info_hash: Option<&'a str>,
+    pub size: i64,
+    pub ep_ids: &'a [i64],
+    pub backend: &'a str,
+}
+
+pub fn ledger_claim_dispatch(
     conn: &Connection,
-    content_key: &str,
-    brief_id: Option<i64>,
-    title: &str,
-    info_hash: Option<&str>,
-    size: i64,
-    ep_ids: &[i64],
-    backend: &str,
-    bp_token: Option<&str>,
-) -> Result<()> {
-    let eps_json = if ep_ids.is_empty() {
+    claim: &DispatchClaim<'_>,
+) -> Result<bool> {
+    let tx = rusqlite::Transaction::new_unchecked(
+        conn,
+        rusqlite::TransactionBehavior::Immediate,
+    )
+    .map_err(db_err)?;
+    let active = tx
+        .query_row(
+            "SELECT COUNT(*) FROM grab_ledger WHERE content_key = ?1 AND state IN ('dispatching','grabbed','completed')",
+            [claim.content_key],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(db_err)?
+        > 0;
+    if active {
+        tx.commit().map_err(db_err)?;
+        return Ok(false);
+    }
+    let eps_json = if claim.ep_ids.is_empty() {
         None
     } else {
-        serde_json::to_string(ep_ids).ok()
+        Some(
+            serde_json::to_string(claim.ep_ids)
+                .map_err(|e| AppError::Other(format!("could not encode episode linkage: {e}")))?,
+        )
     };
-    conn.execute(
+    tx.execute(
         "INSERT INTO grab_ledger (content_key, brief_id, title, info_hash, size, state, ts, ep_ids, backend, bp_token)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'grabbed', ?6, ?7, ?8, ?9)",
-        rusqlite::params![content_key, brief_id, title, info_hash, size, now(), eps_json, backend, bp_token],
+         VALUES (?1, ?2, ?3, ?4, ?5, 'dispatching', ?6, ?7, ?8, NULL)",
+        rusqlite::params![
+            claim.content_key,
+            claim.brief_id,
+            claim.title,
+            claim.info_hash,
+            claim.size,
+            now(),
+            eps_json,
+            claim.backend
+        ],
+    )
+    .map_err(db_err)?;
+    tx.commit().map_err(db_err)?;
+    Ok(true)
+}
+
+pub fn ledger_finish_dispatch(
+    conn: &Connection,
+    content_key: &str,
+    info_hash: Option<&str>,
+    bp_token: Option<&str>,
+) -> Result<()> {
+    let changed = conn
+        .execute(
+            "UPDATE grab_ledger
+             SET state = 'grabbed', info_hash = COALESCE(?2, info_hash), bp_token = ?3
+             WHERE id = (
+               SELECT id FROM grab_ledger
+               WHERE content_key = ?1 AND state = 'dispatching'
+               ORDER BY id DESC LIMIT 1
+             )",
+            rusqlite::params![content_key, info_hash, bp_token],
+        )
+        .map_err(db_err)?;
+    if changed != 1 {
+        return Err(AppError::Other(format!(
+            "database lost the pending grab record for {content_key}"
+        )));
+    }
+    Ok(())
+}
+
+pub fn ledger_set_dispatch_info_hash(
+    conn: &Connection,
+    content_key: &str,
+    info_hash: &str,
+) -> Result<()> {
+    let changed = conn
+        .execute(
+            "UPDATE grab_ledger SET info_hash = ?2
+             WHERE id = (
+               SELECT id FROM grab_ledger
+               WHERE content_key = ?1 AND state = 'dispatching'
+               ORDER BY id DESC LIMIT 1
+             )",
+            rusqlite::params![content_key, info_hash],
+        )
+        .map_err(db_err)?;
+    if changed != 1 {
+        return Err(AppError::Other(format!(
+            "database lost the pending grab record for {content_key}"
+        )));
+    }
+    Ok(())
+}
+
+pub fn ledger_abandon_dispatch(conn: &Connection, content_key: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM grab_ledger WHERE content_key = ?1 AND state = 'dispatching'",
+        [content_key],
     )
     .map_err(db_err)?;
     Ok(())
+}
+
+/// Reconcile a durable pre-I/O claim after the backend listing proves that
+/// the transfer exists. This is the restart path for a crash after backend
+/// acceptance but before `ledger_finish_dispatch`.
+pub fn ledger_confirm_present(
+    conn: &Connection,
+    id: i64,
+    title: &str,
+    ep_ids: &[i64],
+) -> Result<bool> {
+    let changed = conn
+        .execute(
+            "UPDATE grab_ledger SET state = 'grabbed' WHERE id = ?1 AND state = 'dispatching'",
+            [id],
+        )
+        .map_err(db_err)?;
+    if changed > 0 {
+        set_episodes_state_by_ids(conn, ep_ids, "grabbed", Some(title));
+    }
+    Ok(changed > 0)
+}
+
+/// Retire a pending/open claim only after the caller has an authoritative
+/// backend listing proving absence (and has applied its grace/strike policy).
+pub fn ledger_confirm_missing(conn: &Connection, id: i64, ep_ids: &[i64]) -> Result<bool> {
+    let changed = conn
+        .execute(
+            "UPDATE grab_ledger SET state = 'removed'
+             WHERE id = ?1 AND state IN ('dispatching','grabbed')",
+            [id],
+        )
+        .map_err(db_err)?;
+    if changed > 0 {
+        set_episodes_state_by_ids(conn, ep_ids, "wanted", None);
+    }
+    Ok(changed > 0)
 }
 
 /// Parse a ledger row's ep_ids JSON into ids (empty when absent/invalid).
@@ -691,7 +837,145 @@ pub fn list_activity(conn: &Connection, limit: i64) -> Result<Vec<ActivityRow>> 
 
 #[cfg(test)]
 mod tests {
-    use super::parse_ep_ids;
+    use super::{
+        add_column, ledger_abandon_dispatch, ledger_claim_dispatch, ledger_confirm_missing,
+        ledger_confirm_present, ledger_finish_dispatch, ledger_satisfied, parse_ep_ids,
+        DispatchClaim,
+    };
+    use rusqlite::Connection;
+
+    #[test]
+    fn additive_migration_only_ignores_duplicate_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE sample (id INTEGER PRIMARY KEY);")
+            .unwrap();
+
+        add_column(&conn, "ALTER TABLE sample ADD COLUMN note TEXT").unwrap();
+        add_column(&conn, "ALTER TABLE sample ADD COLUMN note TEXT").unwrap();
+
+        let err = add_column(&conn, "ALTER TABLE absent ADD COLUMN note TEXT").unwrap_err();
+        assert!(err.to_string().contains("no such table"));
+    }
+
+    #[test]
+    fn durable_dispatch_claim_blocks_duplicates_until_abandoned() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE grab_ledger (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               content_key TEXT NOT NULL,
+               brief_id INTEGER,
+               title TEXT NOT NULL,
+               info_hash TEXT,
+               size INTEGER NOT NULL DEFAULT 0,
+               state TEXT NOT NULL,
+               ts INTEGER NOT NULL,
+               ep_ids TEXT,
+               backend TEXT NOT NULL,
+               bp_token TEXT
+             );",
+        )
+        .unwrap();
+
+        assert!(ledger_claim_dispatch(&conn, &DispatchClaim {
+            content_key: "release-key",
+            brief_id: None,
+            title: "Release",
+            info_hash: None,
+            size: 10,
+            ep_ids: &[1, 2],
+            backend: "qbittorrent",
+        })
+        .unwrap());
+        assert!(ledger_satisfied(&conn, "release-key"));
+        assert!(!ledger_claim_dispatch(&conn, &DispatchClaim {
+            content_key: "release-key",
+            brief_id: None,
+            title: "Release",
+            info_hash: None,
+            size: 10,
+            ep_ids: &[],
+            backend: "qbittorrent",
+        })
+        .unwrap());
+
+        ledger_abandon_dispatch(&conn, "release-key").unwrap();
+        assert!(!ledger_satisfied(&conn, "release-key"));
+        assert!(ledger_claim_dispatch(&conn, &DispatchClaim {
+            content_key: "release-key",
+            brief_id: None,
+            title: "Release",
+            info_hash: Some("hash"),
+            size: 10,
+            ep_ids: &[],
+            backend: "qbittorrent",
+        })
+        .unwrap());
+        ledger_finish_dispatch(&conn, "release-key", Some("new-hash"), None).unwrap();
+        assert!(ledger_satisfied(&conn, "release-key"));
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM grab_ledger WHERE content_key = 'release-key'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "grabbed");
+    }
+
+    #[test]
+    fn stale_dispatch_claims_recover_from_authoritative_backend_state() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE grab_ledger (
+               id INTEGER PRIMARY KEY AUTOINCREMENT, content_key TEXT NOT NULL,
+               brief_id INTEGER, title TEXT NOT NULL, info_hash TEXT, size INTEGER NOT NULL,
+               state TEXT NOT NULL, ts INTEGER NOT NULL, ep_ids TEXT, backend TEXT NOT NULL,
+               bp_token TEXT
+             );
+             CREATE TABLE episodes (
+               tvmaze_ep_id INTEGER PRIMARY KEY, state TEXT NOT NULL,
+               grabbed_title TEXT, grabbed_at INTEGER, last_searched_at INTEGER DEFAULT 0
+             );
+             INSERT INTO episodes (tvmaze_ep_id, state) VALUES (7, 'wanted'), (8, 'wanted');",
+        )
+        .unwrap();
+
+        assert!(ledger_claim_dispatch(&conn, &DispatchClaim {
+            content_key: "accepted",
+            brief_id: None,
+            title: "Accepted Release",
+            info_hash: Some("hash"),
+            size: 10,
+            ep_ids: &[7],
+            backend: "qbittorrent",
+        })
+        .unwrap());
+        let accepted_id = conn.last_insert_rowid();
+        assert!(ledger_confirm_present(&conn, accepted_id, "Accepted Release", &[7]).unwrap());
+        assert_eq!(
+            conn.query_row("SELECT state FROM grab_ledger WHERE id = ?1", [accepted_id], |r| r.get::<_, String>(0)).unwrap(),
+            "grabbed"
+        );
+        assert_eq!(
+            conn.query_row("SELECT state FROM episodes WHERE tvmaze_ep_id = 7", [], |r| r.get::<_, String>(0)).unwrap(),
+            "grabbed"
+        );
+
+        assert!(ledger_claim_dispatch(&conn, &DispatchClaim {
+            content_key: "never-submitted",
+            brief_id: None,
+            title: "Never Submitted",
+            info_hash: None,
+            size: 10,
+            ep_ids: &[8],
+            backend: "qbittorrent",
+        })
+        .unwrap());
+        let absent_id = conn.last_insert_rowid();
+        assert!(ledger_confirm_missing(&conn, absent_id, &[8]).unwrap());
+        assert!(!ledger_satisfied(&conn, "never-submitted"));
+    }
 
     #[test]
     fn ep_ids_roundtrip_and_junk() {

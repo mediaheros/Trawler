@@ -332,7 +332,7 @@ mod tests {
         let future = "2999-01-01T00:00:00+00:00";
         let now_aired = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S+00:00").to_string();
         let show = mk_show(&[
-            (10, 1, Some(1), &future),    // S1, still future at follow time
+            (10, 1, Some(1), future),     // S1, still future at follow time
             (11, 2, Some(1), &now_aired), // S2, aired
         ]);
         upsert_show(&conn, &show, true, Some(&[1]), true).unwrap();

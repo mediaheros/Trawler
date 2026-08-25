@@ -18,18 +18,55 @@ export interface UpdateInfo {
   close: () => Promise<void>;
 }
 
-/** Returns the available update, or null when current / not applicable. */
-export async function checkForUpdate(): Promise<UpdateInfo | null> {
-  if (!inTauri) return null;
-  const { check } = await import("@tauri-apps/plugin-updater");
-  const update = await check();
-  if (!update) return null;
+type NativeUpdaterEvent =
+  | { event: "Started"; data: { contentLength?: number } }
+  | { event: "Progress"; data: { chunkLength: number } }
+  | { event: "Finished"; data?: Record<string, never> };
+
+export interface NativeUpdateHandle {
+  version: string;
+  download: (
+    onEvent: (event: NativeUpdaterEvent) => void,
+    options: { timeout: number },
+  ) => Promise<void>;
+  install: () => Promise<void>;
+  close: () => Promise<void>;
+}
+
+/**
+ * Owns the plugin resource across an in-flight download. The plugin creates
+ * its downloaded-bytes resource only when download resolves, so closing the
+ * update before then must wait and close again after that resource exists.
+ */
+export function wrapUpdate(update: NativeUpdateHandle): UpdateInfo {
+  let downloadInFlight: Promise<void> | null = null;
+  let closeRequested = false;
+  let closePromise: Promise<void> | null = null;
+
+  const close = (): Promise<void> => {
+    closeRequested = true;
+    if (!closePromise) {
+      closePromise = (async () => {
+        if (downloadInFlight) {
+          try {
+            await downloadInFlight;
+          } catch {
+            // The native Update still needs closing after a failed download.
+          }
+        }
+        await update.close().catch(() => undefined);
+      })();
+    }
+    return closePromise;
+  };
+
   return {
     version: update.version,
     download: async (onProgress) => {
+      if (closeRequested) throw new Error("this update handle has been closed");
       let downloaded = 0;
       let total: number | null = null;
-      await update.download((event) => {
+      const operation = update.download((event) => {
         switch (event.event) {
           case "Started":
             total = event.data.contentLength ?? null;
@@ -42,11 +79,26 @@ export async function checkForUpdate(): Promise<UpdateInfo | null> {
             onProgress(total ?? downloaded, total);
             break;
         }
-      });
+      }, { timeout: 30 * 60_000 });
+      downloadInFlight = operation;
+      try {
+        await operation;
+      } finally {
+        if (downloadInFlight === operation) downloadInFlight = null;
+      }
     },
     install: () => update.install(),
-    close: () => update.close().catch(() => undefined),
+    close,
   };
+}
+
+/** Returns the available update, or null when current / not applicable. */
+export async function checkForUpdate(): Promise<UpdateInfo | null> {
+  if (!inTauri) return null;
+  const { check } = await import("@tauri-apps/plugin-updater");
+  const update = await check({ timeout: 15_000 });
+  if (!update) return null;
+  return wrapUpdate(update as NativeUpdateHandle);
 }
 
 /** Restart into the freshly installed version (Linux path — see install()). */

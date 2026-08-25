@@ -77,6 +77,7 @@ export function IconBtn({
   reveal,
   children,
   className,
+  disabled = false,
 }: {
   title: string;
   onClick: () => void;
@@ -85,14 +86,16 @@ export function IconBtn({
   reveal?: boolean;
   children: ReactNode;
   className?: string;
+  disabled?: boolean;
 }) {
   return (
     <button
       type="button"
       title={title}
       onClick={onClick}
+      disabled={disabled}
       className={cx(
-        "cursor-pointer rounded-md p-1.5 text-faint transition-colors hover:bg-bg3",
+        "cursor-pointer rounded-md p-1.5 text-faint transition-colors hover:bg-bg3 disabled:pointer-events-none disabled:opacity-40",
         danger ? "hover:text-bad" : "hover:text-ink",
         reveal && "opacity-0 focus-visible:opacity-100 group-hover:opacity-100 group-focus-within:opacity-100",
         className,
@@ -103,14 +106,23 @@ export function IconBtn({
   );
 }
 
-export function CloseBtn({ onClick, className }: { onClick: () => void; className?: string }) {
+export function CloseBtn({
+  onClick,
+  className,
+  disabled = false,
+}: {
+  onClick: () => void;
+  className?: string;
+  disabled?: boolean;
+}) {
   return (
     <button
       type="button"
       onClick={onClick}
+      disabled={disabled}
       aria-label="Close"
       className={cx(
-        "cursor-pointer rounded-lg p-1.5 text-faint transition-colors hover:bg-bg3 hover:text-dim",
+        "cursor-pointer rounded-lg p-1.5 text-faint transition-colors hover:bg-bg3 hover:text-dim disabled:pointer-events-none disabled:opacity-40",
         className,
       )}
     >

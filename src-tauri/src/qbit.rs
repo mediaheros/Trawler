@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use sha1::{Digest, Sha1};
 use crate::error::{AppError, Result};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,7 +194,7 @@ impl<'a> QbitClient<'a> {
     pub async fn add(&self, t: AddTorrent<'_>) -> Result<()> {
         // Login preflight: multipart Form is not Clone, so we cannot cheaply
         // retry-after-401 like the form endpoints do.
-        let _ = self.version().await;
+        self.version().await?;
 
         let mut form = reqwest::multipart::Form::new();
         if let Some(magnet) = &t.magnet {
@@ -235,7 +236,16 @@ impl<'a> QbitClient<'a> {
             .header("Referer", self.referer())
             .multipart(form)
             .send()
-            .await?;
+            .await
+            .map_err(|error| {
+                if error.is_connect() || error.is_builder() {
+                    AppError::Http(error)
+                } else {
+                    AppError::DispatchUncertain(format!(
+                        "qBittorrent may have accepted the torrent, but its response was lost ({error}); Trawler will reconcile it before retrying"
+                    ))
+                }
+            })?;
         let status = resp.status().as_u16();
         let ok = resp.status().is_success();
         let body = resp.text().await.unwrap_or_default();
@@ -243,7 +253,7 @@ impl<'a> QbitClient<'a> {
             return Err(AppError::QbitAuth);
         }
         if !ok {
-            return Err(AppError::Qbit { status, body: body.chars().take(300).collect() });
+            return Err(qbit_add_status_error(status, &body));
         }
         if body.contains("Fails") {
             return Err(AppError::Other(
@@ -320,4 +330,128 @@ fn sanitize(name: &str) -> String {
         .map(|c| if c.is_alphanumeric() || " .-_[]()".contains(c) { c } else { '_' })
         .take(120)
         .collect()
+}
+
+fn qbit_add_status_error(status: u16, body: &str) -> AppError {
+    if status == 408 || status >= 500 {
+        AppError::DispatchUncertain(format!(
+            "qBittorrent may have accepted the torrent before returning HTTP {status}; Trawler will reconcile it before retrying"
+        ))
+    } else {
+        AppError::Qbit { status, body: body.chars().take(300).collect() }
+    }
+}
+
+fn bencode_value_end(input: &[u8], start: usize, depth: usize) -> Option<usize> {
+    if depth > 128 || start >= input.len() {
+        return None;
+    }
+    match input[start] {
+        b'i' => input[start + 1..]
+            .iter()
+            .position(|byte| *byte == b'e')
+            .map(|offset| start + offset + 2),
+        b'l' | b'd' => {
+            let mut cursor = start + 1;
+            while *input.get(cursor)? != b'e' {
+                cursor = bencode_value_end(input, cursor, depth + 1)?;
+            }
+            Some(cursor + 1)
+        }
+        b'0'..=b'9' => {
+            let colon = input[start..].iter().position(|byte| *byte == b':')? + start;
+            let length = std::str::from_utf8(&input[start..colon]).ok()?.parse::<usize>().ok()?;
+            colon.checked_add(1)?.checked_add(length).filter(|end| *end <= input.len())
+        }
+        _ => None,
+    }
+}
+
+/// SHA-1 of the exact bencoded `info` dictionary: the identity qBittorrent
+/// reports after accepting a .torrent file, even if its display name changes.
+pub(crate) fn torrent_info_hash(input: &[u8]) -> Option<String> {
+    if input.first() != Some(&b'd') {
+        return None;
+    }
+    let mut cursor = 1usize;
+    while *input.get(cursor)? != b'e' {
+        let key_end = bencode_value_end(input, cursor, 0)?;
+        let colon = input[cursor..key_end].iter().position(|byte| *byte == b':')? + cursor;
+        let key = &input[colon + 1..key_end];
+        cursor = key_end;
+        let value_start = cursor;
+        cursor = bencode_value_end(input, cursor, 0)?;
+        if key == b"info" {
+            let digest = Sha1::digest(&input[value_start..cursor]);
+            return Some(digest.iter().map(|byte| format!("{byte:02x}")).collect());
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn torrent_info_hash_uses_the_exact_info_dictionary() {
+        assert_eq!(
+            torrent_info_hash(b"d4:infod4:name4:testee"),
+            Some("1ade8a1a581f338e4fce4ce784da3f7d03f81f3a".into())
+        );
+        assert_eq!(torrent_info_hash(b"d3:foo3:bare"), None);
+        assert_eq!(torrent_info_hash(b"d4:info999:x"), None);
+    }
+
+    #[test]
+    fn ambiguous_qbittorrent_statuses_are_not_safe_to_retry() {
+        assert!(matches!(qbit_add_status_error(500, "oops"), AppError::DispatchUncertain(_)));
+        assert!(matches!(qbit_add_status_error(408, "late"), AppError::DispatchUncertain(_)));
+        assert!(matches!(qbit_add_status_error(400, "bad torrent"), AppError::Qbit { .. }));
+    }
+
+    #[tokio::test]
+    async fn lost_add_response_is_marked_uncertain() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut version_socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = version_socket.read(&mut request).await.unwrap();
+            version_socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n5.0.0",
+                )
+                .await
+                .unwrap();
+            let (mut add_socket, _) = listener.accept().await.unwrap();
+            let _ = add_socket.read(&mut request).await;
+            // Simulate acceptance followed by a reset before any response.
+            drop(add_socket);
+        });
+        let http = reqwest::Client::builder().cookie_store(true).build().unwrap();
+        let client = QbitClient {
+            http: &http,
+            base: format!("http://{address}"),
+            username: "user".into(),
+            password: "pass".into(),
+        };
+        let error = client
+            .add(AddTorrent {
+                magnet: Some(
+                    "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567".into(),
+                ),
+                torrent_bytes: None,
+                torrent_name: "Renamed after metadata",
+                save_path: None,
+                category: None,
+                paused: false,
+                ratio_limit: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AppError::DispatchUncertain(_)));
+        server.await.unwrap();
+    }
 }

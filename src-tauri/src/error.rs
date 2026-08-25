@@ -26,6 +26,11 @@ pub enum AppError {
     #[error("this release has no usable magnet link or download URL")]
     NoDownloadSource,
 
+    /// The backend request may have been accepted, but its response was lost.
+    /// The durable dispatch row must remain until backend reconciliation.
+    #[error("{0}")]
+    DispatchUncertain(String),
+
     #[error("{0}")]
     Other(String),
 }

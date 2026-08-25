@@ -24,15 +24,35 @@ export default function LogConsole() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
   const pausedRef = useRef(false);
+  const liveRevision = useRef(0);
+  const droppedWhilePaused = useRef(0);
   pausedRef.current = paused;
 
   // incoming events buffer in a ref and flush once per frame — a burst of
   // log lines must not mean a 2000-element copy per line
   const inbox = useRef<LogEntry[]>([]);
   useEffect(() => {
+    let active = true;
+    const revisionAtLoad = liveRevision.current;
     void api
       .logsRecent()
-      .then((rows) => setEntries(rows.map((e) => ({ ...e, seq: logSeq++ }))))
+      .then((rows) => {
+        if (!active) return;
+        setEntries((current) => {
+          if (liveRevision.current === revisionAtLoad) {
+            return rows.map((e) => ({ ...e, seq: logSeq++ }));
+          }
+          // Live events arrived while the snapshot was in flight. Preserve
+          // them and prepend only strictly older history, avoiding a stale
+          // wholesale replacement (and avoiding duplicate recent lines).
+          const oldestLiveTs = current[0]?.ts ?? Number.POSITIVE_INFINITY;
+          const history = rows
+            .filter((entry) => entry.ts < oldestLiveTs)
+            .map((entry) => ({ ...entry, seq: logSeq++ }));
+          const next = [...history, ...current];
+          return next.length > 2000 ? next.slice(next.length - 2000) : next;
+        });
+      })
       .catch(() => {});
     let raf = 0;
     const flush = () => {
@@ -46,12 +66,19 @@ export default function LogConsole() {
       });
     };
     const un = onAppLog((e) => {
+      ++liveRevision.current;
       inbox.current.push(e);
+      if (inbox.current.length > 2000) {
+        const overflow = inbox.current.length - 2000;
+        inbox.current.splice(0, overflow);
+        droppedWhilePaused.current += overflow;
+      }
       // paused = frozen VIEW; the buffer keeps collecting so resume shows
       // everything (a pause that DROPS entries is the opposite of a pause)
       if (!pausedRef.current && raf === 0) raf = requestAnimationFrame(flush);
     });
     return () => {
+      active = false;
       un();
       if (raf) cancelAnimationFrame(raf);
     };
@@ -62,6 +89,15 @@ export default function LogConsole() {
     if (!paused && inbox.current.length > 0) {
       const batch = inbox.current;
       inbox.current = [];
+      if (droppedWhilePaused.current > 0) {
+        batch.unshift({
+          ts: Date.now() / 1000,
+          level: "warn",
+          area: "app",
+          message: `${droppedWhilePaused.current} older live log lines were discarded while the view was paused`,
+        });
+        droppedWhilePaused.current = 0;
+      }
       setEntries((prev) => {
         const next = [...prev, ...batch.map((e) => ({ ...e, seq: logSeq++ }))];
         return next.length > 2000 ? next.slice(next.length - 2000) : next;

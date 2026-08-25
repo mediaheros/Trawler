@@ -23,20 +23,46 @@ export default function FirstRun({ onDone }: { onDone: () => void }) {
   const [logLine, setLogLine] = useState<string | null>(null);
   const [addedIndexers, setAddedIndexers] = useState<string[] | null>(null);
   const [keyDraft, setKeyDraft] = useState("");
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pollInFlightRef = useRef<Promise<void> | null>(null);
+  const mountedRef = useRef(false);
   const busyRef = useRef(false);
 
   const poll = useCallback(async () => {
-    try {
-      setStatus(await api.setupStatus());
-    } catch {
-      /* keep last */
-    }
+    if (pollInFlightRef.current) return pollInFlightRef.current;
+    const request = (async () => {
+      try {
+        const next = await api.setupStatus();
+        if (mountedRef.current) setStatus(next);
+      } catch {
+        /* keep last */
+      }
+    })();
+    let tracked: Promise<void>;
+    tracked = request.finally(() => {
+      if (pollInFlightRef.current === tracked) pollInFlightRef.current = null;
+    });
+    pollInFlightRef.current = tracked;
+    await tracked;
   }, []);
 
+  const pollAfterAction = useCallback(async () => {
+    // A poll that began before an installer/configurer completed can only
+    // describe the old service state. Let it settle, then always start one
+    // request whose snapshot is newer than the completed action.
+    const older = pollInFlightRef.current;
+    if (older) await older;
+    await poll();
+  }, [poll]);
+
   useEffect(() => {
-    void poll();
-    pollRef.current = setInterval(() => void poll(), 3000);
+    mountedRef.current = true;
+    let active = true;
+    const loop = async () => {
+      await poll();
+      if (active) pollRef.current = setTimeout(() => void loop(), 3000);
+    };
+    void loop();
     const un = onSetupStep((s) => {
       if (s.kind === "progress") setProgress(s.payload.pct ?? null);
       if (s.kind === "log") { setLogLine(s.payload.message ?? null); setProgress(null); }
@@ -44,7 +70,9 @@ export default function FirstRun({ onDone }: { onDone: () => void }) {
       if (s.kind === "error") { setLogLine(null); setProgress(null); }
     });
     return () => {
-      if (pollRef.current) clearInterval(pollRef.current);
+      active = false;
+      mountedRef.current = false;
+      if (pollRef.current) clearTimeout(pollRef.current);
       un();
     };
   }, [poll]);
@@ -59,23 +87,28 @@ export default function FirstRun({ onDone }: { onDone: () => void }) {
     } catch (e) {
       toast(String(e), "bad");
     } finally {
-      setBusy(null);
       setProgress(null);
       setLogLine(null);
+      await pollAfterAction();
+      setBusy(null);
       busyRef.current = false;
-      void poll();
     }
   };
 
   const finish = async () => {
     if (busyRef.current) return;
+    busyRef.current = true;
+    setBusy("finish");
     try {
       await api.setupFinish();
-    } catch {
-      /* mock mode */
+      void refreshStatus();
+      onDone();
+    } catch (error) {
+      toast(`Couldn't finish setup: ${error}`, "bad");
+    } finally {
+      setBusy(null);
+      busyRef.current = false;
     }
-    void refreshStatus();
-    onDone();
   };
 
   const ready = status?.qbit === "ok" && status?.prowlarr === "ok";
@@ -135,6 +168,7 @@ export default function FirstRun({ onDone }: { onDone: () => void }) {
                 ? status.prowlarrHasIndexers ? "Running, connected, indexers ready" : "Running and connected — no indexers yet"
               : status.prowlarr === "needs_key" ? "Running, but Trawler can't log in — paste its API key below"
               : status.prowlarr === "managed_stopped" ? "Installed by Trawler, currently stopped"
+              : status.prowlarr === "unreachable" ? "Configured, but not responding — check the URL, key, or service"
               : "Not installed"
             }
             progress={busy === "prowlarr-install" ? progress : null}

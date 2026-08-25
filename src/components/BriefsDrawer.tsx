@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ChevronDown,
   ClipboardList,
@@ -23,9 +23,17 @@ export default function BriefsDrawer({ onClose }: { onClose: () => void }) {
   const [running, setRunning] = useState<number | null>(null);
 
   useEffect(() => {
-    void loadBriefs();
-    const t = setInterval(() => void loadBriefs(), 20_000);
-    return () => clearInterval(t);
+    let active = true;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const poll = async () => {
+      await loadBriefs();
+      if (active) timer = setTimeout(poll, 20_000);
+    };
+    void poll();
+    return () => {
+      active = false;
+      if (timer !== null) clearTimeout(timer);
+    };
   }, [loadBriefs]);
 
   const runNow = async (b: BriefRow) => {
@@ -203,6 +211,9 @@ function BriefEditor({ existing, onClose }: { existing: BriefRow | null; onClose
       return null; // a corrupt plan re-compiles from the prompt instead of crashing
     }
   });
+  const [compiledPrompt, setCompiledPrompt] = useState<string | null>(
+    existing?.planJson ? existing.prompt.trim() : null,
+  );
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [cadence, setCadence] = useState(existing?.cadenceMinutes ?? 180);
@@ -211,27 +222,39 @@ function BriefEditor({ existing, onClose }: { existing: BriefRow | null; onClose
   const [maxGb, setMaxGb] = useState(existing?.maxGbPerRun ?? 12);
   const [compiling, setCompiling] = useState(false);
   const [saving, setSaving] = useState(false);
+  const promptRef = useRef(prompt);
+  promptRef.current = prompt;
+  const compileSeq = useRef(0);
+  const savingRef = useRef(false);
 
   const compile = async () => {
-    if (!prompt.trim()) return;
+    const source = prompt.trim();
+    if (!source) return;
+    const mine = ++compileSeq.current;
     setCompiling(true);
     try {
-      setPlan(await api.compileBrief(prompt));
+      const compiled = await api.compileBrief(source);
+      if (mine === compileSeq.current && promptRef.current.trim() === source) {
+        setPlan(compiled);
+        setCompiledPrompt(source);
+      }
     } catch (e) {
       toast(String(e), "bad");
     } finally {
-      setCompiling(false);
+      if (mine === compileSeq.current) setCompiling(false);
     }
   };
 
   const save = async () => {
-    if (!plan) return;
+    const source = prompt.trim();
+    if (!plan || compiledPrompt !== source || compiling || savingRef.current) return;
+    savingRef.current = true;
     setSaving(true);
     try {
       await api.briefSave({
         id: existing?.id ?? null,
         name: name.trim() || prompt.slice(0, 40),
-        prompt,
+        prompt: source,
         plan,
         cadenceMinutes: cadence,
         mode,
@@ -245,6 +268,7 @@ function BriefEditor({ existing, onClose }: { existing: BriefRow | null; onClose
     } catch (e) {
       toast(String(e), "bad");
     } finally {
+      savingRef.current = false;
       setSaving(false);
     }
   };
@@ -271,7 +295,13 @@ function BriefEditor({ existing, onClose }: { existing: BriefRow | null; onClose
           <Field label="What should the agent watch for?">
             <textarea
               value={prompt}
-              onChange={(e) => setPrompt(e.target.value)}
+              onChange={(e) => {
+                ++compileSeq.current;
+                setCompiling(false);
+                setPrompt(e.target.value);
+                setPlan(null);
+                setCompiledPrompt(null);
+              }}
               rows={2}
               placeholder={'e.g. "UFC numbered events, main card only, 1080p, under 6 GB"'}
               spellCheck={false}
@@ -378,7 +408,13 @@ function BriefEditor({ existing, onClose }: { existing: BriefRow | null; onClose
           )}
           <div className="flex gap-2">
             <Button variant="ghost" onClick={onClose} className="text-[12px]">Cancel</Button>
-            <Button variant="primary" onClick={save} busy={saving} disabled={!plan} className="text-[12px]">
+            <Button
+              variant="primary"
+              onClick={save}
+              busy={saving}
+              disabled={!plan || compiledPrompt !== prompt.trim() || compiling}
+              className="text-[12px]"
+            >
               {existing ? "Save" : "Create brief"}
             </Button>
           </div>

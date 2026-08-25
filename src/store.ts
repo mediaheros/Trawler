@@ -91,14 +91,15 @@ interface Store {
   activity: ActivityRow[];
   loadActivity: () => Promise<void>;
   /** when set, a successful grab matching season/episode marks this episode grabbed */
-  episodeLink: { ep: EpisodeRow; showName: string } | null;
-  findReleaseForEpisode: (showName: string, ep: EpisodeRow) => void;
+  episodeLink: { ep: EpisodeRow; showName: string; seasonWantedEpIds: number[] } | null;
+  findReleaseForEpisode: (showName: string, ep: EpisodeRow, seasonEpisodes: EpisodeRow[]) => void;
 
   // ---- agent ----
   chat: ChatRow[];
   chatLoaded: boolean;
   loadChat: () => Promise<void>;
   agentBusy: boolean;
+  agentClearing: boolean;
   liveSteps: LiveStep[];
   agentThinking: boolean;
   sendToAgent: (text: string) => Promise<void>;
@@ -125,6 +126,15 @@ interface Store {
 let toastSeq = 1;
 /** Monotonic search id — a newer search always supersedes an older in-flight one. */
 let searchSeq = 0;
+let configSeq = 0;
+let configSaveQueue: Promise<void> = Promise.resolve();
+let statusSeq = 0;
+let showsSeq = 0;
+let activitySeq = 0;
+let briefsSeq = 0;
+let proposalsSeq = 0;
+let chatLoadSeq = 0;
+let chatRevision = 0;
 let agentEventsInitialized = false;
 // chat message ids must never collide — two events in one millisecond
 // would produce duplicate React keys in the transcript
@@ -176,16 +186,28 @@ export const useStore = create<Store>((set, get) => ({
 
   config: null,
   loadConfig: async () => {
+    const mine = ++configSeq;
     try {
-      set({ config: await api.getConfig() });
+      const config = await api.getConfig();
+      if (mine === configSeq) set({ config });
     } catch (e) {
       get().toast(String(e), "bad");
     }
   },
   saveConfig: async (c) => {
+    const mine = ++configSeq;
+    ++statusSeq; // invalidate a health verdict for the previous credentials
+    let saved!: Config;
+    const turn = configSaveQueue.then(async () => {
+      saved = await api.setConfig(c);
+    });
+    configSaveQueue = turn.then(
+      () => undefined,
+      () => undefined,
+    );
     try {
-      const saved = await api.setConfig(c);
-      set({ config: saved });
+      await turn;
+      if (mine === configSeq) set({ config: saved });
       get().toast("Settings saved", "ok");
       void get().refreshStatus();
       return true;
@@ -197,10 +219,12 @@ export const useStore = create<Store>((set, get) => ({
 
   status: null,
   refreshStatus: async () => {
+    const mine = ++statusSeq;
     try {
-      set({ status: await api.testConnections() });
+      const status = await api.testConnections();
+      if (mine === statusSeq) set({ status });
     } catch {
-      set({ status: null });
+      if (mine === statusSeq) set({ status: null });
     }
   },
 
@@ -209,9 +233,13 @@ export const useStore = create<Store>((set, get) => ({
   sort: "score",
   sortThen: null,
   // typing a new query manually breaks any episode linkage
-  setQuery: (query) => set({ query, episodeLink: null }),
+  setQuery: (query) => {
+    ++searchSeq;
+    set({ query, episodeLink: null, searching: false });
+  },
   /** back to the landing hero: view + search state reset */
   goHome: () => {
+    ++searchSeq;
     const alreadyThere = get().view === "search";
     set({ view: "search" });
     if (alreadyThere) {
@@ -230,7 +258,10 @@ export const useStore = create<Store>((set, get) => ({
       });
     }
   },
-  setKind: (kind) => set({ kind }),
+  setKind: (kind) => {
+    ++searchSeq;
+    set({ kind, searching: false });
+  },
   // "Best" is already a composite score; a secondary only makes sense for
   // single-key sorts, and never the same key twice
   setSort: (sort) =>
@@ -288,10 +319,12 @@ export const useStore = create<Store>((set, get) => ({
       // remembers WHO this grab was for (survives unfollow/refollow)
       const link0 = get().episodeLink;
       const linked =
-        link0 &&
-        r.parsed.season === link0.ep.season &&
-        (r.parsed.episode === link0.ep.number || r.parsed.seasonPack)
-          ? [link0.ep.tvmazeEpId]
+        link0 && r.parsed.season === link0.ep.season
+          ? r.parsed.seasonPack
+            ? link0.seasonWantedEpIds
+            : r.parsed.episode === link0.ep.number && link0.ep.state === "wanted"
+              ? [link0.ep.tvmazeEpId]
+              : []
           : [];
       const res = await api.grab(r, linked);
       set((s) => ({ grabState: { ...s.grabState, [key]: "done" } }));
@@ -304,13 +337,8 @@ export const useStore = create<Store>((set, get) => ({
         const episodeMatch = r.parsed.episode === link0.ep.number;
         const packMatch = r.parsed.seasonPack;
         if (episodeMatch || packMatch) {
-          try {
-            await api.setEpisodeState(link0.ep.tvmazeEpId, "grabbed", r.title);
-            set({ episodeLink: null });
-            void get().loadShows();
-          } catch {
-            /* non-fatal */
-          }
+          set({ episodeLink: null });
+          void get().loadShows();
         }
       }
     } catch (e) {
@@ -322,8 +350,10 @@ export const useStore = create<Store>((set, get) => ({
   shows: [],
   showsLoaded: false,
   loadShows: async () => {
+    const mine = ++showsSeq;
     try {
       const shows = await api.getShows();
+      if (mine !== showsSeq) return;
       set({ shows, showsLoaded: true });
       const sel = get().selectedShow;
       if (sel) {
@@ -334,6 +364,7 @@ export const useStore = create<Store>((set, get) => ({
     }
   },
   followShow: async (tvmazeId, backfill) => {
+    ++showsSeq;
     try {
       const row = await api.followShow(tvmazeId, backfill, null);
       get().toast(`Following ${row.name}`, "ok");
@@ -344,6 +375,7 @@ export const useStore = create<Store>((set, get) => ({
     }
   },
   unfollowShow: async (tvmazeId) => {
+    ++showsSeq;
     try {
       await api.unfollowShow(tvmazeId);
       set({ selectedShow: null });
@@ -356,14 +388,16 @@ export const useStore = create<Store>((set, get) => ({
   selectShow: (selectedShow) => set({ selectedShow }),
   activity: [],
   loadActivity: async () => {
+    const mine = ++activitySeq;
     try {
-      set({ activity: await api.getActivity() });
+      const activity = await api.getActivity();
+      if (mine === activitySeq) set({ activity });
     } catch {
       /* activity is decorative */
     }
   },
   episodeLink: null,
-  findReleaseForEpisode: (showName, ep) => {
+  findReleaseForEpisode: (showName, ep, seasonEpisodes) => {
     const clean = showName
       .replace(/['’]/g, "")
       .replace(/[:,.()!?]/g, " ")
@@ -372,7 +406,13 @@ export const useStore = create<Store>((set, get) => ({
       .trim();
     const query = `${clean} S${String(ep.season).padStart(2, "0")}E${String(ep.number).padStart(2, "0")}`;
     set({
-      episodeLink: { ep, showName },
+      episodeLink: {
+        ep,
+        showName,
+        seasonWantedEpIds: seasonEpisodes
+          .filter((candidate) => candidate.season === ep.season && candidate.state === "wanted")
+          .map((candidate) => candidate.tvmazeEpId),
+      },
       query,
       kind: "tv",
       view: "search",
@@ -384,25 +424,36 @@ export const useStore = create<Store>((set, get) => ({
   chat: [],
   chatLoaded: false,
   loadChat: async () => {
+    const mine = ++chatLoadSeq;
+    const revision = chatRevision;
     try {
       const rows = await api.agentHistory();
+      if (mine !== chatLoadSeq) return;
       // DB ids are small AUTOINCREMENT integers — the local id counter
       // must start above them or React keys (and the send-rollback
       // filter) collide with persisted history rows
       if (rows.length) chatSeq = Math.max(chatSeq, Math.max(...rows.map((r) => r.id)) + 1);
-      set({ chat: rows, chatLoaded: true });
+      set((state) => ({
+        chat:
+          revision === chatRevision
+            ? rows
+            : [...rows, ...state.chat.filter((message) => message.id < 0)],
+        chatLoaded: true,
+      }));
     } catch (e) {
-      get().toast(String(e), "bad");
+      if (mine === chatLoadSeq) get().toast(String(e), "bad");
     }
   },
   agentBusy: false,
+  agentClearing: false,
   liveSteps: [],
   agentThinking: false,
   sendToAgent: async (text) => {
-    if (!text.trim() || get().agentBusy) return;
+    if (!text.trim() || get().agentBusy || get().agentClearing || !get().chatLoaded) return;
     set({ agentBusy: true, liveSteps: [], agentThinking: true });
     // optimistic: show the user's message instantly
-    const optimisticId = chatSeq++;
+    const optimisticId = -(chatSeq++);
+    ++chatRevision;
     set((s) => ({
       chat: [
         ...s.chat,
@@ -428,11 +479,21 @@ export const useStore = create<Store>((set, get) => ({
     }
   },
   clearChat: async () => {
+    if (get().agentBusy || get().agentClearing) {
+      get().toast("Wait for the active agent run to finish before clearing the conversation", "bad");
+      return;
+    }
+    // This write is synchronous, so Send cannot slip into the await gap.
+    set({ agentClearing: true });
     try {
       await api.agentClear();
+      ++chatLoadSeq;
+      ++chatRevision;
       set({ chat: [], liveSteps: [] });
     } catch (e) {
       get().toast(String(e), "bad");
+    } finally {
+      set({ agentClearing: false });
     }
   },
   initAgentEvents: () => {
@@ -473,11 +534,12 @@ export const useStore = create<Store>((set, get) => ({
           });
           break;
         case "text":
+          ++chatRevision;
           set((st) => ({
             agentThinking: false,
             chat: [
               ...st.chat,
-              { id: chatSeq++, ts: Date.now() / 1000, role: "assistant", content: s.payload.text ?? "", toolName: null, toolPayload: null },
+              { id: -(chatSeq++), ts: Date.now() / 1000, role: "assistant", content: s.payload.text ?? "", toolName: null, toolPayload: null },
             ],
           }));
           break;
@@ -493,6 +555,7 @@ export const useStore = create<Store>((set, get) => ({
         case "done":
           clearAgentWatchdog();
           set({ agentBusy: false, agentThinking: false });
+          void get().loadChat();
           void get().loadProposals();
           break;
       }
@@ -500,16 +563,20 @@ export const useStore = create<Store>((set, get) => ({
   },
   briefs: [],
   loadBriefs: async () => {
+    const mine = ++briefsSeq;
     try {
-      set({ briefs: await api.briefsList() });
+      const briefs = await api.briefsList();
+      if (mine === briefsSeq) set({ briefs });
     } catch {
       /* agent may be disabled */
     }
   },
   proposals: [],
   loadProposals: async () => {
+    const mine = ++proposalsSeq;
     try {
-      set({ proposals: await api.proposalsList() });
+      const proposals = await api.proposalsList();
+      if (mine === proposalsSeq) set({ proposals });
     } catch {
       /* ignore */
     }

@@ -316,7 +316,7 @@ export default function ShowDetail({ show, onClose }: { show: ShowRow; onClose: 
                       <EpisodeLine
                         key={ep.tvmazeEpId}
                         ep={ep}
-                        onFind={() => findReleaseForEpisode(show.name, ep)}
+                        onFind={() => findReleaseForEpisode(show.name, ep, eps)}
                         onSetState={(s) => setState(ep, s)}
                       />
                     ))}
@@ -354,8 +354,19 @@ function QualitySelect({ show }: { show: ShowRow }) {
   })();
   const matched = current ? presets.find((p) => sameProfile(p.profile, current)) : undefined;
   const value = current === null ? "" : (matched?.name ?? "__custom");
+  const [selected, setSelected] = useState(value);
+  const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
+
+  useEffect(() => {
+    if (!savingRef.current) setSelected(value);
+  }, [value]);
 
   const apply = async (v: string) => {
+    if (savingRef.current) return;
+    savingRef.current = true;
+    setSaving(true);
+    setSelected(v);
     const preset = presets.find((p) => p.name === v);
     const json = v === "" ? null : preset ? JSON.stringify(preset.profile) : show.qualityJson;
     try {
@@ -368,7 +379,11 @@ function QualitySelect({ show }: { show: ShowRow }) {
         "ok",
       );
     } catch (e) {
+      setSelected(value);
       toast(String(e), "bad");
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
     }
   };
 
@@ -376,7 +391,8 @@ function QualitySelect({ show }: { show: ShowRow }) {
     <label className="ml-auto flex items-center gap-1.5 text-[11px] text-faint" title="Quality profile used when grabbing this show">
       Quality
       <select
-        value={value}
+        value={selected}
+        disabled={saving}
         onChange={(e) => void apply(e.target.value)}
         className="cursor-pointer rounded-(--radius-btn) border border-line2 bg-bg1 px-1.5 py-1 text-[11.5px] text-dim focus:border-accent/50"
       >
@@ -384,7 +400,7 @@ function QualitySelect({ show }: { show: ShowRow }) {
         {presets.map((p) => (
           <option key={p.name} value={p.name}>{p.name}</option>
         ))}
-        {value === "__custom" && <option value="__custom">Custom</option>}
+        {selected === "__custom" && <option value="__custom">Custom</option>}
       </select>
     </label>
   );
@@ -476,4 +492,3 @@ function EpisodeLine({
     </div>
   );
 }
-

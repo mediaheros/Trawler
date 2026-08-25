@@ -64,9 +64,18 @@ export default function CalendarView() {
   }, [gridStart, toast]);
 
   useEffect(() => {
-    void load();
-    const t = setInterval(() => void load(), 30_000);
-    return () => clearInterval(t);
+    let active = true;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const poll = async () => {
+      await load();
+      if (active) timer = setTimeout(poll, 30_000);
+    };
+    void poll();
+    return () => {
+      active = false;
+      ++reqSeq.current;
+      if (timer !== null) clearTimeout(timer);
+    };
   }, [load]);
 
   const byDay = useMemo(() => {

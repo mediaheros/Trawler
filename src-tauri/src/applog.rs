@@ -47,7 +47,7 @@ fn find_ci(hay: &str, needle: &str) -> Option<usize> {
 /// spaces ("Bearer abc"), and under-masking is the one unacceptable direction.
 fn value_end(tail: &str, header_style: bool) -> usize {
     if header_style {
-        tail.find(|c: char| matches!(c, '\n' | '\r' | '"' | ',' | '}'))
+        tail.find(['\n', '\r', '"', ',', '}'])
             .unwrap_or(tail.len())
     } else {
         tail.find(|c: char| {

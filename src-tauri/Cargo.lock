@@ -3828,6 +3828,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4345,6 +4356,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "tauri-plugin-single-instance"
+version = "2.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b3214becf9ef5783c0ae99a3bb25adf5353a7a16ebf53e74b909e29205735c6c"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tauri",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "windows-sys 0.60.2",
+ "zbus",
+]
+
+[[package]]
 name = "tauri-plugin-updater"
 version = "2.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4855,7 +4882,7 @@ dependencies = [
 
 [[package]]
 name = "trawler"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -4868,6 +4895,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha1",
  "sha2",
  "tauri",
  "tauri-build",
@@ -4875,11 +4903,13 @@ dependencies = [
  "tauri-plugin-notification",
  "tauri-plugin-opener",
  "tauri-plugin-process",
+ "tauri-plugin-single-instance",
  "tauri-plugin-updater",
  "thiserror 2.0.20",
  "tokio",
  "url",
  "urlencoding",
+ "windows-sys 0.61.2",
  "zip 2.4.2",
 ]
 

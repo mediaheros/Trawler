@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ArrowDownCircle, RefreshCw, X } from "lucide-react";
 import { inTauri } from "../lib/api";
 import { checkForUpdate, relaunchApp } from "../lib/updater";
@@ -18,10 +18,12 @@ export default function UpdateBanner() {
   const setDismissedVersion = useStore((s) => s.setUpdateDismissedVersion);
   const [phase, setPhase] = useState<Phase>("idle");
   const [pct, setPct] = useState<number | null>(null);
+  const operation = useRef(0);
 
   // a re-check replaces the update object (and frees the old one's bytes) —
   // phase must not survive that or "Install & restart" acts on a dead handle
   useEffect(() => {
+    ++operation.current;
     setPhase("idle");
     setPct(null);
   }, [update]);
@@ -44,27 +46,36 @@ export default function UpdateBanner() {
   if (!update || (dismissedVersion === update.version && phase === "idle")) return null;
 
   const download = async () => {
+    const handle = update;
+    const mine = ++operation.current;
     setPhase("downloading");
     setPct(null);
     try {
       await update.download((done, total) => {
+        if (mine !== operation.current || useStore.getState().pendingUpdate !== handle) return;
         if (total && total > 0) setPct(Math.min(100, Math.round((done / total) * 100)));
       });
+      if (mine !== operation.current || useStore.getState().pendingUpdate !== handle) return;
       setPhase("downloaded");
     } catch (e) {
+      if (mine !== operation.current || useStore.getState().pendingUpdate !== handle) return;
       setPhase("idle");
       toast(`Update download failed: ${e}`, "bad");
     }
   };
 
   const install = async () => {
+    const handle = update;
+    const mine = ++operation.current;
     setPhase("installing");
     try {
       // Windows: never returns — the installer takes over and relaunches.
       await update.install();
+      if (mine !== operation.current || useStore.getState().pendingUpdate !== handle) return;
       // Linux AppImage: swap happened in place, restart into it.
       await relaunchApp();
     } catch (e) {
+      if (mine !== operation.current || useStore.getState().pendingUpdate !== handle) return;
       setPhase("downloaded");
       toast(
         `Update install failed: ${e} — if you installed via deb/rpm, update through your package manager`,

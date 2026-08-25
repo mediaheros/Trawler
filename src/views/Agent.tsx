@@ -31,6 +31,7 @@ export default function AgentView() {
   const chatLoaded = useStore((s) => s.chatLoaded);
   const loadChat = useStore((s) => s.loadChat);
   const agentBusy = useStore((s) => s.agentBusy);
+  const agentClearing = useStore((s) => s.agentClearing);
   const liveSteps = useStore((s) => s.liveSteps);
   const agentThinking = useStore((s) => s.agentThinking);
   const sendToAgent = useStore((s) => s.sendToAgent);
@@ -43,17 +44,24 @@ export default function AgentView() {
   const config = useStore((s) => s.config);
   const [input, setInput] = useState("");
   const [briefsOpen, setBriefsOpen] = useState(false);
+  const [confirmClear, setConfirmClear] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
+    initAgentEvents();
     void loadChat();
     void loadProposals();
     void loadBriefs();
-    initAgentEvents();
     inputRef.current?.focus();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (!confirmClear) return;
+    const timer = window.setTimeout(() => setConfirmClear(false), 3000);
+    return () => window.clearTimeout(timer);
+  }, [confirmClear]);
 
   // pin to bottom as content streams in — but never yank the user back down
   // while they're scrolled up reading an earlier answer
@@ -65,7 +73,7 @@ export default function AgentView() {
 
   const send = () => {
     const text = input.trim();
-    if (!text || agentBusy) return;
+    if (!text || agentBusy || agentClearing || !chatLoaded) return;
     setInput("");
     void sendToAgent(text);
   };
@@ -84,7 +92,26 @@ export default function AgentView() {
           </div>
           <div className="flex items-center gap-1.5">
             {chat.length > 0 && (
-              <Button variant="ghost" onClick={() => void clearChat()} className="px-2 py-1.5" title="Clear conversation">
+              <Button
+                variant="ghost"
+                disabled={agentBusy || agentClearing}
+                onClick={() => {
+                  if (confirmClear) {
+                    setConfirmClear(false);
+                    void clearChat();
+                  } else {
+                    setConfirmClear(true);
+                  }
+                }}
+                className={cx("px-2 py-1.5", confirmClear && "text-bad")}
+                title={
+                  agentBusy || agentClearing
+                    ? "Wait for the active run to finish"
+                    : confirmClear
+                      ? "Click again to permanently clear the conversation"
+                      : "Clear conversation"
+                }
+              >
                 <Eraser size={14} />
               </Button>
             )}
@@ -168,7 +195,7 @@ export default function AgentView() {
             <div
               className={cx(
                 "group flex items-end gap-2 rounded-(--radius-card) border bg-bg1 p-1.5 pl-3 transition-all duration-200",
-                agentBusy
+                agentBusy || agentClearing
                   ? "border-line"
                   : "border-line2 focus-within:border-accent/40 focus-within:shadow-[0_8px_40px_-14px_var(--color-accent)]",
               )}
@@ -183,6 +210,7 @@ export default function AgentView() {
               <textarea
                 ref={inputRef}
                 value={input}
+                disabled={!chatLoaded || agentClearing}
                 onChange={(e) => {
                   setInput(e.target.value);
                   e.target.style.height = "auto";
@@ -195,18 +223,26 @@ export default function AgentView() {
                   }
                 }}
                 rows={1}
-                placeholder={agentBusy ? "The agent is working…" : "Ask for anything — or describe a standing brief…"}
+                placeholder={
+                  !chatLoaded
+                    ? "Loading conversation…"
+                    : agentClearing
+                      ? "Clearing conversation…"
+                      : agentBusy
+                      ? "The agent is working…"
+                      : "Ask for anything — or describe a standing brief…"
+                }
                 spellCheck={false}
                 className="max-h-[140px] min-h-[24px] flex-1 resize-none bg-transparent py-2 text-[13.5px] leading-relaxed text-ink outline-none placeholder:text-faint"
               />
               <button
                 type="button"
                 onClick={send}
-                disabled={!input.trim() || agentBusy}
+                disabled={!input.trim() || agentBusy || agentClearing || !chatLoaded}
                 title="Send (Enter)"
                 className={cx(
                   "flex size-9 shrink-0 cursor-pointer items-center justify-center rounded-[10px] transition-all duration-150 active:scale-95",
-                  input.trim() && !agentBusy
+                  input.trim() && !agentBusy && !agentClearing && chatLoaded
                     ? "bg-accent text-bg0 shadow-[0_0_18px_-6px_var(--color-accent)] hover:brightness-110"
                     : "bg-bg3 text-faint",
                 )}

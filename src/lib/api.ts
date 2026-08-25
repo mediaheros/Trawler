@@ -98,7 +98,7 @@ export interface ShowPreview {
 
 export interface SetupStatus {
   qbit: "ok" | "running_no_webui" | "installed_stopped" | "missing";
-  prowlarr: "ok" | "needs_key" | "managed_stopped" | "missing";
+  prowlarr: "ok" | "needs_key" | "managed_stopped" | "unreachable" | "missing";
   agent: "ok" | "unreachable";
   prowlarrHasIndexers: boolean;
 }

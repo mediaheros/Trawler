@@ -80,6 +80,12 @@ pub fn run() {
     };
 
     tauri::Builder::default()
+        // Must be first: a second process would otherwise create independent
+        // scheduler/config state and can duplicate work. Bring the existing
+        // instance forward instead.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            tray::show_main(app);
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         // (the updater exits the process on Windows after handing off to the

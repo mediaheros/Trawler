@@ -160,7 +160,8 @@ async fn run_pass(app: &tauri::AppHandle) -> crate::error::Result<Option<usize>>
             Ok(s) => s,
             Err(_) => return Ok(None),
         };
-        let rows: Vec<(String, Option<String>, Option<String>, i64, i64, String)> = stmt
+        type UpgradeCandidateRow = (String, Option<String>, Option<String>, i64, i64, String);
+        let rows: Vec<UpgradeCandidateRow> = stmt
             .query_map([db::now() - window_secs], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
             })

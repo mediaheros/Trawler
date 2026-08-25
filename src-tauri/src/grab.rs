@@ -10,12 +10,64 @@
 //!   row, every later pass sees the content as missing and grabs it again.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use crate::commands::perform_grab_core;
 use crate::db;
 use crate::error::{AppError, Result};
 use crate::AppState;
+
+fn uses_bitport(cfg: &crate::config::Config) -> bool {
+    cfg.download_backend == "bitport" && !cfg.bitport_token.is_empty()
+}
+
+async fn selected_backend_free_bytes_with<BitportProbe, BitportFuture, QbitProbe, QbitFuture>(
+    cfg: &crate::config::Config,
+    bitport_probe: BitportProbe,
+    qbit_probe: QbitProbe,
+) -> Result<i64>
+where
+    BitportProbe: FnOnce() -> BitportFuture,
+    BitportFuture: Future<Output = Result<i64>>,
+    QbitProbe: FnOnce() -> QbitFuture,
+    QbitFuture: Future<Output = Result<i64>>,
+{
+    if uses_bitport(cfg) {
+        bitport_probe().await
+    } else {
+        qbit_probe().await
+    }
+}
+
+/// Available bytes on the backend that will actually receive the grab.
+/// Cloud grabs must not be blocked by an unrelated local qBittorrent disk,
+/// and local grabs must never be authorized from Bitport's cloud quota.
+pub async fn selected_backend_free_bytes(
+    http: &reqwest::Client,
+    cfg: &crate::config::Config,
+) -> Result<i64> {
+    selected_backend_free_bytes_with(
+        cfg,
+        || async {
+            let client = crate::bitport::BitportClient {
+                http,
+                token: cfg.bitport_token.clone(),
+            };
+            Ok(client.me().await?.disk_available)
+        },
+        || async {
+            let client = crate::qbit::QbitClient {
+                http,
+                base: cfg.qbit_url.clone(),
+                username: cfg.qbit_username.clone(),
+                password: cfg.qbit_password.clone(),
+            };
+            client.free_space().await
+        },
+    )
+    .await
+}
 
 /// In-flight grab claims, keyed by content key. The lock is a std Mutex and
 /// its critical section is a hash insert/remove — it must never span an
@@ -77,27 +129,43 @@ pub async fn dispatch(
     brief_id: Option<i64>,
     ep_ids: Vec<i64>,
 ) -> Result<GrabOutcome> {
+    let mut order = order;
+    // Persist the strongest backend identity before the durable claim. A
+    // magnet torrent can be renamed as soon as qBittorrent receives metadata;
+    // after a crash, title-only reconciliation could otherwise miss a transfer
+    // the backend accepted and release the claim for a duplicate grab.
+    if order.info_hash.is_none() {
+        order.info_hash = crate::scheduler::magnet_hash(order.magnet_url.as_deref());
+    }
     let ck = crate::briefs::content_key(&order.title);
     let Some(claim) = state.grab_claims.claim(&ck) else {
         return Ok(GrabOutcome::AlreadyClaimed);
     };
-    {
-        let conn = state.db.lock().await;
-        if db::ledger_satisfied(&conn, &ck) {
-            return Ok(GrabOutcome::AlreadyHad);
-        }
-    }
     let http = state.http.clone();
     let cfg = state.config.read().await.clone();
     let title = order.title.clone();
     // the ADDITIVE cloud backend: same claim, same ledger, same episode
     // linkage — only the transport differs. Chosen per config, never forced.
-    let use_bitport = cfg.download_backend == "bitport" && !cfg.bitport_token.is_empty();
+    let use_bitport = uses_bitport(&cfg);
     let backend: &'static str = if use_bitport { "bitport" } else { "qbittorrent" };
+    {
+        let conn = state.db.lock().await;
+        if !db::ledger_claim_dispatch(&conn, &db::DispatchClaim {
+            content_key: &ck,
+            brief_id,
+            title: &order.title,
+            info_hash: order.info_hash.as_deref(),
+            size: order.size,
+            ep_ids: &ep_ids,
+            backend,
+        })? {
+            return Ok(GrabOutcome::AlreadyHad);
+        }
+    }
     let handle = tauri::async_runtime::spawn(async move {
         let _claim = claim; // released when the grab settles, even on panic
-        let mut order = order;
-        let bp_token: Option<String> = if use_bitport {
+        let dispatch_result: Result<Option<String>> = async {
+            if use_bitport {
             // Bitport receives a magnet and nothing else: a download_url can
             // carry Prowlarr's API key or a private-tracker passkey, and
             // .torrent bytes embed the passkey in their announce URL — none
@@ -125,33 +193,61 @@ pub async fn dispatch(
             // even when the search result carried no info_hash
             if order.info_hash.is_none() {
                 order.info_hash = crate::scheduler::magnet_hash(Some(&src));
+                if let Some(info_hash) = order.info_hash.as_deref() {
+                    let conn = db::open_existing()?;
+                    db::ledger_set_dispatch_info_hash(&conn, &ck, info_hash)?;
+                }
             }
             let bp = crate::bitport::BitportClient { http: &http, token: cfg.bitport_token.clone() };
             let tok = bp.add_transfer(&src).await?;
             crate::applog::info("bitport", format!("sent to cloud: {}", order.title.chars().take(70).collect::<String>()));
-            tok
-        } else {
-            perform_grab_core(&http, &cfg, &order).await?;
-            None
+                Ok(tok)
+            } else {
+                perform_grab_core(&http, &cfg, &order, &ck).await?;
+                Ok(None)
+            }
+        }
+        .await;
+        let bp_token = match dispatch_result {
+            Ok(token) => token,
+            Err(error @ AppError::DispatchUncertain(_)) => {
+                // The request crossed the submission boundary. Deleting the
+                // claim here could duplicate a transfer whose response was
+                // lost; completion passes now reconcile this pending row.
+                crate::applog::warn(
+                    "grab",
+                    format!("keeping pending {backend} claim for \"{title}\": {error}"),
+                );
+                return Err(error);
+            }
+            Err(error) => {
+                // A definitive backend failure releases the durable claim so
+                // a later retry is possible. If cleanup itself fails, the
+                // dispatching row intentionally remains fail-safe against an
+                // accidental duplicate.
+                match db::open_existing()
+                    .and_then(|conn| db::ledger_abandon_dispatch(&conn, &ck))
+                {
+                    Ok(()) => {}
+                    Err(cleanup_error) => crate::applog::error(
+                        "grab",
+                        format!(
+                            "{backend} rejected \"{title}\", and its pending ledger claim could not be cleared: {cleanup_error}"
+                        ),
+                    ),
+                }
+                return Err(error);
+            }
         };
-        // A fresh connection, not AppState's: this task must outlive callers
-        // that can be dropped mid-await, and the shared connection is not
-        // 'static. If recording fails after qBittorrent accepted the add,
-        // say so loudly — a silent miss here means future re-grabs.
+        // The durable row existed before backend I/O. If this final update
+        // fails after acceptance, it stays in `dispatching`, which blocks
+        // later automatic re-grabs instead of losing all evidence.
         match db::open_existing() {
             Ok(conn) => {
-                // the ledger row is the "already have" record — if it can't
-                // be written, the grab must surface as failed, or every
-                // later pass re-grabs this content forever
-                db::ledger_insert(
+                db::ledger_finish_dispatch(
                     &conn,
                     &ck,
-                    brief_id,
-                    &order.title,
                     order.info_hash.as_deref(),
-                    order.size,
-                    &ep_ids,
-                    backend,
                     bp_token.as_deref(),
                 )?;
                 if !ep_ids.is_empty() {
@@ -171,7 +267,9 @@ pub async fn dispatch(
             Err(e) => {
                 crate::applog::error(
                     "grab",
-                    format!("{backend} took \"{title}\" but the ledger write failed: {e}"),
+                    format!(
+                        "{backend} took \"{title}\"; its durable ledger claim remains pending because finalization failed: {e}"
+                    ),
                 );
                 Err(e)
             }
@@ -186,6 +284,7 @@ pub async fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn claims_are_exclusive_until_released() {
@@ -207,5 +306,48 @@ mod tests {
         }));
         assert!(result.is_err());
         assert!(claims.claim("panicky").is_some(), "claim released during unwind");
+    }
+
+    #[tokio::test]
+    async fn bitport_capacity_does_not_probe_unavailable_qbittorrent() {
+        let cfg = crate::config::Config {
+            download_backend: "bitport".into(),
+            bitport_token: "connected".into(),
+            ..Default::default()
+        };
+        let qbit_called = AtomicBool::new(false);
+
+        let free = selected_backend_free_bytes_with(
+            &cfg,
+            || async { Ok(40_000_000_000) },
+            || async {
+                qbit_called.store(true, Ordering::SeqCst);
+                Err(AppError::Other("qBittorrent is stopped".into()))
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(free, 40_000_000_000);
+        assert!(!qbit_called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn bitport_capacity_does_not_use_low_local_disk() {
+        let cfg = crate::config::Config {
+            download_backend: "bitport".into(),
+            bitport_token: "connected".into(),
+            ..Default::default()
+        };
+
+        let free = selected_backend_free_bytes_with(
+            &cfg,
+            || async { Ok(25_000_000_000) },
+            || async { Ok(1) },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(free, 25_000_000_000);
     }
 }

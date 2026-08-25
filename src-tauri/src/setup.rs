@@ -76,6 +76,18 @@ pub fn managed_prowlarr_install_is_complete() -> bool {
     prowlarr_runtime_files_complete_at(dir, REQUIRED)
 }
 
+fn offline_prowlarr_status(url: &str, managed_install_complete: bool) -> &'static str {
+    if url.trim_end_matches('/') != "http://127.0.0.1:9696" {
+        "unreachable"
+    } else if managed_install_complete {
+        "managed_stopped"
+    } else {
+        // A remembered API key does not make a truncated/absent local runtime
+        // usable. Report missing so First Run offers the rollback-safe repair.
+        "missing"
+    }
+}
+
 fn managed_prowlarr_dir() -> PathBuf {
     managed_prowlarr_exe()
         .parent()
@@ -322,7 +334,7 @@ fn qbt_ini_path() -> PathBuf {
 pub struct SetupStatus {
     /// ok | running_no_webui | installed_stopped | missing
     pub qbit: String,
-    /// ok | needs_key | managed_stopped | missing
+    /// ok | needs_key | managed_stopped | unreachable | missing
     pub prowlarr: String,
     /// ok | unreachable
     pub agent: String,
@@ -418,14 +430,79 @@ pub(crate) fn kill_process_force(name: &str) {
 pub async fn status(state: &AppState) -> SetupStatus {
     let cfg = state.config.read().await.clone();
 
-    // qBittorrent: API answer is definitive
+    // Recover a managed key before probing. Reading the local config does not
+    // depend on the service being healthy and lets every network check run in
+    // parallel under the same short readiness deadline.
+    let mut api_key = cfg.prowlarr_api_key.clone();
+    if api_key.is_empty() && cfg.prowlarr_url.contains("127.0.0.1:9696") {
+        if let Some(found) = read_prowlarr_api_key() {
+            let mut w = state.config.write().await;
+            w.prowlarr_api_key = found.clone();
+            if let Err(error) = crate::config::save(&w) {
+                crate::applog::warn(
+                    "setup",
+                    format!("found Prowlarr's API key but could not save it: {error}"),
+                );
+            }
+            api_key = found;
+        }
+    }
+
+    // Setup readiness is a UI heartbeat, not a normal API operation. The
+    // shared client deliberately permits 60-second searches/downloads, so
+    // every required readiness probe gets its own four-second ceiling and all
+    // probes run together. The optional agent gets a much shorter ceiling so
+    // an offline model endpoint cannot hold the Start hunting button hostage.
     let q = crate::qbit::QbitClient {
         http: &state.http,
         base: cfg.qbit_url.clone(),
         username: cfg.qbit_username.clone(),
         password: cfg.qbit_password.clone(),
     };
-    let qbit = if q.version().await.is_ok() {
+    let qbit_probe = tokio::time::timeout(std::time::Duration::from_secs(4), q.version());
+    let prowlarr_ping_probe = async {
+        state
+            .http
+            .get(format!("{}/ping", cfg.prowlarr_url.trim_end_matches('/')))
+            .timeout(std::time::Duration::from_secs(4))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+    };
+    let prowlarr_auth_probe = async {
+        if api_key.is_empty() {
+            return None;
+        }
+        let client = crate::prowlarr::ProwlarrClient {
+            http: &state.http,
+            base: cfg.prowlarr_url.clone(),
+            api_key: api_key.clone(),
+        };
+        Some(
+            tokio::time::timeout(std::time::Duration::from_secs(4), client.indexers()).await,
+        )
+    };
+    let agent_probe = async {
+        if cfg.agent_enabled {
+            let client = crate::llm::LlmClient::new(&cfg.agent_base_url, &cfg.agent_model);
+            match tokio::time::timeout(std::time::Duration::from_millis(750), client.models()).await {
+                Ok(Ok(_)) => "ok",
+                _ => "unreachable",
+            }
+        } else {
+            "unreachable"
+        }
+    };
+    let (qbit_result, prowlarr_ping, prowlarr_auth, agent) = tokio::join!(
+        qbit_probe,
+        prowlarr_ping_probe,
+        prowlarr_auth_probe,
+        agent_probe
+    );
+
+    // qBittorrent: an authenticated API answer is definitive.
+    let qbit = if matches!(qbit_result, Ok(Ok(_))) {
         "ok"
     } else if qbt_process_running() {
         "running_no_webui"
@@ -435,64 +512,19 @@ pub async fn status(state: &AppState) -> SetupStatus {
         "missing"
     };
 
-    // Prowlarr. /ping is UNAUTHENTICATED — a green ping alone must never
-    // report "connected", or every authenticated call afterwards fails
-    // while the wizard shows an all-clear.
-    let prowlarr_ping = state
-        .http
-        .get(format!("{}/ping", cfg.prowlarr_url.trim_end_matches('/')))
-        .timeout(std::time::Duration::from_secs(4))
-        .send()
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false);
-
-    // self-heal a managed install whose key never made it into our config
-    let mut api_key = cfg.prowlarr_api_key.clone();
-    if prowlarr_ping && api_key.is_empty() && cfg.prowlarr_url.contains("127.0.0.1:9696") {
-        if let Some(found) = read_prowlarr_api_key() {
-            let mut w = state.config.write().await;
-            w.prowlarr_api_key = found.clone();
-            let _ = crate::config::save(&w);
-            api_key = found;
-        }
-    }
-
     let mut prowlarr_has_indexers = false;
-    let prowlarr = if prowlarr_ping {
-        if api_key.is_empty() {
-            "needs_key"
-        } else {
-            let client = crate::prowlarr::ProwlarrClient {
-                http: &state.http,
-                base: cfg.prowlarr_url.clone(),
-                api_key,
-            };
-            match client.indexers().await {
-                Ok(v) => {
-                    prowlarr_has_indexers = !v.is_empty();
-                    "ok"
-                }
-                // the key is present but Prowlarr rejects it
-                Err(crate::error::AppError::Prowlarr { status: 401, .. }) => "needs_key",
-                // transient hiccup: still connected, just no indexer info yet
-                Err(_) => "ok",
-            }
+    let prowlarr = match prowlarr_auth {
+        Some(Ok(Ok(indexers))) => {
+            prowlarr_has_indexers = !indexers.is_empty();
+            "ok"
         }
-    } else if managed_prowlarr_install_is_complete() {
-        "managed_stopped"
-    } else {
-        "missing"
-    };
-
-    let agent = if cfg.agent_enabled {
-        let client = crate::llm::LlmClient::new(&cfg.agent_base_url, &cfg.agent_model);
-        match tokio::time::timeout(std::time::Duration::from_secs(4), client.models()).await {
-            Ok(Ok(_)) => "ok",
-            _ => "unreachable",
-        }
-    } else {
-        "unreachable"
+        Some(Ok(Err(crate::error::AppError::Prowlarr { status: 401, .. }))) => "needs_key",
+        Some(_) if prowlarr_ping => "unreachable",
+        None if prowlarr_ping => "needs_key",
+        _ => offline_prowlarr_status(
+            &cfg.prowlarr_url,
+            managed_prowlarr_install_is_complete(),
+        ),
     };
 
     SetupStatus {
@@ -674,6 +706,7 @@ fn claim_prowlarr_lifecycle_at<'a>(
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(lock_path)?;
         lock_file.try_lock_exclusive().map_err(|error| {
             if error.kind() == std::io::ErrorKind::WouldBlock {
@@ -888,6 +921,35 @@ async fn start_managed_prowlarr_inner(state: &AppState) -> Result<()> {
     }
 }
 
+/// Stop only the process whose persisted command line still identifies the
+/// managed executable and data directory. This is used before rolling a failed
+/// activation back; moving a running tree is unreliable on Windows.
+async fn stop_failed_managed_prowlarr(state: &AppState) -> Result<()> {
+    if let Some(key) = read_prowlarr_api_key() {
+        if prowlarr_is_ours(state, &key).await && stop_managed_prowlarr(state, &key).await.is_ok() {
+            return Ok(());
+        }
+    }
+    if let Some(pid) = managed_prowlarr_pid() {
+        if !terminate_managed_prowlarr_pid(pid, true) {
+            return Err(AppError::Other(format!(
+                "couldn't stop failed managed Prowlarr process PID {pid}"
+            )));
+        }
+        for _ in 0..20 {
+            if managed_prowlarr_pid().is_none() {
+                clear_managed_prowlarr_pid(pid);
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        return Err(AppError::Other(format!(
+            "failed managed Prowlarr process PID {pid} did not exit"
+        )));
+    }
+    Ok(())
+}
+
 async fn stop_managed_prowlarr(state: &AppState, key: &str) -> Result<()> {
     let response = state
         .http
@@ -1039,12 +1101,57 @@ fn create_unique_staging_dir(target: &Path) -> Result<PathBuf> {
 
 #[derive(Debug)]
 struct PendingDirectoryActivation {
+    final_target: PathBuf,
     backup: Option<PathBuf>,
 }
 
 impl PendingDirectoryActivation {
+    #[cfg(test)]
     fn backup_path(&self) -> Option<&Path> {
         self.backup.as_deref()
+    }
+
+    fn had_backup(&self) -> bool {
+        self.backup.is_some()
+    }
+
+    fn rollback(mut self) -> Result<()> {
+        let displaced = unique_sibling_path(&self.final_target, "failed")?;
+        if self.final_target.exists() {
+            std::fs::rename(&self.final_target, &displaced).map_err(|error| {
+                AppError::Other(format!(
+                    "couldn't move the failed Prowlarr install aside for rollback: {error}"
+                ))
+            })?;
+        }
+
+        if let Some(backup) = self.backup.take() {
+            if let Err(restore_error) = std::fs::rename(&backup, &self.final_target) {
+                let recovery = if displaced.exists() {
+                    std::fs::rename(&displaced, &self.final_target).err()
+                } else {
+                    None
+                };
+                return Err(AppError::Other(format!(
+                    "couldn't restore the previous Prowlarr install from {} ({restore_error}); failed-install recovery: {}",
+                    backup.display(),
+                    recovery.map(|e| e.to_string()).unwrap_or_else(|| "the new tree was put back".into())
+                )));
+            }
+        }
+
+        if displaced.exists() {
+            if let Err(error) = std::fs::remove_dir_all(&displaced) {
+                crate::applog::warn(
+                    "setup",
+                    format!(
+                        "Prowlarr rollback succeeded, but failed files at {} could not be removed: {error}",
+                        displaced.display()
+                    ),
+                );
+            }
+        }
+        Ok(())
     }
 
     fn commit(mut self) {
@@ -1076,7 +1183,10 @@ fn replace_directory_rollback_safe(
         std::fs::rename(staged, final_target).map_err(|error| {
             AppError::Other(format!("couldn't activate the staged Prowlarr install: {error}"))
         })?;
-        return Ok(PendingDirectoryActivation { backup: None });
+        return Ok(PendingDirectoryActivation {
+            final_target: final_target.to_path_buf(),
+            backup: None,
+        });
     }
 
     let backup = unique_sibling_path(final_target, "backup")?;
@@ -1098,6 +1208,7 @@ fn replace_directory_rollback_safe(
     }
 
     Ok(PendingDirectoryActivation {
+        final_target: final_target.to_path_buf(),
         backup: Some(backup),
     })
 }
@@ -1251,7 +1362,13 @@ pub async fn install_prowlarr(app: &AppHandle) -> Result<String> {
         .await?
         .error_for_status()
         .map_err(|e| AppError::Other(format!("Prowlarr download failed: {e}")))?;
+    const MAX_PROWLARR_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
     let total = resp.content_length().unwrap_or(0);
+    if total > MAX_PROWLARR_ARCHIVE_BYTES {
+        return Err(AppError::Other(format!(
+            "Prowlarr archive was unexpectedly large ({total} bytes)"
+        )));
+    }
     let mut bytes: Vec<u8> = Vec::with_capacity(total as usize);
     let mut hasher = Sha256::new();
     let mut stream = resp;
@@ -1259,8 +1376,13 @@ pub async fn install_prowlarr(app: &AppHandle) -> Result<String> {
     while let Some(chunk) = stream.chunk().await? {
         hasher.update(&chunk);
         bytes.extend_from_slice(&chunk);
-        if total > 0 {
-            let pct = (bytes.len() as u64 * 100 / total) as u32;
+        if bytes.len() as u64 > MAX_PROWLARR_ARCHIVE_BYTES {
+            return Err(AppError::Other(
+                "Prowlarr archive exceeded the 512 MiB safety limit".into(),
+            ));
+        }
+        if let Some(pct) = (bytes.len() as u64).saturating_mul(100).checked_div(total) {
+            let pct = pct as u32;
             if pct >= last_pct + 5 {
                 last_pct = pct;
                 emit(app, "prowlarr", "progress", json!({ "pct": pct }));
@@ -1323,9 +1445,11 @@ pub async fn install_prowlarr(app: &AppHandle) -> Result<String> {
     // old process serving from unlinked inodes while the new one can't
     // bind). The seeded key proves the process on :9696 is ours — a foreign
     // Prowlarr the user runs themselves is never killed.
+    let mut previous_was_running = false;
     if managed_prowlarr_exe().exists() {
         if let Some(key) = read_prowlarr_api_key() {
             if prowlarr_is_ours(state, &key).await {
+                previous_was_running = true;
                 emit(app, "prowlarr", "log", json!({ "message": "Stopping the running Prowlarr…" }));
                 stop_managed_prowlarr(state, &key).await?;
             }
@@ -1367,13 +1491,29 @@ pub async fn install_prowlarr(app: &AppHandle) -> Result<String> {
             key
         }
         Err(error) => {
-            if let Some(backup) = activation.backup_path() {
+            let had_backup = activation.had_backup();
+            if let Err(stop_error) = stop_failed_managed_prowlarr(state).await {
                 return Err(AppError::Other(format!(
-                    "{error}; the previous Prowlarr executables were retained at {}",
-                    backup.display()
+                    "{error}; rollback was not attempted because the failed Prowlarr process could not be stopped ({stop_error})"
                 )));
             }
-            return Err(error);
+            activation.rollback().map_err(|rollback_error| {
+                AppError::Other(format!(
+                    "{error}; restoring the previous Prowlarr install also failed ({rollback_error})"
+                ))
+            })?;
+            if had_backup && previous_was_running {
+                if let Err(restart_error) = start_managed_prowlarr_inner(state).await {
+                    return Err(AppError::Other(format!(
+                        "{error}; the previous Prowlarr files were restored, but restarting them failed ({restart_error})"
+                    )));
+                }
+            }
+            return Err(AppError::Other(if had_backup {
+                format!("{error}; the previous Prowlarr install was restored")
+            } else {
+                format!("{error}; the failed fresh Prowlarr install was removed")
+            }));
         }
     };
     emit(app, "prowlarr", "done", json!({ "message": "Prowlarr is running and connected" }));
@@ -1916,7 +2056,8 @@ fn qbt_password_blob(password: &str) -> String {
 /// `fresh` additionally pre-accepts the legal notice (only used when the ini
 /// didn't exist — i.e. the install the user explicitly clicked for; without
 /// it qBittorrent halts ALL startup, WebUI included, behind a modal).
-pub fn ensure_qbt_ini(ini: &str, credentials: Option<(&str, &str)>, fresh: bool) -> String {
+#[cfg(test)]
+fn ensure_qbt_ini(ini: &str, credentials: Option<(&str, &str)>, fresh: bool) -> String {
     ensure_qbt_ini_port(ini, credentials, fresh, 8080)
 }
 
@@ -2262,7 +2403,7 @@ fn qbt_linux_asset(release: &Value) -> Result<QbtLinuxAsset> {
                 .unwrap_or_default()
                 .contains("_lt20")
         })
-        .or_else(|| assets.iter().filter(matches).next())
+        .or_else(|| assets.iter().find(matches))
         .ok_or_else(|| AppError::Other("could not find qBittorrent's Linux x86_64 AppImage".into()))?;
     let url = asset
         .get("browser_download_url")
@@ -2312,7 +2453,7 @@ fn qbt_windows_asset(release: &Value) -> Result<QbtWindowsAsset> {
                 .unwrap_or_default()
                 .contains("_lt20_")
         })
-        .or_else(|| assets.iter().filter(matches).next())
+        .or_else(|| assets.iter().find(matches))
         .ok_or_else(|| AppError::Other("could not find qBittorrent's Windows x64 installer".into()))?;
     let url = asset
         .get("browser_download_url")
@@ -2576,6 +2717,7 @@ mod tests {
     use super::ensure_qbt_ini;
     use super::extract_windows_prowlarr;
     use super::folder_write_probe;
+    use super::offline_prowlarr_status;
     use super::parse_windows_sid;
     use super::prowlarr_asset;
     use super::process_command_matches_managed;
@@ -2599,6 +2741,26 @@ mod tests {
         assert!(claim_prowlarr_lifecycle(&busy).is_err());
         drop(first);
         assert!(claim_prowlarr_lifecycle(&busy).is_ok());
+    }
+
+    #[test]
+    fn incomplete_managed_prowlarr_is_offered_for_repair() {
+        assert_eq!(
+            offline_prowlarr_status("http://127.0.0.1:9696", false),
+            "missing"
+        );
+        assert_eq!(
+            offline_prowlarr_status("http://127.0.0.1:9696/", true),
+            "managed_stopped"
+        );
+        assert_eq!(
+            offline_prowlarr_status("http://nas.local:9696", false),
+            "unreachable"
+        );
+        assert_eq!(
+            offline_prowlarr_status("http://nas.local:9696", true),
+            "unreachable"
+        );
     }
 
     #[test]
@@ -2742,7 +2904,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_readiness_keeps_previous_executable_tree() {
+    fn failed_readiness_restores_previous_executable_tree() {
         let root = temp_path("prowlarr-readiness-failure");
         let final_target = root.join("Prowlarr");
         let staged = root.join("stage");
@@ -2752,10 +2914,25 @@ mod tests {
         std::fs::write(staged.join("new.dll"), b"new").unwrap();
 
         let activation = replace_directory_rollback_safe(&staged, &final_target).unwrap();
-        let backup = activation.backup_path().unwrap().to_path_buf();
-        drop(activation); // simulates config/readiness failing before commit
-        assert_eq!(std::fs::read(backup.join("old.dll")).unwrap(), b"old");
-        assert_eq!(std::fs::read(final_target.join("new.dll")).unwrap(), b"new");
+        activation.rollback().unwrap();
+        assert_eq!(std::fs::read(final_target.join("old.dll")).unwrap(), b"old");
+        assert!(!final_target.join("new.dll").exists());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_fresh_activation_removes_broken_tree() {
+        let root = temp_path("prowlarr-fresh-readiness-failure");
+        let final_target = root.join("Prowlarr");
+        let staged = root.join("stage");
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::write(staged.join("new.dll"), b"new").unwrap();
+
+        let activation = replace_directory_rollback_safe(&staged, &final_target).unwrap();
+        activation.rollback().unwrap();
+        assert!(!final_target.exists());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
         std::fs::remove_dir_all(root).unwrap();
     }
 

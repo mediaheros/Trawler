@@ -494,6 +494,7 @@ pub struct GrabResult {
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri exposes these as named invoke parameters.
 pub async fn grab(
     state: State<'_, AppState>,
     title: String,
@@ -552,6 +553,7 @@ pub async fn perform_grab_core(
     http: &reqwest::Client,
     cfg: &Config,
     order: &crate::grab::GrabOrder,
+    content_key: &str,
 ) -> Result<()> {
     let q = qbit(http, cfg);
     let save_path = order.save_path.clone().unwrap_or_default();
@@ -575,6 +577,15 @@ pub async fn perform_grab_core(
         }
         _ => return Err(AppError::NoDownloadSource),
     };
+
+    if order.info_hash.is_none() {
+        let resolved_hash = crate::scheduler::magnet_hash(magnet.as_deref())
+            .or_else(|| torrent_bytes.as_deref().and_then(crate::qbit::torrent_info_hash));
+        if let Some(info_hash) = resolved_hash {
+            let conn = crate::db::open_existing()?;
+            crate::db::ledger_set_dispatch_info_hash(&conn, content_key, &info_hash)?;
+        }
+    }
 
     let ratio_limit = match cfg.seed_policy.as_str() {
         "none" => Some(0.0),
@@ -921,7 +932,7 @@ pub async fn indexer_defs(state: State<'_, AppState>) -> Result<Vec<IndexerDef>>
             language: d.get("language").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         })
         .collect();
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out.sort_by_key(|a| a.name.to_lowercase());
     Ok(out)
 }
 
@@ -990,7 +1001,7 @@ pub struct BitportStatus {
 
 #[tauri::command]
 pub async fn bitport_authorize_url() -> Result<String> {
-    Ok(crate::bitport::authorize_url())
+    Ok(crate::bitport::authorize_url(None))
 }
 
 /// The whole connect handshake behind one button: claim the callback port,
@@ -1005,12 +1016,18 @@ pub async fn bitport_connect_flow(
     // bind first: a blocked port must fail now, with a reason, not after a
     // five-minute wait on a redirect that could never arrive
     let listener = crate::bitport::bind_callback().await?;
-    let url = crate::bitport::authorize_url();
+    let oauth_state = crate::bitport::new_oauth_state()?;
+    let url = crate::bitport::authorize_url(Some(&oauth_state));
     crate::applog::info("bitport", "waiting for browser approval on 127.0.0.1:8788");
     app.opener()
         .open_url(url.clone(), None::<&str>)
         .map_err(|e| AppError::Other(format!("could not open your browser ({e}) — visit {url} manually")))?;
-    let code = crate::bitport::await_code(listener, std::time::Duration::from_secs(300)).await?;
+    let code = crate::bitport::await_code(
+        listener,
+        std::time::Duration::from_secs(300),
+        &oauth_state,
+    )
+    .await?;
     let token = crate::bitport::exchange_code(&state.http, &code).await?;
     bitport_store_and_probe(&state, token).await
 }
@@ -1094,7 +1111,8 @@ pub async fn bitport_delete(state: State<'_, AppState>, token: String) -> Result
     let vic_hash = victim.as_ref().and_then(crate::bitport::transfer_hash);
     let vic_norm = victim.as_ref().map(|t| normalize(&t.name));
     let conn = state.db.lock().await;
-    let rows: Vec<(i64, String, Option<String>, Option<String>, Option<String>)> = conn
+    type BitportLedgerRow = (i64, String, Option<String>, Option<String>, Option<String>);
+    let rows: Vec<BitportLedgerRow> = conn
         .prepare("SELECT id, title, info_hash, ep_ids, bp_token FROM grab_ledger WHERE backend = 'bitport' AND state IN ('grabbed','completed')")
         .ok()
         .map(|mut stmt| {

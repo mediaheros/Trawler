@@ -310,22 +310,22 @@ async fn grab_release(state: &AppState, ctx: &mut RunCtx, args: &Value) -> Value
             }
         }
     }
-    // Free-disk floor from qBittorrent's own accounting (best effort).
+    // Capacity floor from the backend that will actually receive the grab.
     let cfg = state.config.read().await.clone();
-    let q = crate::qbit::QbitClient {
-        http: &state.http,
-        base: cfg.qbit_url.clone(),
-        username: cfg.qbit_username.clone(),
-        password: cfg.qbit_password.clone(),
-    };
-    if let Ok(free) = q.free_space().await {
-        if (free as f64) < cfg.agent_min_free_disk_gb * 1e9 {
+    let free = match crate::grab::selected_backend_free_bytes(&state.http, &cfg).await {
+        Ok(free) => free,
+        Err(error) => {
             return err(format!(
-                "refusing: download disk has only {:.0} GB free (floor is {:.0} GB)",
-                free as f64 / 1e9,
-                cfg.agent_min_free_disk_gb
-            ));
+                "refusing: could not verify free space on the selected download backend ({error})"
+            ))
         }
+    };
+    if (free as f64) < cfg.agent_min_free_disk_gb * 1e9 {
+        return err(format!(
+            "refusing: selected download backend has only {:.0} GB free (floor is {:.0} GB)",
+            free as f64 / 1e9,
+            cfg.agent_min_free_disk_gb
+        ));
     }
 
     let reason = clean_text(args.get("reason").and_then(|v| v.as_str()).unwrap_or(""), 200);
