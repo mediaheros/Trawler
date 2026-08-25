@@ -1,0 +1,230 @@
+name: Publish verified release artifacts
+
+# Promotion only: this workflow never compiles. Every platform must first pass
+# its manual build workflow at the same source commit.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version without the v prefix (must match package.json)
+        required: true
+        type: string
+      source_commit:
+        description: Full commit SHA used by every platform build
+        required: true
+        type: string
+      windows_x64_run:
+        description: Successful Windows x64 workflow run ID
+        required: true
+        type: string
+      windows_arm64_run:
+        description: Successful Windows ARM64 workflow run ID
+        required: true
+        type: string
+      macos_run:
+        description: Successful macOS universal workflow run ID
+        required: true
+        type: string
+      linux_x64_run:
+        description: Successful Linux x64 workflow run ID
+        required: true
+        type: string
+      release_notes:
+        description: Updater/release notes
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: trawler-release-promotion
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Verify, normalize, and publish existing artifacts
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPOSITORY: ${{ github.repository }}
+      VERSION: ${{ inputs.version }}
+      SOURCE_COMMIT: ${{ inputs.source_commit }}
+      RELEASE_NOTES: ${{ inputs.release_notes }}
+      WINDOWS_X64_RUN: ${{ inputs.windows_x64_run }}
+      WINDOWS_ARM64_RUN: ${{ inputs.windows_arm64_run }}
+      MACOS_RUN: ${{ inputs.macos_run }}
+      LINUX_X64_RUN: ${{ inputs.linux_x64_run }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_commit }}
+
+      - name: Verify version and build provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          for run_id in "$WINDOWS_X64_RUN" "$WINDOWS_ARM64_RUN" "$MACOS_RUN" "$LINUX_X64_RUN"; do
+            [[ "$run_id" =~ ^[0-9]+$ ]]
+          done
+          test "$(node -p "require('./package.json').version")" = "$VERSION"
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          verify_run() {
+            local run_id="$1"
+            local workflow_path="$2"
+            local conclusion head path
+            conclusion="$(gh api "repos/$REPOSITORY/actions/runs/$run_id" --jq .conclusion)"
+            head="$(gh api "repos/$REPOSITORY/actions/runs/$run_id" --jq .head_sha)"
+            path="$(gh api "repos/$REPOSITORY/actions/runs/$run_id" --jq .path)"
+            test "$conclusion" = success
+            test "$head" = "$SOURCE_COMMIT"
+            test "$path" = "$workflow_path"
+          }
+          verify_run "$WINDOWS_X64_RUN" '.github/workflows/windows-x64.yml'
+          verify_run "$WINDOWS_ARM64_RUN" '.github/workflows/windows-arm64.yml'
+          verify_run "$MACOS_RUN" '.github/workflows/macos-universal.yml'
+          verify_run "$LINUX_X64_RUN" '.github/workflows/linux-x64.yml'
+
+      - uses: actions/download-artifact@v5
+        with:
+          name: Trawler-windows-x64
+          path: artifacts/windows-x64
+          run-id: ${{ inputs.windows_x64_run }}
+          github-token: ${{ github.token }}
+
+      - uses: actions/download-artifact@v5
+        with:
+          name: Trawler-windows-arm64
+          path: artifacts/windows-arm64
+          run-id: ${{ inputs.windows_arm64_run }}
+          github-token: ${{ github.token }}
+
+      - uses: actions/download-artifact@v5
+        with:
+          name: Trawler-macos-universal
+          path: artifacts/macos
+          run-id: ${{ inputs.macos_run }}
+          github-token: ${{ github.token }}
+
+      - uses: actions/download-artifact@v5
+        with:
+          name: Trawler-linux-x64
+          path: artifacts/linux-x64
+          run-id: ${{ inputs.linux_x64_run }}
+          github-token: ${{ github.token }}
+
+      - name: Normalize assets and build updater manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s globstar nullglob
+          exactly_one() {
+            local label="$1"
+            shift
+            local matches=("$@")
+            if [[ ${#matches[@]} -ne 1 ]]; then
+              echo "Expected exactly one $label artifact, found ${#matches[@]}" >&2
+              return 1
+            fi
+            printf '%s' "${matches[0]}"
+          }
+          wx="$(exactly_one exe artifacts/windows-x64/**/*-setup.exe)"
+          wx_sig="$(exactly_one sig artifacts/windows-x64/**/*-setup.exe.sig)"
+          wa="$(exactly_one exe artifacts/windows-arm64/**/*-setup.exe)"
+          wa_sig="$(exactly_one sig artifacts/windows-arm64/**/*-setup.exe.sig)"
+          mac_dmg="$(exactly_one dmg artifacts/macos/**/*.dmg)"
+          mac_tar="$(exactly_one tar artifacts/macos/**/*.app.tar.gz)"
+          mac_sig="$(exactly_one sig artifacts/macos/**/*.app.tar.gz.sig)"
+          linux_app="$(exactly_one appimage artifacts/linux-x64/**/*.AppImage)"
+          linux_sig="$(exactly_one sig artifacts/linux-x64/**/*.AppImage.sig)"
+          linux_deb="$(exactly_one deb artifacts/linux-x64/**/*.deb)"
+          linux_rpm="$(exactly_one rpm artifacts/linux-x64/**/*.rpm)"
+
+          mkdir release-assets
+          install -m 0644 "$wx" "release-assets/Trawler_${VERSION}_windows-x64-setup.exe"
+          install -m 0644 "$wx_sig" "release-assets/Trawler_${VERSION}_windows-x64-setup.exe.sig"
+          install -m 0644 "$wa" "release-assets/Trawler_${VERSION}_windows-arm64-setup.exe"
+          install -m 0644 "$wa_sig" "release-assets/Trawler_${VERSION}_windows-arm64-setup.exe.sig"
+          install -m 0644 "$mac_dmg" "release-assets/Trawler_${VERSION}_macos-universal.dmg"
+          install -m 0644 "$mac_tar" "release-assets/Trawler_${VERSION}_macos-universal.app.tar.gz"
+          install -m 0644 "$mac_sig" "release-assets/Trawler_${VERSION}_macos-universal.app.tar.gz.sig"
+          install -m 0755 "$linux_app" "release-assets/Trawler_${VERSION}_linux-x64.AppImage"
+          install -m 0644 "$linux_sig" "release-assets/Trawler_${VERSION}_linux-x64.AppImage.sig"
+          install -m 0644 "$linux_deb" "release-assets/Trawler_${VERSION}_linux-x64.deb"
+          install -m 0644 "$linux_rpm" "release-assets/Trawler_${VERSION}_linux-x64.rpm"
+
+          wx_url="https://github.com/$REPOSITORY/releases/download/v$VERSION/Trawler_${VERSION}_windows-x64-setup.exe"
+          wa_url="https://github.com/$REPOSITORY/releases/download/v$VERSION/Trawler_${VERSION}_windows-arm64-setup.exe"
+          mac_url="https://github.com/$REPOSITORY/releases/download/v$VERSION/Trawler_${VERSION}_macos-universal.app.tar.gz"
+          linux_url="https://github.com/$REPOSITORY/releases/download/v$VERSION/Trawler_${VERSION}_linux-x64.AppImage"
+          wx_signature="$(tr -d '\r\n' <"$wx_sig")"
+          wa_signature="$(tr -d '\r\n' <"$wa_sig")"
+          mac_signature="$(tr -d '\r\n' <"$mac_sig")"
+          linux_signature="$(tr -d '\r\n' <"$linux_sig")"
+          published="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          jq -n \
+            --arg version "$VERSION" \
+            --arg notes "$RELEASE_NOTES" \
+            --arg published "$published" \
+            --arg wx_url "$wx_url" --arg wx_sig "$wx_signature" \
+            --arg wa_url "$wa_url" --arg wa_sig "$wa_signature" \
+            --arg mac_url "$mac_url" --arg mac_sig "$mac_signature" \
+            --arg linux_url "$linux_url" --arg linux_sig "$linux_signature" \
+            '{version:$version,notes:$notes,pub_date:$published,platforms:{
+              "windows-x86_64":{url:$wx_url,signature:$wx_sig},
+              "windows-x86_64-nsis":{url:$wx_url,signature:$wx_sig},
+              "windows-aarch64":{url:$wa_url,signature:$wa_sig},
+              "windows-aarch64-nsis":{url:$wa_url,signature:$wa_sig},
+              "darwin-aarch64":{url:$mac_url,signature:$mac_sig},
+              "darwin-x86_64":{url:$mac_url,signature:$mac_sig},
+              "darwin-universal":{url:$mac_url,signature:$mac_sig},
+              "linux-x86_64-appimage":{url:$linux_url,signature:$linux_sig}
+            }}' >release-assets/latest.json
+          (cd release-assets && sha256sum -- * >SHA256SUMS)
+
+      - name: Publish one coherent release
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          created=false
+          cleanup_failed_draft() {
+            if [[ "$created" == true ]]; then
+              gh release delete "$tag" --cleanup-tag --yes --repo "$REPOSITORY" || true
+            fi
+          }
+          trap cleanup_failed_draft ERR
+          if gh release view "$tag" --repo "$REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $tag already exists; refusing to overwrite it" >&2
+            exit 1
+          fi
+          if gh api "repos/$REPOSITORY/git/ref/tags/$tag" >/dev/null 2>&1; then
+            echo "Tag $tag already exists without a release; refusing ambiguous provenance" >&2
+            exit 1
+          fi
+          gh release create "$tag" \
+            --repo "$REPOSITORY" \
+            --target "$SOURCE_COMMIT" \
+            --title "Trawler $tag" \
+            --notes "$RELEASE_NOTES" \
+            --draft
+          created=true
+          gh release upload "$tag" release-assets/* --repo "$REPOSITORY"
+          gh release edit "$tag" --draft=false --latest --repo "$REPOSITORY"
+          created=false
+          trap - ERR
+
+      - name: Preserve production manifest for website deployment
+        uses: actions/upload-artifact@v4
+        with:
+          name: Trawler-${{ inputs.version }}-release-manifest
+          path: |
+            release-assets/latest.json
+            release-assets/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30

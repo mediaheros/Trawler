@@ -53,6 +53,9 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Run frontend tests
+        run: npm test
+
       - name: Run Rust tests
         working-directory: src-tauri
         run: cargo test --all-targets
@@ -125,7 +128,6 @@ jobs:
           fi
 
       - name: Upload Linux packages
-        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: Trawler-linux-x64
