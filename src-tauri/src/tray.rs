@@ -7,12 +7,14 @@ use tauri::{
     App, AppHandle, Manager,
 };
 
-pub(crate) fn show_main(app: &AppHandle) {
+pub(crate) fn show_main(app: &AppHandle) -> bool {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
         let _ = w.unminimize();
         let _ = w.set_focus();
+        return w.is_visible().unwrap_or(false);
     }
+    false
 }
 
 pub fn init(app: &App) -> tauri::Result<()> {
@@ -37,7 +39,9 @@ pub fn init(app: &App) -> tauri::Result<()> {
         // on Windows left-click is reserved and double-click opens the app
         .show_menu_on_left_click(cfg!(target_os = "macos"))
         .on_menu_event(|app, event| match event.id.as_ref() {
-            "open" => show_main(app),
+            "open" => {
+                show_main(app);
+            }
             "check" => {
                 let handle = app.clone();
                 tauri::async_runtime::spawn(async move {

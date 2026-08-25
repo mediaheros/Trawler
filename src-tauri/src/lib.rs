@@ -13,6 +13,7 @@ mod error;
 mod follows;
 mod bitport;
 mod grab;
+mod launch_visibility;
 mod llm;
 mod notify;
 mod parse;
@@ -248,6 +249,17 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {
+            // The NSIS updater can relaunch a healthy WebView without a
+            // visible top-level window. Force a visible launch once per new
+            // version; same-version tray and autostart behavior is unchanged.
+            #[cfg(target_os = "windows")]
+            if matches!(&event, tauri::RunEvent::Ready) {
+                if launch_visibility::should_show() && tray::show_main(app_handle) {
+                    if let Err(e) = launch_visibility::record_visible() {
+                        applog::warn("app", format!("could not record visible launch version: {e}"));
+                    }
+                }
+            }
             // clicking the Dock icon with the window hidden is THE macOS
             // gesture for "bring it back" — without this it does nothing
             #[cfg(target_os = "macos")]
