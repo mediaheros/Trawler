@@ -79,9 +79,11 @@ jobs:
           [[ ${#rpms[@]} -eq 1 ]]
           file "${appimages[0]}" | grep -q 'ELF 64-bit.*x86-64'
           dpkg-deb --info "${debs[0]}" >/dev/null
-          dpkg-deb --contents "${debs[0]}" | grep -q '/usr/bin/trawler$'
+          dpkg-deb --contents "${debs[0]}" >deb-contents.txt
+          grep -q '/usr/bin/trawler$' deb-contents.txt
           rpm -qip "${rpms[0]}" >/dev/null
-          rpm -qlp "${rpms[0]}" | grep -q '/usr/bin/trawler$'
+          rpm -qlp "${rpms[0]}" >rpm-contents.txt
+          grep -q '/usr/bin/trawler$' rpm-contents.txt
           chmod +x "${appimages[0]}"
           set +e
           timeout 15s dbus-run-session -- xvfb-run -a env \

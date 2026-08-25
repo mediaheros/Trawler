@@ -1280,9 +1280,8 @@ pub async fn install_flaresolverr(app: &AppHandle) -> Result<()> {
         }
     }
     let _archive_guard = TempFile(archive_path.clone());
-    let mut downloaded: u64 = 0;
     let mut hasher = Sha256::new();
-    {
+    let downloaded = {
         let mut out = std::fs::File::create(&archive_path)?;
         let mut stream = resp;
         let mut got: u64 = 0;
@@ -1300,8 +1299,8 @@ pub async fn install_flaresolverr(app: &AppHandle) -> Result<()> {
                 }
             }
         }
-        downloaded = got;
-    }
+        got
+    };
     if total > 0 && downloaded != total {
         return Err(AppError::Other(format!(
             "the download ended early ({downloaded} of {total} bytes) — check the connection and try again"
