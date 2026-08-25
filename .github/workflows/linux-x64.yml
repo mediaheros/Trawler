@@ -31,6 +31,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential \
+            cpio \
             dbus-x11 \
             file \
             libayatana-appindicator3-dev \
@@ -41,6 +42,7 @@ jobs:
             patchelf \
             rpm \
             wget \
+            xauth \
             xvfb
 
       - name: Select stable Rust
@@ -64,7 +66,7 @@ jobs:
           --bundles appimage,deb,rpm
           --config src-tauri/tauri.linux-ci.conf.json
 
-      - name: Verify packages and launch the AppImage under Xvfb
+      - name: Verify package structures
         shell: bash
         run: |
           set -euo pipefail
@@ -77,13 +79,27 @@ jobs:
           [[ ${#signatures[@]} -eq 1 ]]
           [[ ${#debs[@]} -eq 1 ]]
           [[ ${#rpms[@]} -eq 1 ]]
-          file "${appimages[0]}" | grep -q 'ELF 64-bit.*x86-64'
+          appimage_file="$(file "${appimages[0]}")"
+          echo "$appimage_file"
+          [[ "$appimage_file" == *"ELF 64-bit"* ]]
+          [[ "$appimage_file" == *"x86-64"* ]]
           dpkg-deb --info "${debs[0]}" >/dev/null
-          dpkg-deb --contents "${debs[0]}" >deb-contents.txt
-          grep -q '/usr/bin/trawler$' deb-contents.txt
-          rpm -qip "${rpms[0]}" >/dev/null
-          rpm -qlp "${rpms[0]}" >rpm-contents.txt
-          grep -q '/usr/bin/trawler$' rpm-contents.txt
+          mkdir deb-root rpm-root
+          dpkg-deb --extract "${debs[0]}" deb-root
+          test -x deb-root/usr/bin/trawler
+          (
+            cd rpm-root
+            rpm2cpio "../${rpms[0]}" | cpio -idm --quiet
+          )
+          test -x rpm-root/usr/bin/trawler
+
+      - name: Launch the AppImage under Xvfb
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          appimages=(src-tauri/target/release/bundle/appimage/*.AppImage)
+          [[ ${#appimages[@]} -eq 1 ]]
           chmod +x "${appimages[0]}"
           set +e
           timeout 15s dbus-run-session -- xvfb-run -a env \
@@ -102,6 +118,7 @@ jobs:
           fi
 
       - name: Upload Linux packages
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: Trawler-linux-x64
