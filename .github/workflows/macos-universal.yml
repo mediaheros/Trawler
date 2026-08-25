@@ -44,7 +44,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: >-
-          npm run tauri -- build --ci --bundles dmg
+          npm run tauri -- build --ci --bundles app,dmg
           --target universal-apple-darwin
           --config src-tauri/tauri.macos-ci.conf.json
 
