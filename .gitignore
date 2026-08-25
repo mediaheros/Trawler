@@ -4,7 +4,10 @@ src-tauri/target/
 src-tauri/gen/
 *.local
 .DS_Store
-docs/dl/
+# Release binaries stay out of Git, but the updater manifest is source and
+# must be reviewed so one platform cannot silently overwrite the others.
+docs/dl/*
+!docs/dl/latest.json
 dev.cmd
 .claude/
 

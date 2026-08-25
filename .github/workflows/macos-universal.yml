@@ -1,0 +1,69 @@
+name: macOS universal build
+
+# Intentionally manual-only. Pushes, pull requests, and tags cannot start it.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Repeated clicks cannot create concurrent builds; only the newest run survives.
+concurrency:
+  group: trawler-macos-universal-build
+  cancel-in-progress: true
+
+jobs:
+  macos-universal:
+    name: Build universal macOS disk image
+    runs-on: macos-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Select stable Rust and both macOS targets
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Run Rust tests
+        working-directory: src-tauri
+        run: cargo test --all-targets
+
+      - name: Build ad-hoc-signed universal DMG and updater archive
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: >-
+          npm run tauri -- build --ci --bundles dmg
+          --target universal-apple-darwin
+          --config src-tauri/tauri.macos-ci.conf.json
+
+      - name: Verify the app bundle and both architectures
+        run: |
+          app="src-tauri/target/universal-apple-darwin/release/bundle/macos/Trawler.app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign -dvvv "$app"
+          archs="$(lipo -archs "$app/Contents/MacOS/trawler")"
+          [[ " $archs " == *" arm64 "* ]]
+          [[ " $archs " == *" x86_64 "* ]]
+
+      - name: Upload macOS packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: Trawler-macos-universal
+          path: |
+            src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz
+            src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz.sig
+          if-no-files-found: error
+          retention-days: 7

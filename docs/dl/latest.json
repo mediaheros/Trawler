@@ -1,0 +1,23 @@
+{
+  "version": "0.5.1",
+  "notes": "### Windows x64\nDownload `Trawler_*_x64-setup.exe`.\n\nThis build is not Authenticode-signed, so Windows SmartScreen may\nrequire **More info → Run anyway** on first launch.",
+  "pub_date": "2026-08-24T21:24:51.440Z",
+  "platforms": {
+    "windows-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVDdvNU5DYTR2dzFNbHlXbmpGN3hkVVU4T2R2VjFneVl2bGE2Y2lVcWpLTW54NnA1c05SRDI1VytJUkZSWFVYTWRDMTFqa2JZVGhoY05zZEZtT29Qb0tmaWUzVG9qa0FrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg3NjA2Njg5CWZpbGU6VHJhd2xlcl8wLjUuMV94NjQtc2V0dXAuZXhlCkpOMDgvYm96ZGZ6V0JHL29hMmpqME92T2EvOWJkRlpJWEVsRTZteXpoL0JnU2lraEdqUERoTmNISi83QncrL3pIZlY3aHRQVVpiTnBDN3paekpPakFnPT0K",
+      "url": "https://mediahero.org/dl/0.5.1/Trawler_0.5.1_x64-setup.exe"
+    },
+    "windows-x86_64-nsis": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVDdvNU5DYTR2dzFNbHlXbmpGN3hkVVU4T2R2VjFneVl2bGE2Y2lVcWpLTW54NnA1c05SRDI1VytJUkZSWFVYTWRDMTFqa2JZVGhoY05zZEZtT29Qb0tmaWUzVG9qa0FrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg3NjA2Njg5CWZpbGU6VHJhd2xlcl8wLjUuMV94NjQtc2V0dXAuZXhlCkpOMDgvYm96ZGZ6V0JHL29hMmpqME92T2EvOWJkRlpJWEVsRTZteXpoL0JnU2lraEdqUERoTmNISi83QncrL3pIZlY3aHRQVVpiTnBDN3paekpPakFnPT0K",
+      "url": "https://mediahero.org/dl/0.5.1/Trawler_0.5.1_x64-setup.exe"
+    },
+    "windows-aarch64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVDdvNU5DYTR2dzFJOXZ3S2p1MkhPQUJjZU1waE4rNlp0RHNKZTJVbzlubHRkbFFHQStpVitMU2pKRHlHNmxxRVlNWnhLODNsOGhpcE9mSHNFZ2VieFhONUtUc2xjVVFRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg3NjQ4MTQwCWZpbGU6VHJhd2xlcl8wLjUuMV93aW5kb3dzLWFybTY0LXNldHVwLmV4ZQo3Q2ErcXd6aHJXQkRWaXk5MWM1OUNhdzlRWjJkWXdsaHpMOVNtUlpRTVRrdFJTZ3VUUHJCa3E2MDkrclZZRGtLdlhVK1FrSzV0T21ERXNYT0FMbDBDZz09Cg==",
+      "url": "https://mediahero.org/dl/0.5.1/Trawler_0.5.1_windows-arm64-setup.exe"
+    },
+    "windows-aarch64-nsis": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVDdvNU5DYTR2dzFJOXZ3S2p1MkhPQUJjZU1waE4rNlp0RHNKZTJVbzlubHRkbFFHQStpVitMU2pKRHlHNmxxRVlNWnhLODNsOGhpcE9mSHNFZ2VieFhONUtUc2xjVVFRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg3NjQ4MTQwCWZpbGU6VHJhd2xlcl8wLjUuMV93aW5kb3dzLWFybTY0LXNldHVwLmV4ZQo3Q2ErcXd6aHJXQkRWaXk5MWM1OUNhdzlRWjJkWXdsaHpMOVNtUlpRTVRrdFJTZ3VUUHJCa3E2MDkrclZZRGtLdlhVK1FrSzV0T21ERXNYT0FMbDBDZz09Cg==",
+      "url": "https://mediahero.org/dl/0.5.1/Trawler_0.5.1_windows-arm64-setup.exe"
+    }
+  }
+}
