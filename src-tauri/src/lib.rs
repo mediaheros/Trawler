@@ -101,7 +101,9 @@ pub fn run() {
                 use tauri::Manager;
                 let state = boot_handle.state::<AppState>();
                 let url = { state.config.read().await.prowlarr_url.clone() };
-                if url.contains("127.0.0.1:9696") && setup::managed_prowlarr_exe().exists() {
+                if url.contains("127.0.0.1:9696")
+                    && setup::managed_prowlarr_install_is_complete()
+                {
                     let up = state
                         .http
                         .get("http://127.0.0.1:9696/ping")
@@ -113,6 +115,13 @@ pub fn run() {
                     if !up {
                         let _ = setup::start_managed_prowlarr(state.inner()).await;
                     }
+                } else if url.contains("127.0.0.1:9696")
+                    && setup::managed_prowlarr_exe().exists()
+                {
+                    applog::warn(
+                        "setup",
+                        "managed Prowlarr installation is incomplete — waiting for a clean reinstall",
+                    );
                 }
                 // FlareSolverr is opt-in; but once opted in, it should come
                 // back after a reboot without the user thinking about it

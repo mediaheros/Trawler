@@ -52,6 +52,30 @@ pub fn managed_prowlarr_exe() -> PathBuf {
     if legacy.exists() { legacy } else { new }
 }
 
+fn prowlarr_runtime_files_complete_at(dir: &Path, required: &[&str]) -> bool {
+    required.iter().all(|name| {
+        std::fs::metadata(dir.join(name))
+            .map(|metadata| metadata.is_file() && metadata.len() > 0)
+            .unwrap_or(false)
+    })
+}
+
+/// An executable by itself is not an installation. The broken Windows
+/// extractor left Prowlarr.exe behind while silently dropping AngleSharp.dll,
+/// which made every automatic start open a fatal .NET dialog. Treat that tree
+/// as missing so the setup UI offers a clean reinstall instead of starting it.
+pub fn managed_prowlarr_install_is_complete() -> bool {
+    let exe = managed_prowlarr_exe();
+    let Some(dir) = exe.parent() else {
+        return false;
+    };
+    #[cfg(windows)]
+    const REQUIRED: &[&str] = &["Prowlarr.exe", "AngleSharp.dll"];
+    #[cfg(not(windows))]
+    const REQUIRED: &[&str] = &["Prowlarr"];
+    prowlarr_runtime_files_complete_at(dir, REQUIRED)
+}
+
 fn managed_prowlarr_dir() -> PathBuf {
     managed_prowlarr_exe()
         .parent()
@@ -455,7 +479,7 @@ pub async fn status(state: &AppState) -> SetupStatus {
                 Err(_) => "ok",
             }
         }
-    } else if managed_prowlarr_exe().exists() {
+    } else if managed_prowlarr_install_is_complete() {
         "managed_stopped"
     } else {
         "missing"
@@ -772,8 +796,11 @@ fn terminate_managed_prowlarr_pid(pid: u32, force: bool) -> bool {
 
 fn spawn_managed_prowlarr() -> Result<()> {
     let exe = managed_prowlarr_exe();
-    if !exe.exists() {
-        return Err(AppError::Other("no managed Prowlarr install found".into()));
+    if !managed_prowlarr_install_is_complete() {
+        return Err(AppError::Other(
+            "the managed Prowlarr installation is incomplete — reinstall it from Trawler setup"
+                .into(),
+        ));
     }
     // Prowlarr's self-updater replaces binaries with fresh unsigned ones —
     // re-signing here is idempotent and cheap, and un-bricks that case
@@ -2675,6 +2702,22 @@ mod tests {
         assert!(verify_extracted_files(&target, &manifest).is_err());
         std::fs::write(target.join("AngleSharp.dll"), b"0123456789").unwrap();
         assert!(verify_extracted_files(&target, &manifest).is_ok());
+        std::fs::remove_dir_all(target).unwrap();
+    }
+
+    #[test]
+    fn runtime_completeness_rejects_executable_only_or_empty_dependencies() {
+        let target = temp_path("prowlarr-runtime-complete");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("Prowlarr.exe"), b"exe").unwrap();
+        let required = &["Prowlarr.exe", "AngleSharp.dll"];
+        assert!(!super::prowlarr_runtime_files_complete_at(&target, required));
+
+        std::fs::write(target.join("AngleSharp.dll"), b"").unwrap();
+        assert!(!super::prowlarr_runtime_files_complete_at(&target, required));
+        std::fs::write(target.join("AngleSharp.dll"), b"assembly").unwrap();
+        assert!(super::prowlarr_runtime_files_complete_at(&target, required));
+
         std::fs::remove_dir_all(target).unwrap();
     }
 
