@@ -92,7 +92,11 @@ jobs:
           dpkg-deb --extract "${debs[0]}" deb-root
           test -x deb-root/usr/bin/trawler
           rpm_path="$(realpath "${rpms[0]}")"
-          rpm2cpio "$rpm_path" >package.cpio
+          # Ubuntu 22.04's rpm2cpio can emit a complete, valid archive but
+          # still return 1 for RPM v3 packages produced by Tauri. Accept that
+          # false-negative only when an archive was actually written; cpio
+          # and the executable check below remain the authoritative guards.
+          rpm2cpio "$rpm_path" >package.cpio || test -s package.cpio
           (cd rpm-root && cpio -idm --quiet <../package.cpio)
           test -x rpm-root/usr/bin/trawler
 
