@@ -4,7 +4,7 @@
 //! editing its ini while it isn't running. Progress streams to the UI as
 //! `setup-step` events.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -64,6 +64,129 @@ fn managed_prowlarr_data() -> PathBuf {
         return legacy;
     }
     local_app_data().join("TrawlerTools").join("ProwlarrData")
+}
+
+/// Match Prowlarr's own startup check: creating a file is not enough if the
+/// process cannot also write and delete it. The unique name means a crashed
+/// prior probe can never make a healthy folder look broken.
+fn folder_write_probe(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    let mut nonce = [0u8; 8];
+    if getrandom::getrandom(&mut nonce).is_err() {
+        nonce.copy_from_slice(&(crate::db::now() as u64).to_le_bytes());
+    }
+    let suffix: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
+    let probe = path.join(format!(".trawler-write-test-{suffix}.tmp"));
+    let result = (|| {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)?;
+        file.write_all(b"Trawler managed Prowlarr write test")?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::remove_file(&probe)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&probe);
+    }
+    result
+}
+
+#[cfg(any(windows, test))]
+fn parse_windows_sid(whoami_csv: &str) -> Option<String> {
+    whoami_csv.lines().find_map(|line| {
+        let sid = line.rsplit(',').next()?.trim().trim_matches('"');
+        let body = sid.strip_prefix("S-")?;
+        (body.starts_with("1-")
+            && sid.len() <= 192
+            && body.chars().all(|c| c.is_ascii_digit() || c == '-'))
+        .then(|| sid.to_string())
+    })
+}
+
+/// Prowlarr's Windows startup adds an inheritable Everyone/Modify ACL before
+/// its write test. On Windows ARM the x64 build can fail during that ACL path.
+/// Seed the same rule with native icacls plus an explicit rule for the current
+/// user, so Prowlarr sees its intended ACL already present and leaves it alone.
+#[cfg(windows)]
+fn repair_windows_prowlarr_acl(path: &Path) -> std::result::Result<(), String> {
+    let mut whoami = std::process::Command::new("whoami.exe");
+    whoami.args(["/user", "/fo", "csv", "/nh"]);
+    {
+        use std::os::windows::process::CommandExt;
+        whoami.creation_flags(0x0800_0000);
+    }
+    let whoami = whoami
+        .output()
+        .map_err(|e| format!("couldn't read the current Windows user SID: {e}"))?;
+    if !whoami.status.success() {
+        let detail = String::from_utf8_lossy(&whoami.stderr);
+        return Err(format!(
+            "Windows could not determine the current user SID: {}",
+            detail.trim().chars().take(240).collect::<String>()
+        ));
+    }
+    let sid = parse_windows_sid(&String::from_utf8_lossy(&whoami.stdout))
+        .ok_or_else(|| "Windows did not return a usable current-user SID".to_string())?;
+
+    let current_user_rule = format!("*{sid}:(OI)(CI)M");
+    // S-1-1-0 is Everyone. IO makes this the same inherit-only rule Prowlarr
+    // itself adds; access to the directory is supplied by the user rule.
+    let prowlarr_rule = "*S-1-1-0:(OI)(CI)(IO)M";
+    let mut icacls = std::process::Command::new("icacls.exe");
+    icacls
+        .arg(path)
+        .args(["/inheritance:e", "/grant"])
+        .arg(current_user_rule)
+        .arg(prowlarr_rule)
+        .arg("/Q");
+    {
+        use std::os::windows::process::CommandExt;
+        icacls.creation_flags(0x0800_0000);
+    }
+    let output = icacls
+        .output()
+        .map_err(|e| format!("couldn't start Windows ACL repair: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        Err(format!(
+            "Windows ACL repair failed: {}",
+            detail.trim().chars().take(240).collect::<String>()
+        ))
+    }
+}
+
+fn ensure_prowlarr_data_writable(path: &Path) -> Result<()> {
+    std::fs::create_dir_all(path)?;
+
+    #[cfg(not(windows))]
+    return folder_write_probe(path).map_err(|error| {
+        AppError::Other(format!(
+            "Prowlarr's data folder is not writable ({}): {error}",
+            path.display()
+        ))
+    });
+
+    #[cfg(windows)]
+    {
+        repair_windows_prowlarr_acl(path).map_err(|error| {
+            AppError::Other(format!(
+                "Could not prepare Prowlarr's Windows data permissions ({}): {error}",
+                path.display()
+            ))
+        })?;
+        folder_write_probe(path).map_err(|error| {
+            AppError::Other(format!(
+                "Prowlarr's data folder is not writable after Windows permission repair ({}): {error}",
+                path.display()
+            ))
+        })?;
+        Ok(())
+    }
 }
 
 #[cfg(windows)]
@@ -382,7 +505,7 @@ pub fn upsert_xml_tag(xml: &str, tag: &str, value: &str) -> String {
 /// on later boots — a login the user deliberately created is left alone.
 fn seed_managed_prowlarr_config() -> Result<String> {
     let data = managed_prowlarr_data();
-    std::fs::create_dir_all(&data)?;
+    ensure_prowlarr_data_writable(&data)?;
     let path = data.join("config.xml");
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     let key = read_prowlarr_api_key().unwrap_or_else(random_api_key);
@@ -455,7 +578,7 @@ pub fn start_managed_prowlarr() -> Result<()> {
     if let Some(dir) = exe.parent() {
         let _ = sign_prowlarr_tree(dir);
     }
-    let _ = seed_managed_prowlarr_config();
+    seed_managed_prowlarr_config()?;
     let data = managed_prowlarr_data();
     spawn_detached(&exe, &[format!("-data={}", data.display())])
 }
@@ -1681,8 +1804,33 @@ pub async fn install_qbt(app: &AppHandle) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::ensure_qbt_ini;
+    use super::folder_write_probe;
+    use super::parse_windows_sid;
     use super::qbt_windows_asset;
     use super::upsert_xml_tag;
+
+    #[test]
+    fn write_probe_checks_create_write_and_delete() {
+        let path = std::env::temp_dir().join(format!(
+            "trawler-prowlarr-write-probe-{}",
+            super::random_api_key()
+        ));
+        folder_write_probe(&path).unwrap();
+        assert!(path.is_dir());
+        assert_eq!(std::fs::read_dir(&path).unwrap().count(), 0);
+        std::fs::remove_dir(&path).unwrap();
+    }
+
+    #[test]
+    fn parses_only_valid_windows_user_sids() {
+        let output = "\"ARMBOX\\dev\",\"S-1-5-21-123-456-789-1001\"\r\n";
+        assert_eq!(
+            parse_windows_sid(output).as_deref(),
+            Some("S-1-5-21-123-456-789-1001")
+        );
+        assert_eq!(parse_windows_sid("dev,S-1-5-21-1 & whoami"), None);
+        assert_eq!(parse_windows_sid("unexpected output"), None);
+    }
 
     #[test]
     fn selects_normal_qbt_windows_installer_with_digest() {
