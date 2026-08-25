@@ -1,6 +1,6 @@
 {
   "version": "0.5.1",
-  "notes": "### Windows x64\nDownload `Trawler_*_x64-setup.exe`.\n\nThis build is not Authenticode-signed, so Windows SmartScreen may\nrequire **More info → Run anyway** on first launch.",
+  "notes": "Trawler 0.5.1 adds Windows x64 and ARM64 installers, an unsigned universal macOS build, and Linux x64 AppImage support.",
   "pub_date": "2026-08-24T21:24:51.440Z",
   "platforms": {
     "windows-x86_64": {
