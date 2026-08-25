@@ -18,6 +18,18 @@
     "windows-aarch64-nsis": {
       "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVDdvNU5DYTR2dzFJOXZ3S2p1MkhPQUJjZU1waE4rNlp0RHNKZTJVbzlubHRkbFFHQStpVitMU2pKRHlHNmxxRVlNWnhLODNsOGhpcE9mSHNFZ2VieFhONUtUc2xjVVFRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg3NjQ4MTQwCWZpbGU6VHJhd2xlcl8wLjUuMV93aW5kb3dzLWFybTY0LXNldHVwLmV4ZQo3Q2ErcXd6aHJXQkRWaXk5MWM1OUNhdzlRWjJkWXdsaHpMOVNtUlpRTVRrdFJTZ3VUUHJCa3E2MDkrclZZRGtLdlhVK1FrSzV0T21ERXNYT0FMbDBDZz09Cg==",
       "url": "https://mediahero.org/dl/0.5.1/Trawler_0.5.1_windows-arm64-setup.exe"
+    },
+    "darwin-aarch64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVDdvNU5DYTR2dzhiRU43UWJwMFhFMisyMVFsU1lac1RnbnpGUHIxQ1BZQnMzMjI5enEyQmIvSHR4Zi9CN0swcGVxWVVMTUZuemo5Qys3cHRNSWZkSFVGUkx6UFZRUUFNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg3NjUwMDM5CWZpbGU6VHJhd2xlci5hcHAudGFyLmd6CmdYbEMzWHlsTnB2RWxHM05iNkNBeTdjN2huemNLbXV0MFFmRVAyV0loS2oyWDl5dXBsZ1M4cEgyNnluOVJibjNWSTE0N0MrNUhQVUdQZjFyOUk3dERRPT0K",
+      "url": "https://mediahero.org/dl/0.5.1/Trawler.app.tar.gz"
+    },
+    "darwin-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVDdvNU5DYTR2dzhiRU43UWJwMFhFMisyMVFsU1lac1RnbnpGUHIxQ1BZQnMzMjI5enEyQmIvSHR4Zi9CN0swcGVxWVVMTUZuemo5Qys3cHRNSWZkSFVGUkx6UFZRUUFNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg3NjUwMDM5CWZpbGU6VHJhd2xlci5hcHAudGFyLmd6CmdYbEMzWHlsTnB2RWxHM05iNkNBeTdjN2huemNLbXV0MFFmRVAyV0loS2oyWDl5dXBsZ1M4cEgyNnluOVJibjNWSTE0N0MrNUhQVUdQZjFyOUk3dERRPT0K",
+      "url": "https://mediahero.org/dl/0.5.1/Trawler.app.tar.gz"
+    },
+    "darwin-universal": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVDdvNU5DYTR2dzhiRU43UWJwMFhFMisyMVFsU1lac1RnbnpGUHIxQ1BZQnMzMjI5enEyQmIvSHR4Zi9CN0swcGVxWVVMTUZuemo5Qys3cHRNSWZkSFVGUkx6UFZRUUFNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg3NjUwMDM5CWZpbGU6VHJhd2xlci5hcHAudGFyLmd6CmdYbEMzWHlsTnB2RWxHM05iNkNBeTdjN2huemNLbXV0MFFmRVAyV0loS2oyWDl5dXBsZ1M4cEgyNnluOVJibjNWSTE0N0MrNUhQVUdQZjFyOUk3dERRPT0K",
+      "url": "https://mediahero.org/dl/0.5.1/Trawler.app.tar.gz"
     }
   }
 }

@@ -76,7 +76,7 @@ Download from **[mediahero.org](https://mediahero.org/#download)**:
 - **Windows 11 ARM64** — `Trawler_*_windows-arm64-setup.exe`. Trawler runs natively; Prowlarr and qBittorrent use Windows x64 emulation.
 - **macOS 12+** — `Trawler_universal.dmg`, one app for Apple Silicon and Intel. Drag to Applications.
 
-Builds carry no OS certificates yet, so the first launch asks for trust once: Windows SmartScreen wants *More info → Run anyway*; macOS Gatekeeper wants a right-click → *Open*. The signed updater currently covers Windows x64 and macOS; ARM64 updates are manual for now.
+Builds carry no OS certificates yet, so the first launch asks for trust once: Windows SmartScreen wants *More info → Run anyway*; on macOS, try to open Trawler once, then choose *System Settings → Privacy & Security → Open Anyway*. The signed updater covers Windows x64, Windows ARM64, and macOS.
 
 ## Five-minute setup
 
