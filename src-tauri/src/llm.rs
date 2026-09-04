@@ -36,6 +36,26 @@ impl ChatMsg {
     }
 }
 
+/// Locate the JSON object in a model reply, tolerating code fences, leading
+/// prose, and `<think>…</think>` reasoning blocks. Never panics: a reply whose
+/// last `}` precedes its first `{` (a think block containing a brace, then a
+/// truncated object) must not slice `start..=end` with `end < start`, which
+/// aborts the whole app under `panic = "abort"`. Returns the reply untouched
+/// when no object is found, so the caller's parse error names the real text.
+pub fn extract_json_object(text: &str) -> &str {
+    let text = match text.rfind("</think>") {
+        Some(i) => &text[i + "</think>".len()..],
+        None => text,
+    };
+    let Some(start) = text.find('{') else {
+        return text;
+    };
+    match text.rfind('}').filter(|&end| end >= start) {
+        Some(end) => &text[start..=end],
+        None => &text[start..],
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     #[serde(default = "default_call_id")]

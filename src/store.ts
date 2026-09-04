@@ -97,7 +97,8 @@ interface Store {
   // ---- agent ----
   chat: ChatRow[];
   chatLoaded: boolean;
-  loadChat: () => Promise<void>;
+  /** resolves true when the transcript was replaced with stored rows */
+  loadChat: () => Promise<boolean>;
   agentBusy: boolean;
   agentClearing: boolean;
   liveSteps: LiveStep[];
@@ -448,7 +449,7 @@ export const useStore = create<Store>((set, get) => ({
     const revision = chatRevision;
     try {
       const rows = await api.agentHistory();
-      if (mine !== chatLoadSeq) return;
+      if (mine !== chatLoadSeq) return false;
       // DB ids are small AUTOINCREMENT integers — the local id counter
       // must start above them or React keys (and the send-rollback
       // filter) collide with persisted history rows
@@ -460,6 +461,7 @@ export const useStore = create<Store>((set, get) => ({
             : [...rows, ...state.chat.filter((message) => message.id < 0)],
         chatLoaded: true,
       }));
+      return true;
     } catch (e) {
       if (mine === chatLoadSeq) {
         // the composer is disabled until history has loaded; a failed load
@@ -468,6 +470,7 @@ export const useStore = create<Store>((set, get) => ({
         get().toast(`Couldn't load the conversation history: ${String(e)}`, "bad");
       }
     }
+    return false;
   },
   agentBusy: false,
   agentClearing: false,
@@ -589,8 +592,10 @@ export const useStore = create<Store>((set, get) => ({
           const revision = chatRevision;
           void get()
             .loadChat()
-            .then(() => {
-              if (revision === chatRevision) set({ liveSteps: [] });
+            .then((replaced) => {
+              // a failed reload keeps the live cards: they are the only
+              // record of the run until the stored rows arrive
+              if (replaced && revision === chatRevision) set({ liveSteps: [] });
             });
           void get().loadProposals();
           break;

@@ -211,44 +211,29 @@ const COMPILE_PROMPT: &str = r#"You compile a user's media-hunting brief into a 
 }
 Be conservative: include only terms clearly implied by the brief. If the user names a size limit, quality, or things to avoid, encode them. The include list is a hard filter — put ONLY terms that will appear in every valid release name (e.g. "ufc"), NOT descriptive words like "main card" that release names may omit; put soft preferences in notes."#;
 
-/// Locate the JSON object in a model reply, tolerating code fences, leading
-/// prose, and `<think>…</think>` reasoning blocks. Never panics: a reply whose
-/// last `}` precedes its first `{` (a think block containing a brace, then a
-/// truncated object) used to slice `start..=end` with `end < start`, which
-/// aborts the whole app under `panic = "abort"`.
-fn extract_json_object(text: &str) -> &str {
-    let text = match text.rfind("</think>") {
-        Some(i) => &text[i + "</think>".len()..],
-        None => text,
-    };
-    let Some(start) = text.find('{') else {
-        return text;
-    };
-    match text.rfind('}').filter(|&end| end >= start) {
-        Some(end) => &text[start..=end],
-        None => &text[start..],
-    }
-}
-
 /// One LLM call turning a natural-language brief into a HuntPlan (then sanitized).
 pub async fn compile(client: &LlmClient, brief_prompt: &str) -> Result<HuntPlan> {
-    let messages = vec![
+    let mut messages = vec![
         ChatMsg::system(COMPILE_PROMPT),
         ChatMsg::user(format!("Brief: {}", brief_prompt.chars().take(1000).collect::<String>())),
     ];
-    let mut messages = messages;
     let mut last_err = String::new();
+    let mut last_reply = String::new();
     for attempt in 0..2 {
         if attempt > 0 {
             // a second identical request to a deterministic backend fails the
-            // same way; tell the model what was wrong with its first reply
+            // same way; show the model its own reply and what was wrong with
+            // it. The assistant turn keeps roles alternating — backends with
+            // strict chat templates reject user,user with HTTP 400.
+            messages.push(ChatMsg::assistant_text(last_reply.clone()));
             messages.push(ChatMsg::user(format!(
-                "Your previous reply could not be used ({last_err}). Reply with ONLY the JSON object, no prose, no code fence."
+                "That reply could not be used ({last_err}). Reply with ONLY the JSON object, no prose, no code fence."
             )));
         }
         let reply = client.chat(&messages, None).await?;
         let text = reply.content.unwrap_or_default();
-        let json_str = extract_json_object(&text);
+        let json_str = crate::llm::extract_json_object(&text);
+        last_reply = text.chars().take(4000).collect();
         match serde_json::from_str::<HuntPlan>(json_str) {
             Ok(plan) => {
                 let plan = plan.sanitize();
@@ -282,6 +267,8 @@ mod tests {
             notes: String::new(),
         }
     }
+
+    use crate::llm::extract_json_object;
 
     #[test]
     fn extract_json_object_never_panics_on_odd_brace_order() {

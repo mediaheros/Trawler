@@ -1496,10 +1496,14 @@ pub async fn install_prowlarr(app: &AppHandle) -> Result<String> {
         start_managed_prowlarr_inner(state).await?;
 
         {
+            // save before committing to memory: a refused save must not
+            // leave the UI believing the managed instance is configured
             let mut cfg = state.config.write().await;
-            cfg.prowlarr_url = "http://127.0.0.1:9696".into();
-            cfg.prowlarr_api_key = key.clone();
-            crate::config::save(&cfg)?;
+            let mut next = cfg.clone();
+            next.prowlarr_url = "http://127.0.0.1:9696".into();
+            next.prowlarr_api_key = key.clone();
+            crate::config::save(&next)?;
+            *cfg = next;
         }
         Ok(key)
     }

@@ -234,26 +234,45 @@ pub async fn dispatch(
             crate::applog::info("bitport", format!("sent to cloud: {}", order.title.chars().take(70).collect::<String>()));
                 Ok(tok)
             } else {
-                match perform_grab_core(&http, &cfg, &order, &ck).await {
-                    Ok(()) => Ok(None),
-                    // The torrent is already in qBittorrent (a reap that fired
-                    // on a partial listing, or the user added it by hand).
-                    // Abandoning the claim here made the scheduler pick the
-                    // same top release again next cycle, forever. Adopt it:
-                    // the ledger row finishes as grabbed and the completion
-                    // pass tracks the existing torrent like any other.
-                    Err(AppError::QbitDuplicate) => {
-                        crate::applog::info(
-                            "grab",
-                            format!(
-                                "qBittorrent already had \"{}\" — adopting the existing torrent",
-                                order.title.chars().take(70).collect::<String>()
-                            ),
-                        );
-                        Ok(None)
-                    }
-                    Err(error) => Err(error),
+                let core = perform_grab_core(&http, &cfg, &order, &ck).await?;
+                // the hash qBittorrent tracks wins over the search result's
+                // claim, and it is what ledger_finish_dispatch records below —
+                // otherwise a stale indexer hash is written straight back
+                // over the corrected one
+                if core.info_hash.is_some() {
+                    order.info_hash = core.info_hash;
                 }
+                if core.duplicate {
+                    // "Fails." means either the torrent is already in
+                    // qBittorrent (a reap that fired on a partial listing, or
+                    // the user added it by hand) or qBittorrent could not
+                    // parse it. Only the first is a grab: confirm by hash.
+                    // Abandoning a real duplicate made the scheduler pick the
+                    // same top release again every cycle, forever.
+                    let q = crate::commands::qbit(&http, &cfg);
+                    let present = match order.info_hash.as_deref() {
+                        Some(h) => q
+                            .list(None)
+                            .await?
+                            .into_iter()
+                            .any(|t| t.hash.eq_ignore_ascii_case(h)),
+                        None => false,
+                    };
+                    if !present {
+                        return Err(AppError::Other(format!(
+                            "qBittorrent rejected \"{}\" — it could not parse the torrent",
+                            order.title.chars().take(70).collect::<String>()
+                        )));
+                    }
+                    crate::applog::info(
+                        "grab",
+                        format!(
+                            "qBittorrent already had \"{}\" — adopting the existing torrent",
+                            order.title.chars().take(70).collect::<String>()
+                        ),
+                    );
+                }
+                Ok(None)
             }
         }
         .await;
