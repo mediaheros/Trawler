@@ -1,0 +1,126 @@
+name: Audit CI - Linux x64
+
+# TEMPORARY: push-triggered copy of linux-x64.yml for the audit branch,
+# because that workflow is dispatch-only. Delete this file before merging.
+on:
+  push:
+    branches:
+      - audit/v0.5.4-fixes
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trawler-audit-linux-x64
+  cancel-in-progress: true
+
+jobs:
+  linux-x64:
+    name: Test, build and smoke-test Linux x64
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Tauri and package verification dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cpio \
+            dbus-x11 \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf \
+            rpm \
+            wget \
+            xauth \
+            xvfb
+
+      - name: Select stable Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Run frontend tests
+        run: npm test
+
+      - name: Run Rust tests
+        working-directory: src-tauri
+        run: cargo test --all-targets
+
+      - name: Build AppImage, Debian, and RPM packages
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: >-
+          npm run tauri -- build --ci
+          --bundles appimage,deb,rpm
+          --config src-tauri/tauri.linux-ci.conf.json
+
+      - name: Verify package structures
+        shell: bash
+        run: |
+          set -euxo pipefail
+          shopt -s nullglob
+          appimages=(src-tauri/target/release/bundle/appimage/*.AppImage)
+          appimage_signatures=(src-tauri/target/release/bundle/appimage/*.AppImage.sig)
+          debs=(src-tauri/target/release/bundle/deb/*.deb)
+          deb_signatures=(src-tauri/target/release/bundle/deb/*.deb.sig)
+          rpms=(src-tauri/target/release/bundle/rpm/*.rpm)
+          rpm_signatures=(src-tauri/target/release/bundle/rpm/*.rpm.sig)
+          [[ ${#appimages[@]} -eq 1 ]]
+          [[ ${#appimage_signatures[@]} -eq 1 ]]
+          [[ ${#debs[@]} -eq 1 ]]
+          [[ ${#deb_signatures[@]} -eq 1 ]]
+          [[ ${#rpms[@]} -eq 1 ]]
+          [[ ${#rpm_signatures[@]} -eq 1 ]]
+          appimage_file="$(file "${appimages[0]}")"
+          echo "$appimage_file"
+          [[ "$appimage_file" == *"ELF 64-bit"* ]]
+          [[ "$appimage_file" == *"x86-64"* ]]
+          dpkg-deb --info "${debs[0]}" >/dev/null
+          mkdir deb-root rpm-root
+          dpkg-deb --extract "${debs[0]}" deb-root
+          test -x deb-root/usr/bin/trawler
+          rpm_path="$(realpath "${rpms[0]}")"
+          rpm2cpio "$rpm_path" >package.cpio || test -s package.cpio
+          (cd rpm-root && cpio -idm --quiet <../package.cpio)
+          test -x rpm-root/usr/bin/trawler
+
+      - name: Launch the AppImage under Xvfb
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          appimages=(src-tauri/target/release/bundle/appimage/*.AppImage)
+          [[ ${#appimages[@]} -eq 1 ]]
+          chmod +x "${appimages[0]}"
+          set +e
+          timeout 15s dbus-run-session -- xvfb-run -a env \
+            APPIMAGE_EXTRACT_AND_RUN=1 \
+            WEBKIT_DISABLE_COMPOSITING_MODE=1 \
+            "${appimages[0]}" >appimage-smoke.log 2>&1
+          status=$?
+          set -e
+          if [[ $status -ne 124 && $status -ne 143 ]]; then
+            cat appimage-smoke.log
+            exit 1
+          fi
+          if grep -Eiq 'panicked at|undefined symbol|error while loading shared libraries|segmentation fault' appimage-smoke.log; then
+            cat appimage-smoke.log
+            exit 1
+          fi

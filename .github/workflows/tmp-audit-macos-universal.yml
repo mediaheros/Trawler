@@ -1,0 +1,63 @@
+name: Audit CI - macOS universal
+
+# TEMPORARY: push-triggered copy of macos-universal.yml for the audit branch,
+# because that workflow is dispatch-only. Delete this file before merging.
+on:
+  push:
+    branches:
+      - audit/v0.5.4-fixes
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trawler-audit-macos-universal
+  cancel-in-progress: true
+
+jobs:
+  macos-universal:
+    name: Test and build universal macOS
+    runs-on: macos-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Select stable Rust and both macOS targets
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Run frontend tests
+        run: npm test
+
+      - name: Run Rust tests
+        working-directory: src-tauri
+        run: cargo test --all-targets
+
+      - name: Build ad-hoc-signed universal DMG and updater archive
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: >-
+          npm run tauri -- build --ci --bundles app,dmg
+          --target universal-apple-darwin
+          --config src-tauri/tauri.macos-ci.conf.json
+
+      - name: Verify the app bundle and both architectures
+        run: |
+          app="src-tauri/target/universal-apple-darwin/release/bundle/macos/Trawler.app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign -dvvv "$app"
+          archs="$(lipo -archs "$app/Contents/MacOS/trawler")"
+          [[ " $archs " == *" arm64 "* ]]
+          [[ " $archs " == *" x86_64 "* ]]

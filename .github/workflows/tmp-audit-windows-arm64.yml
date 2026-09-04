@@ -1,0 +1,52 @@
+name: Audit CI - Windows ARM64
+
+# TEMPORARY: push-triggered copy of windows-arm64.yml for the audit branch,
+# because that workflow is dispatch-only. Delete this file before merging.
+on:
+  push:
+    branches:
+      - audit/v0.5.4-fixes
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trawler-audit-windows-arm64
+  cancel-in-progress: true
+
+jobs:
+  windows-arm64:
+    name: Test and build Windows ARM64
+    runs-on: windows-11-arm
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Select stable Rust and ARM64 target
+        shell: pwsh
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup target add aarch64-pc-windows-msvc
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Run frontend tests
+        run: npm test
+
+      - name: Run Rust tests on Windows ARM64
+        working-directory: src-tauri
+        run: cargo test --all-targets --target aarch64-pc-windows-msvc
+
+      - name: Build Windows ARM64 NSIS installer
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri -- build --ci --bundles nsis --target aarch64-pc-windows-msvc --config src-tauri/tauri.windows-ci.conf.json
