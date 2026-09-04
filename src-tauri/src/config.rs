@@ -226,7 +226,25 @@ fn load_from_path(path: &std::path::Path) -> Config {
             format!("could not secure existing Trawler configuration files: {error}"),
         );
     }
-    let raw = std::fs::read_to_string(path).ok();
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => Some(raw),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            // a file that exists but cannot be read right now (permissions,
+            // a sharing violation, a roaming profile mid-sync) is not "no
+            // config": starting with defaults would make the setup wizard
+            // save over it and destroy every stored key and token
+            CONFIG_READ_FAILED.store(true, std::sync::atomic::Ordering::SeqCst);
+            crate::applog::error(
+                "app",
+                format!(
+                    "config.json exists but could not be read ({e}); running with defaults and \
+                     refusing to save settings until Trawler is restarted, so the file is not overwritten"
+                ),
+            );
+            return Config::default();
+        }
+    };
     let parsed = raw.as_deref().map(serde_json::from_str::<Config>);
     match parsed {
         Some(Ok(c)) => c,
@@ -273,7 +291,19 @@ pub fn load() -> Config {
     cfg
 }
 
+/// Set when config.json exists but could not be read at startup. While set,
+/// `save` refuses to run: the in-memory config is defaults, and writing it
+/// would silently replace the user's real settings and secrets.
+static CONFIG_READ_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn save(cfg: &Config) -> Result<()> {
+    if CONFIG_READ_FAILED.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(crate::error::AppError::Other(
+            "config.json could not be read when Trawler started, so settings are not being saved \
+             to avoid overwriting it — restart Trawler and try again"
+                .into(),
+        ));
+    }
     // two concurrent saves must not interleave writes to one tmp file —
     // the rename would make the corruption permanent
     static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
