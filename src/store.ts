@@ -102,6 +102,8 @@ interface Store {
   agentBusy: boolean;
   agentClearing: boolean;
   liveSteps: LiveStep[];
+  /** a run died mid-tool: keep its live cards, the stored rows lack the last one */
+  liveStepsPinned: boolean;
   agentThinking: boolean;
   sendToAgent: (text: string) => Promise<void>;
   clearChat: () => Promise<void>;
@@ -464,7 +466,7 @@ export const useStore = create<Store>((set, get) => ({
         // keeping liveSteps rendered each step twice under a pulsing avatar.
         // Whichever reload lands (the run's own, or the Agent view mounting
         // mid-run) clears them — but never while a run is still producing.
-        liveSteps: state.agentBusy ? state.liveSteps : [],
+        liveSteps: state.agentBusy || state.liveStepsPinned ? state.liveSteps : [],
       }));
       return true;
     } catch (e) {
@@ -480,10 +482,11 @@ export const useStore = create<Store>((set, get) => ({
   agentBusy: false,
   agentClearing: false,
   liveSteps: [],
+  liveStepsPinned: false,
   agentThinking: false,
   sendToAgent: async (text) => {
     if (!text.trim() || get().agentBusy || get().agentClearing || !get().chatLoaded) return;
-    set({ agentBusy: true, liveSteps: [], agentThinking: true });
+    set({ agentBusy: true, liveSteps: [], liveStepsPinned: false, agentThinking: true });
     // optimistic: show the user's message instantly
     const optimisticId = -(chatSeq++);
     ++chatRevision;
@@ -522,7 +525,7 @@ export const useStore = create<Store>((set, get) => ({
       await api.agentClear();
       ++chatLoadSeq;
       ++chatRevision;
-      set({ chat: [], liveSteps: [] });
+      set({ chat: [], liveSteps: [], liveStepsPinned: false });
     } catch (e) {
       get().toast(String(e), "bad");
     } finally {
@@ -582,6 +585,9 @@ export const useStore = create<Store>((set, get) => ({
             agentBusy: false,
             agentThinking: false,
             liveSteps: st.liveSteps.map((x) => ({ ...x, running: false })),
+            // a tool cut off by the deadline was never persisted; the live
+            // card is the only record of what hung, so the reload keeps it
+            liveStepsPinned: true,
           }));
           get().toast(s.payload.message ?? "agent error", "bad");
           // the backend persisted a "⚠ …" assistant row before emitting this

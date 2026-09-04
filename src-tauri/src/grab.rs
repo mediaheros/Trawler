@@ -272,27 +272,72 @@ pub async fn dispatch(
                             order.title.chars().take(70).collect::<String>()
                         )));
                     };
-                    // a stopped torrent is a corpse the dead-swarm medic
-                    // paused on purpose; adopting it would park the episodes
-                    // on it forever (never stalled again, never reaped)
-                    if existing.state.starts_with("stopped") || existing.state.starts_with("paused") {
+                    // The dead-swarm medic's corpse is known from the ledger,
+                    // not from qBittorrent's state: a torrent may be stopped
+                    // for many benign reasons (added paused, finished under a
+                    // stop-when-complete seed policy, paused by hand) and all
+                    // of those are adoptable. A stalled ledger row for this
+                    // torrent means Trawler already judged it dead; parking
+                    // the episodes on it again would leave them there forever.
+                    let is_corpse = {
+                        let conn = db::open_existing()?;
+                        let norm = crate::commands::normalize(&existing.name);
+                        let title_norm = crate::commands::normalize(&order.title);
+                        conn.prepare(
+                            "SELECT title, info_hash FROM grab_ledger WHERE state = 'stalled' AND backend = 'qbittorrent'",
+                        )
+                        .ok()
+                        .and_then(|mut stmt| {
+                            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))
+                                .ok()
+                                .map(|rows| {
+                                    rows.flatten().any(|(title, hash)| {
+                                        hash.is_some_and(|h| h.eq_ignore_ascii_case(&existing.hash))
+                                            || crate::commands::normalize(&title) == norm
+                                            || crate::commands::normalize(&title) == title_norm
+                                    })
+                                })
+                        })
+                        .unwrap_or(false)
+                    };
+                    if is_corpse {
                         return Err(AppError::Other(format!(
-                            "qBittorrent already has \"{}\" but it is stopped — Trawler paused it as a dead swarm; pick another release or resume it by hand",
+                            "qBittorrent already has \"{}\" but Trawler paused it as a dead swarm — pick another release, or resume it by hand",
                             order.title.chars().take(70).collect::<String>()
+                        )));
+                    }
+                    // a torrent whose payload is gone or that qBittorrent has
+                    // flagged as broken must not become a "downloaded" episode
+                    if existing.state == "missingFiles" || existing.state == "error" {
+                        return Err(AppError::Other(format!(
+                            "qBittorrent already has \"{}\" but reports it as {} — fix or remove it there first",
+                            order.title.chars().take(70).collect::<String>(),
+                            existing.state
                         )));
                     }
                     if order.info_hash.is_none() {
                         order.info_hash = Some(existing.hash.clone());
                     }
-                    // make it visible where Trawler's grabs live; the files
-                    // stay wherever the user put them
-                    if !cfg.qbit_category.is_empty() && existing.category != cfg.qbit_category {
+                    // Make it visible where Trawler's grabs live, but only
+                    // when that cannot move anything: never overwrite a
+                    // category the user chose, and never touch a torrent under
+                    // Automatic Torrent Management, which relocates its files
+                    // when the category changes.
+                    if !cfg.qbit_category.is_empty() && existing.category.is_empty() && !existing.auto_tmm {
                         if let Err(e) = q.set_category(&existing.hash, &cfg.qbit_category).await {
                             crate::applog::warn(
                                 "grab",
-                                format!("adopted torrent could not be moved under the {} category: {e}", cfg.qbit_category),
+                                format!("adopted torrent could not be labeled with the {} category: {e}", cfg.qbit_category),
                             );
                         }
+                    } else if existing.category != cfg.qbit_category {
+                        crate::applog::info(
+                            "grab",
+                            format!(
+                                "adopted torrent keeps its own category ({}); it will not appear under Trawler's in Downloads",
+                                if existing.category.is_empty() { "none" } else { existing.category.as_str() }
+                            ),
+                        );
                     }
                     crate::applog::info(
                         "grab",

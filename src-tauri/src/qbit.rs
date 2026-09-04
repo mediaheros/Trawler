@@ -24,6 +24,10 @@ pub struct QbitTorrent {
     pub ratio: f64,
     #[serde(default)]
     pub content_path: String,
+    /// Automatic Torrent Management: qBittorrent relocates the files when
+    /// such a torrent's category changes, so adoption must not touch it.
+    #[serde(default)]
+    pub auto_tmm: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -260,9 +264,9 @@ impl<'a> QbitClient<'a> {
         }
         if body.contains("Fails") {
             // qBittorrent says "Fails." for a torrent it already holds (and,
-            // rarely, for an unparseable one). Treat it as a duplicate: the
-            // caller verifies presence by hash and adopts, or retires the
-            // release — never retries the identical add forever.
+            // rarely, for an unparseable one). Report it as a duplicate: the
+            // dispatcher confirms presence by listing and adopts the existing
+            // torrent, or turns a phantom into a definitive error.
             return Err(AppError::QbitDuplicate);
         }
         Ok(())
@@ -444,7 +448,27 @@ mod tests {
                 .await
                 .unwrap();
             let (mut add_socket, _) = listener.accept().await.unwrap();
-            let _ = add_socket.read(&mut request).await.unwrap();
+            // drain the whole multipart POST before answering: closing with
+            // unread bytes in the receive buffer makes the kernel send RST,
+            // and the client would see a reset instead of the body
+            let mut received = Vec::new();
+            loop {
+                let n = add_socket.read(&mut request).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                received.extend_from_slice(&request[..n]);
+                let text = String::from_utf8_lossy(&received);
+                let Some(header_end) = text.find("\r\n\r\n") else { continue };
+                let content_length = text
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length: ").or_else(|| l.strip_prefix("Content-Length: ")))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if received.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
             add_socket
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nFails.",

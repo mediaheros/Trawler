@@ -250,6 +250,9 @@ fn load_from_path(path: &std::path::Path) -> Config {
     let parsed = raw.as_deref().map(|bytes| {
         std::str::from_utf8(bytes)
             .map_err(|e| e.to_string())
+            // PowerShell's Out-File and Notepad write a UTF-8 BOM, which
+            // serde_json rejects as "expected value"; it is not corruption
+            .map(|text| text.strip_prefix('\u{FEFF}').unwrap_or(text))
             .and_then(|text| serde_json::from_str::<Config>(text).map_err(|e| e.to_string()))
     });
     match parsed {

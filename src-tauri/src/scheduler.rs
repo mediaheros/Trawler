@@ -365,8 +365,9 @@ async fn execute_plan(app: &tauri::AppHandle, state: &AppState, plan: &PlannedGr
 /// user deleted their only torrent — still confirms once the window passes.
 #[derive(Default)]
 struct AbsenceStrikes {
-    /// row id → (first time seen missing, observations)
-    first_missing: std::collections::HashMap<i64, (i64, u32)>,
+    /// row id → (first time seen missing, observations, any observation
+    /// came from an empty listing)
+    first_missing: std::collections::HashMap<i64, (i64, u32, bool)>,
 }
 
 impl AbsenceStrikes {
@@ -388,9 +389,13 @@ impl AbsenceStrikes {
     /// so a retire that fails (a busy database) is retried next cycle
     /// instead of restarting the window.
     fn missing(&mut self, id: i64, now: i64, listing_empty: bool) -> bool {
-        let window = if listing_empty { Self::EMPTY_LISTING_WINDOW_SECS } else { Self::WINDOW_SECS };
-        let slot = self.first_missing.entry(id).or_insert((now, 0));
+        let slot = self.first_missing.entry(id).or_insert((now, 0, false));
         slot.1 += 1;
+        // a weak observation anywhere in the streak (not only the current
+        // one) demands the longer window: an empty listing during a restart
+        // followed by one normal miss is still one real observation
+        slot.2 |= listing_empty;
+        let window = if slot.2 { Self::EMPTY_LISTING_WINDOW_SECS } else { Self::WINDOW_SECS };
         slot.1 >= 2 && now - slot.0 >= window
     }
 }
@@ -1516,6 +1521,7 @@ mod tests {
             num_leechs: 0,
             ratio: 0.0,
             content_path: String::new(),
+            auto_tmm: false,
         }
     }
 
@@ -1601,6 +1607,12 @@ mod tests {
         assert!(!empty.missing(10, t0, true));
         assert!(!empty.missing(10, t0 + w, true));
         assert!(empty.missing(10, t0 + AbsenceStrikes::EMPTY_LISTING_WINDOW_SECS, true));
+        // a weak first observation followed by one normal miss is still one
+        // real observation: the longer window applies to the whole streak
+        let mut weak_first = AbsenceStrikes::default();
+        assert!(!weak_first.missing(11, t0, true));
+        assert!(!weak_first.missing(11, t0 + w, false));
+        assert!(weak_first.missing(11, t0 + AbsenceStrikes::EMPTY_LISTING_WINDOW_SECS, false));
     }
 
     #[test]
