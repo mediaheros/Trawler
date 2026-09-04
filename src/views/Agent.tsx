@@ -174,7 +174,7 @@ export default function AgentView() {
                 {/* live run */}
                 {(liveSteps.length > 0 || agentThinking) && (
                   <div className="mb-5 flex gap-3">
-                    <AgentAvatar pulse />
+                    <AgentAvatar pulse={agentBusy} />
                     <div className="min-w-0 flex-1 space-y-1.5 pt-1">
                       {liveSteps.map((s) => (
                         <LiveStepCard key={s.key} s={s} />

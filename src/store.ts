@@ -461,7 +461,12 @@ export const useStore = create<Store>((set, get) => ({
         chatLoaded: true,
       }));
     } catch (e) {
-      if (mine === chatLoadSeq) get().toast(String(e), "bad");
+      if (mine === chatLoadSeq) {
+        // the composer is disabled until history has loaded; a failed load
+        // must not leave it disabled forever with "Loading conversation…"
+        set({ chatLoaded: true });
+        get().toast(`Couldn't load the conversation history: ${String(e)}`, "bad");
+      }
     }
   },
   agentBusy: false,
@@ -574,12 +579,22 @@ export const useStore = create<Store>((set, get) => ({
           // the backend persisted a "⚠ …" assistant row before emitting this
           void get().loadChat();
           break;
-        case "done":
+        case "done": {
           clearAgentWatchdog();
           set({ agentBusy: false, agentThinking: false });
-          void get().loadChat();
+          // the reloaded transcript carries the run's tool steps as stored
+          // rows; keeping liveSteps around rendered every step twice under a
+          // still-pulsing avatar until the next send. Clear them once the
+          // stored rows are in — unless a new run has started meanwhile.
+          const revision = chatRevision;
+          void get()
+            .loadChat()
+            .then(() => {
+              if (revision === chatRevision) set({ liveSteps: [] });
+            });
           void get().loadProposals();
           break;
+        }
       }
     });
   },
