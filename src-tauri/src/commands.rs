@@ -620,10 +620,19 @@ pub async fn perform_grab_core(
         _ => return Err(AppError::NoDownloadSource),
     };
 
-    if order.info_hash.is_none() {
-        let resolved_hash = crate::scheduler::magnet_hash(magnet.as_deref())
-            .or_else(|| torrent_bytes.as_deref().and_then(crate::qbit::torrent_info_hash));
-        if let Some(info_hash) = resolved_hash {
+    // The hash qBittorrent will actually track comes from the magnet or the
+    // .torrent bytes. Indexer definitions go stale and report wrong hashes;
+    // a ledger row carrying one never matches the running torrent, gets
+    // reaped as "vanished", and the release is grabbed again. So the
+    // resolved hash always wins over whatever the search result claimed.
+    let resolved_hash = crate::scheduler::magnet_hash(magnet.as_deref())
+        .or_else(|| torrent_bytes.as_deref().and_then(crate::qbit::torrent_info_hash));
+    if let Some(info_hash) = resolved_hash {
+        let differs = order
+            .info_hash
+            .as_deref()
+            .is_none_or(|claimed| !claimed.eq_ignore_ascii_case(&info_hash));
+        if differs {
             let conn = crate::db::open_existing()?;
             crate::db::ledger_set_dispatch_info_hash(&conn, content_key, &info_hash)?;
         }

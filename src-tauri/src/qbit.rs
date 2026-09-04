@@ -259,9 +259,11 @@ impl<'a> QbitClient<'a> {
             return Err(qbit_add_status_error(status, &body));
         }
         if body.contains("Fails") {
-            return Err(AppError::Other(
-                "qBittorrent rejected the torrent (duplicate or invalid)".into(),
-            ));
+            // qBittorrent says "Fails." for a torrent it already holds (and,
+            // rarely, for an unparseable one). Treat it as a duplicate: the
+            // caller verifies presence by hash and adopts, or retires the
+            // release — never retries the identical add forever.
+            return Err(AppError::QbitDuplicate);
         }
         Ok(())
     }

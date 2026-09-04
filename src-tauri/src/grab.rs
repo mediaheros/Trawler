@@ -234,8 +234,26 @@ pub async fn dispatch(
             crate::applog::info("bitport", format!("sent to cloud: {}", order.title.chars().take(70).collect::<String>()));
                 Ok(tok)
             } else {
-                perform_grab_core(&http, &cfg, &order, &ck).await?;
-                Ok(None)
+                match perform_grab_core(&http, &cfg, &order, &ck).await {
+                    Ok(()) => Ok(None),
+                    // The torrent is already in qBittorrent (a reap that fired
+                    // on a partial listing, or the user added it by hand).
+                    // Abandoning the claim here made the scheduler pick the
+                    // same top release again next cycle, forever. Adopt it:
+                    // the ledger row finishes as grabbed and the completion
+                    // pass tracks the existing torrent like any other.
+                    Err(AppError::QbitDuplicate) => {
+                        crate::applog::info(
+                            "grab",
+                            format!(
+                                "qBittorrent already had \"{}\" — adopting the existing torrent",
+                                order.title.chars().take(70).collect::<String>()
+                            ),
+                        );
+                        Ok(None)
+                    }
+                    Err(error) => Err(error),
+                }
             }
         }
         .await;
