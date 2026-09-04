@@ -183,6 +183,7 @@ jobs:
               "darwin-aarch64":{url:$mac_url,signature:$mac_sig},
               "darwin-x86_64":{url:$mac_url,signature:$mac_sig},
               "darwin-universal":{url:$mac_url,signature:$mac_sig},
+              "linux-x86_64":{url:$linux_url,signature:$linux_sig},
               "linux-x86_64-appimage":{url:$linux_url,signature:$linux_sig}
             }}' >release-assets/latest.json
           (cd release-assets && sha256sum -- * >SHA256SUMS)

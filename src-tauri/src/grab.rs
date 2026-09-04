@@ -22,6 +22,14 @@ fn uses_bitport(cfg: &crate::config::Config) -> bool {
     cfg.download_backend == "bitport" && !cfg.bitport_token.is_empty()
 }
 
+/// The free-space floor every automatic grab path checks against, in bytes.
+/// Never below 5 GB whatever Settings says: the scheduler, the RSS sweep and
+/// the agent used to disagree on this, and a catalog import must not be able
+/// to fill a disk because one path trusted a 0 GB setting.
+pub fn min_free_bytes(cfg: &crate::config::Config) -> f64 {
+    cfg.agent_min_free_disk_gb.max(5.0) * 1e9
+}
+
 async fn selected_backend_free_bytes_with<BitportProbe, BitportFuture, QbitProbe, QbitFuture>(
     cfg: &crate::config::Config,
     bitport_probe: BitportProbe,
@@ -123,6 +131,25 @@ pub enum GrabOutcome {
     AlreadyHad,
 }
 
+/// Only a real magnet link travels as one. Indexer definitions are free-form
+/// and can put an http(s) link (passkey included) in the magnet field; that
+/// must be fetched through Prowlarr like any download link, never POSTed to
+/// Bitport or handed to qBittorrent as a URL to fetch itself.
+pub fn split_sources(
+    magnet_url: Option<String>,
+    download_url: Option<String>,
+) -> (Option<String>, Option<String>) {
+    let magnet_url = magnet_url.filter(|m| !m.trim().is_empty());
+    let download_url = download_url.filter(|d| !d.trim().is_empty());
+    match magnet_url {
+        Some(m) if m.trim_start().get(..7).is_some_and(|p| p.eq_ignore_ascii_case("magnet:")) => {
+            (Some(m), download_url)
+        }
+        Some(link) => (None, download_url.or(Some(link))),
+        None => (None, download_url),
+    }
+}
+
 pub async fn dispatch(
     state: &AppState,
     order: GrabOrder,
@@ -130,6 +157,9 @@ pub async fn dispatch(
     ep_ids: Vec<i64>,
 ) -> Result<GrabOutcome> {
     let mut order = order;
+    let (magnet_url, download_url) = split_sources(order.magnet_url.take(), order.download_url.take());
+    order.magnet_url = magnet_url;
+    order.download_url = download_url;
     // Persist the strongest backend identity before the durable claim. A
     // magnet torrent can be renamed as soon as qBittorrent receives metadata;
     // after a crash, title-only reconciliation could otherwise miss a transfer
@@ -162,6 +192,7 @@ pub async fn dispatch(
             return Ok(GrabOutcome::AlreadyHad);
         }
     }
+    // moved into the task: a definitive backend failure hands these back
     let handle = tauri::async_runtime::spawn(async move {
         let _claim = claim; // released when the grab settles, even on panic
         let dispatch_result: Result<Option<String>> = async {
@@ -226,7 +257,7 @@ pub async fn dispatch(
                 // dispatching row intentionally remains fail-safe against an
                 // accidental duplicate.
                 match db::open_existing()
-                    .and_then(|conn| db::ledger_abandon_dispatch(&conn, &ck))
+                    .and_then(|conn| db::ledger_abandon_dispatch(&conn, &ck, &ep_ids))
                 {
                     Ok(()) => {}
                     Err(cleanup_error) => crate::applog::error(
@@ -244,24 +275,13 @@ pub async fn dispatch(
         // later automatic re-grabs instead of losing all evidence.
         match db::open_existing() {
             Ok(conn) => {
+                // (the episodes were stamped 'grabbed' by the claim itself)
                 db::ledger_finish_dispatch(
                     &conn,
                     &ck,
                     order.info_hash.as_deref(),
                     bp_token.as_deref(),
                 )?;
-                if !ep_ids.is_empty() {
-                    if let Err(e) = db::mark_grabbed(&conn, &ep_ids, &order.title) {
-                        // not fatal (the torrent is in qBittorrent and the
-                        // ledger row is written) but nothing repairs a
-                        // missed stamp automatically — the episode stays
-                        // 'wanted' and gets re-searched each cycle
-                        crate::applog::error(
-                            "grab",
-                            format!("ledger recorded but episode stamping failed for \"{title}\": {e}"),
-                        );
-                    }
-                }
                 Ok(())
             }
             Err(e) => {
@@ -306,6 +326,35 @@ mod tests {
         }));
         assert!(result.is_err());
         assert!(claims.claim("panicky").is_some(), "claim released during unwind");
+    }
+
+    #[test]
+    fn only_real_magnets_travel_as_magnets() {
+        // an indexer definition can put an http link (passkey included) in
+        // the magnet field; it must be fetched through Prowlarr like any
+        // download link, never handed to Bitport or qBittorrent as a URL
+        let (m, d) = split_sources(Some("magnet:?xt=urn:btih:abc".into()), Some("http://x/dl".into()));
+        assert_eq!(m.as_deref(), Some("magnet:?xt=urn:btih:abc"));
+        assert_eq!(d.as_deref(), Some("http://x/dl"));
+        let (m, d) = split_sources(Some("MAGNET:?xt=urn:btih:abc".into()), None);
+        assert!(m.is_some() && d.is_none());
+        let (m, d) = split_sources(Some("https://tracker/dl?passkey=k".into()), None);
+        assert!(m.is_none());
+        assert_eq!(d.as_deref(), Some("https://tracker/dl?passkey=k"));
+        // a real download link is not displaced by a bogus magnet
+        let (m, d) = split_sources(Some("https://tracker/a".into()), Some("https://tracker/b".into()));
+        assert!(m.is_none());
+        assert_eq!(d.as_deref(), Some("https://tracker/b"));
+        let (m, d) = split_sources(Some("".into()), Some("".into()));
+        assert!(m.is_none() && d.is_none());
+    }
+
+    #[test]
+    fn automatic_grabs_keep_a_five_gb_floor_whatever_the_setting() {
+        let low = crate::config::Config { agent_min_free_disk_gb: 1.0, ..Default::default() };
+        assert_eq!(min_free_bytes(&low), 5_000_000_000.0);
+        let high = crate::config::Config { agent_min_free_disk_gb: 80.0, ..Default::default() };
+        assert_eq!(min_free_bytes(&high), 80_000_000_000.0);
     }
 
     #[tokio::test]

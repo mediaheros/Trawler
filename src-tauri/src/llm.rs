@@ -109,7 +109,7 @@ impl LlmClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AppError::Other(format!("agent model unreachable: {e}")))?;
+            .map_err(|e| AppError::Other(format!("agent model unreachable: {}", e.without_url())))?;
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
@@ -122,7 +122,7 @@ impl LlmClient {
         let parsed: ChatResponse = resp
             .json()
             .await
-            .map_err(|e| AppError::Other(format!("agent model returned malformed response: {e}")))?;
+            .map_err(|e| AppError::Other(format!("agent model returned malformed response: {}", e.without_url())))?;
         let mut msg = parsed
             .choices
             .into_iter()
@@ -151,8 +151,8 @@ impl LlmClient {
             .get(format!("{}/api/tags", self.base_url))
             .send()
             .await
-            .map_err(|e| AppError::Other(format!("agent endpoint unreachable: {e}")))?;
-        let v: Value = resp.json().await.map_err(|e| AppError::Other(e.to_string()))?;
+            .map_err(|e| AppError::Other(format!("agent endpoint unreachable: {}", e.without_url())))?;
+        let v: Value = resp.json().await.map_err(|e| AppError::Other(e.without_url().to_string()))?;
         Ok(v.get("models")
             .and_then(|m| m.as_array())
             .map(|arr| {

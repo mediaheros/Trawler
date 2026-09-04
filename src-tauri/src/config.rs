@@ -295,6 +295,25 @@ pub fn save(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Atomic, owner-only write for any secret-bearing file (Prowlarr's
+/// config.xml, qBittorrent's ini): a crash mid-write must leave the previous
+/// file intact, never a truncated one that breaks the service on next start.
+pub(crate) fn write_atomic_private(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    // two overlapping writers (a double-clicked "Enable Web UI") would share
+    // one pid-named tmp and publish each other's half-written file
+    static ATOMIC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = ATOMIC_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = path.with_extension(format!(
+        "{}.tmp.{}",
+        path.extension().and_then(|e| e.to_str()).unwrap_or("dat"),
+        std::process::id()
+    ));
+    write_private_file(&tmp, contents)?;
+    replace_file(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
 fn write_private_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);

@@ -193,7 +193,7 @@ impl<'a> ProwlarrClient<'a> {
     pub async fn tags(&self) -> Result<Vec<serde_json::Value>> {
         let resp = self
             .http
-            .get(format!("{}/api/v1/tag", self.base))
+            .get(self.url("/api/v1/tag"))
             .header("X-Api-Key", &self.api_key)
             .send()
             .await?;
@@ -212,7 +212,7 @@ impl<'a> ProwlarrClient<'a> {
         }
         let resp = self
             .http
-            .post(format!("{}/api/v1/tag", self.base))
+            .post(self.url("/api/v1/tag"))
             .header("X-Api-Key", &self.api_key)
             .json(&serde_json::json!({ "label": label }))
             .send()
@@ -228,7 +228,7 @@ impl<'a> ProwlarrClient<'a> {
     pub async fn indexer_proxies(&self) -> Result<Vec<serde_json::Value>> {
         let resp = self
             .http
-            .get(format!("{}/api/v1/indexerproxy", self.base))
+            .get(self.url("/api/v1/indexerproxy"))
             .header("X-Api-Key", &self.api_key)
             .send()
             .await?;
@@ -267,7 +267,7 @@ impl<'a> ProwlarrClient<'a> {
             let id = p.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
             let resp = self
                 .http
-                .put(format!("{}/api/v1/indexerproxy/{id}", self.base))
+                .put(self.url(&format!("/api/v1/indexerproxy/{id}")))
                 .header("X-Api-Key", &self.api_key)
                 .json(&p)
                 .send()
@@ -277,7 +277,7 @@ impl<'a> ProwlarrClient<'a> {
         }
         let resp = self
             .http
-            .get(format!("{}/api/v1/indexerproxy/schema", self.base))
+            .get(self.url("/api/v1/indexerproxy/schema"))
             .header("X-Api-Key", &self.api_key)
             .send()
             .await?;
@@ -301,7 +301,7 @@ impl<'a> ProwlarrClient<'a> {
         }
         let resp = self
             .http
-            .post(format!("{}/api/v1/indexerproxy", self.base))
+            .post(self.url("/api/v1/indexerproxy"))
             .header("X-Api-Key", &self.api_key)
             .json(&def)
             .send()
@@ -322,7 +322,7 @@ impl<'a> ProwlarrClient<'a> {
                 if let Some(id) = p.get("id").and_then(|v| v.as_i64()) {
                     let resp = self
                         .http
-                        .delete(format!("{}/api/v1/indexerproxy/{id}", self.base))
+                        .delete(self.url(&format!("/api/v1/indexerproxy/{id}")))
                         .header("X-Api-Key", &self.api_key)
                         .send()
                         .await?;
@@ -335,7 +335,7 @@ impl<'a> ProwlarrClient<'a> {
                 if let Some(id) = t.get("id").and_then(|v| v.as_i64()) {
                     let resp = self
                         .http
-                        .delete(format!("{}/api/v1/tag/{id}", self.base))
+                        .delete(self.url(&format!("/api/v1/tag/{id}")))
                         .header("X-Api-Key", &self.api_key)
                         .send()
                         .await?;
@@ -491,6 +491,23 @@ mod tests {
                 .contains("x-api-key: top-secret")
         );
         assert!(!external_task.await.unwrap().contains("top-secret"));
+    }
+
+    #[tokio::test]
+    async fn trailing_slash_base_never_doubles_the_path_separator() {
+        let (server, task) = one_shot_server(
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]".into(),
+        )
+        .await;
+        let http = reqwest::Client::builder().build().unwrap();
+        let client = ProwlarrClient {
+            http: &http,
+            base: format!("{server}/"),
+            api_key: "key".into(),
+        };
+        client.tags().await.unwrap();
+        let request = task.await.unwrap();
+        assert!(request.starts_with("GET /api/v1/tag "), "{request}");
     }
 
     #[tokio::test]

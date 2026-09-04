@@ -237,6 +237,11 @@ pub(crate) fn normalize(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut last_space = true;
     for c in s.chars() {
+        // apostrophes vanish the way release groups drop them: "Grey's"
+        // and "Greys" are one word, not "grey s"
+        if matches!(c, '\'' | '\u{2019}') {
+            continue;
+        }
         if let Some(folded) = fold_diacritic(c.to_lowercase().next().unwrap_or(c)) {
             out.push_str(folded);
             last_space = false;
@@ -251,14 +256,38 @@ pub(crate) fn normalize(s: &str) -> String {
     out
 }
 
-/// Every word of the query must appear (as a substring) in the release name.
+/// Every word of the query must appear as a whole normalized word of the
+/// release name. Substrings made short titles unsafe: "Us" matched "hoUSe"
+/// and the follow scheduler grabbed the wrong show. A season or episode
+/// marker ("s02", "s01e01") still matches the marker that extends it
+/// ("s02e05", the glued double episode "s01e01e02").
 /// Protects against indexers that answer weak matches with unrelated filler.
 fn matches_query(query: &str, title: &str) -> bool {
     let title = normalize(title);
-    normalize(query)
-        .split(' ')
-        .filter(|t| !t.is_empty())
-        .all(|t| title.contains(t))
+    let title_words: Vec<&str> = title.split_whitespace().collect();
+    normalize(query).split_whitespace().all(|query_word| {
+        title_words.iter().any(|title_word| word_matches(title_word, query_word))
+    })
+}
+
+/// One normalized title word against one normalized query word.
+pub(crate) fn word_matches(title_word: &str, query_word: &str) -> bool {
+    title_word == query_word
+        || (is_episode_marker(query_word)
+            && title_word
+                .strip_prefix(query_word)
+                .is_some_and(|rest| rest.starts_with('e')))
+}
+
+/// "s02" / "s01e05"-style scene markers.
+pub(crate) fn is_episode_marker(word: &str) -> bool {
+    let Some(rest) = word.strip_prefix('s') else { return false };
+    let (season, episode) = match rest.split_once('e') {
+        Some((s, e)) => (s, Some(e)),
+        None => (rest, None),
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    digits(season) && episode.is_none_or(digits)
 }
 
 fn dedupe_key(r: &ProwlarrRelease) -> String {
@@ -517,6 +546,7 @@ pub async fn grab(
     // Manual grabs go through the same claim-then-dispatch as every other
     // path: the ledger row is written even if this caller goes away, and a
     // linked episode is stamped grabbed server-side.
+    let ep_ids = ep_ids.unwrap_or_default();
     let outcome = crate::grab::dispatch(
         state.inner(),
         crate::grab::GrabOrder {
@@ -528,22 +558,34 @@ pub async fn grab(
             size: size.unwrap_or(0),
         },
         None,
-        ep_ids.unwrap_or_default(),
+        ep_ids.clone(),
     )
     .await?;
-    let detail = match outcome {
+    // "Find a release" for a wanted episode whose content the ledger already
+    // holds (an agent or brief grab carried no episode id): link the episode
+    // to that row, or it stays wanted with nothing left for the user to do
+    if !ep_ids.is_empty() && !matches!(outcome, crate::grab::GrabOutcome::Grabbed { .. }) {
+        let ck = crate::briefs::content_key(&title);
+        let conn = state.db.lock().await;
+        if let Err(e) = crate::db::ledger_adopt_episodes(&conn, &ck, &ep_ids) {
+            crate::applog::warn("grab", format!("could not link episodes to the existing grab: {e}"));
+        }
+    }
+    // ok means "this click sent it"; the other two outcomes sent nothing,
+    // and the UI must not show a done Sent button for them
+    let (ok, detail) = match outcome {
         crate::grab::GrabOutcome::Grabbed { backend } => match backend {
-            "bitport" => format!("Sent to your Bitport cloud: {title}"),
-            _ => format!("Sent to qBittorrent: {title}"),
+            "bitport" => (true, format!("Sent to your Bitport cloud: {title}")),
+            _ => (true, format!("Sent to qBittorrent: {title}")),
         },
         crate::grab::GrabOutcome::AlreadyClaimed => {
-            "Already being grabbed right now — one moment".to_string()
+            (false, "Already being grabbed right now — one moment".to_string())
         }
         crate::grab::GrabOutcome::AlreadyHad => {
-            "Already in your library — recorded earlier".to_string()
+            (false, "Already in your library — recorded earlier".to_string())
         }
     };
-    Ok(GrabResult { ok: true, detail })
+    Ok(GrabResult { ok, detail })
 }
 
 /// The qBittorrent add itself, factored out so `grab::dispatch` can run it
@@ -675,28 +717,35 @@ pub async fn torrent_action(
         let conn = state.db.lock().await;
         let norm_name = normalize(&name);
         let h = hash.to_lowercase();
-        // retire ledger rows for this torrent — hash first, title fallback
-        let rows: Vec<(i64, String, Option<String>, Option<String>)> = conn
-            .prepare("SELECT id, title, info_hash, ep_ids FROM grab_ledger WHERE state IN ('grabbed','completed') AND backend = 'qbittorrent'")
+        // retire ledger rows for this torrent - hash first, title fallback.
+        // 'deleted' (not the reaper's 'removed'): this was the user's call,
+        // and automated paths must not pull the content straight back
+        type LedgerRow = (i64, String, Option<String>, Option<String>, String);
+        let rows: Vec<LedgerRow> = conn
+            .prepare("SELECT id, title, info_hash, ep_ids, state FROM grab_ledger WHERE state IN ('grabbed','completed','stalled') AND backend = 'qbittorrent'")
             .ok()
             .map(|mut stmt| {
-                stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
                     .map(|it| it.flatten().collect::<Vec<_>>())
                     .unwrap_or_default()
             })
             .unwrap_or_default();
         let mut freed: Vec<String> = vec![];
-        for (id, title, info_hash, ep_ids_raw) in rows {
+        for (id, title, info_hash, ep_ids_raw, ledger_state) in rows {
             let hash_match = info_hash.map(|x| x.eq_ignore_ascii_case(&h)).unwrap_or(false);
             if hash_match || normalize(&title) == norm_name {
-                let _ = conn.execute("UPDATE grab_ledger SET state = 'removed' WHERE id = ?1", [id]);
-                crate::db::set_episodes_state_by_ids(
-                    &conn,
-                    &crate::db::parse_ep_ids(ep_ids_raw.as_deref()),
-                    "wanted",
-                    None,
-                );
-                freed.push(title);
+                let _ = conn.execute("UPDATE grab_ledger SET state = 'deleted' WHERE id = ?1", [id]);
+                // a stalled corpse already handed its episodes back - they
+                // may belong to the replacement grab by now
+                if ledger_state != "stalled" {
+                    crate::db::set_episodes_state_by_ids(
+                        &conn,
+                        &crate::db::parse_ep_ids(ep_ids_raw.as_deref()),
+                        "wanted",
+                        None,
+                    );
+                    freed.push(title);
+                }
             }
         }
         // episodes still pointing at this grab go back to wanted
@@ -752,6 +801,22 @@ mod tests {
         assert!(!matches_query("ubuntu", "Big Buck Bunny 1080p"));
         assert!(!matches_query("the expanse s03", "The.Expanse.S02E05.1080p"));
         assert!(matches_query("", "anything at all"));
+    }
+
+    #[test]
+    fn query_words_match_whole_tokens_not_substrings() {
+        // following "Us" or "It" must not accept "House" / "Split"
+        assert!(!matches_query("it 2017", "Split.2017.1080p.WEB"));
+        assert!(!matches_query("Us S01E02", "House.S01E02.1080p.WEB-DL"));
+        assert!(matches_query("Us S01E02", "Us.S01E02.1080p.WEB-DL"));
+        // a bare season term still matches the episode marker that extends it
+        assert!(matches_query("the expanse s02", "The.Expanse.S02E05.1080p.WEB-DL"));
+        assert!(matches_query("the expanse s02", "The.Expanse.S02.COMPLETE.1080p"));
+        // and an episode marker matches a glued double-episode release
+        assert!(matches_query("show s01e01", "Show.S01E01E02.1080p.WEB"));
+        // apostrophes vanish the way release groups drop them
+        assert!(matches_query("grey's anatomy", "Greys.Anatomy.S02E01.1080p.WEB"));
+        assert!(matches_query("It’s Always Sunny", "Its.Always.Sunny.in.Philadelphia.S16E03"));
     }
 }
 
@@ -1089,12 +1154,26 @@ pub async fn bitport_status(state: State<'_, AppState>) -> Result<BitportStatus>
 
 #[tauri::command]
 pub async fn bitport_disconnect(state: State<'_, AppState>) -> Result<()> {
-    let mut cfg = state.config.write().await;
-    cfg.bitport_token.clear();
-    if cfg.download_backend == "bitport" {
-        cfg.download_backend = "qbittorrent".into();
+    {
+        let mut cfg = state.config.write().await;
+        cfg.bitport_token.clear();
+        if cfg.download_backend == "bitport" {
+            cfg.download_backend = "qbittorrent".into();
+        }
+        crate::config::save(&cfg)?;
     }
-    crate::config::save(&cfg)?;
+    // no token means no completion pass will ever settle the open cloud
+    // claims - release them now so their episodes can be grabbed locally
+    let conn = state.db.lock().await;
+    let released = crate::db::ledger_release_backend(&conn, "bitport")?;
+    if released > 0 {
+        crate::db::log_activity(
+            &conn,
+            "system",
+            None,
+            &format!("Bitport disconnected — released {released} in-flight cloud grab(s); Trawler can grab them locally"),
+        );
+    }
     Ok(())
 }
 
@@ -1131,7 +1210,7 @@ pub async fn bitport_delete(state: State<'_, AppState>, token: String) -> Result
         };
         let norm_match = vic_norm.as_ref().map(|n| &normalize(&title) == n).unwrap_or(false);
         if tok_match || hash_match || norm_match {
-            let _ = conn.execute("UPDATE grab_ledger SET state = 'removed' WHERE id = ?1", [id]);
+            let _ = conn.execute("UPDATE grab_ledger SET state = 'deleted' WHERE id = ?1", [id]);
             crate::db::set_episodes_state_by_ids(
                 &conn,
                 &crate::db::parse_ep_ids(ep_ids_raw.as_deref()),

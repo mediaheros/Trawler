@@ -299,7 +299,7 @@ pub async fn sweep(app: &AppHandle) -> Result<SweepStats> {
     // an unavailable measurement is not permission to fill an unknown disk.
     let free_disk_ok = {
         match crate::grab::selected_backend_free_bytes(&state.http, &cfg).await {
-            Ok(free) => (free as f64) >= cfg.agent_min_free_disk_gb * 1e9,
+            Ok(free) => (free as f64) >= crate::grab::min_free_bytes(&cfg),
             Err(error) => {
                 crate::applog::warn(
                     "rss",
@@ -329,6 +329,12 @@ pub async fn sweep(app: &AppHandle) -> Result<SweepStats> {
         let (still_wanted, w_save_path, show_name) = {
             let conn = state.db.lock().await;
             if db::ledger_satisfied(&conn, &ck) {
+                // an agent/brief/proposal grab of this content carried no
+                // episode id - link the episode to it rather than re-match
+                // it every sweep
+                if let Err(e) = db::ledger_adopt_episodes(&conn, &ck, &[ep_id]) {
+                    crate::applog::warn("rss", format!("could not link an episode to an existing grab: {e}"));
+                }
                 continue;
             }
             let still: bool = conn
@@ -418,7 +424,9 @@ pub async fn sweep(app: &AppHandle) -> Result<SweepStats> {
         let Some((brief, _plan)) = briefs.iter().find(|(b, _)| b.id == brief_id) else { continue };
         {
             let conn = state.db.lock().await;
-            if db::ledger_satisfied(&conn, &ck) {
+            // content the user deleted after watching counts as had here -
+            // the sweep must not pull it straight back
+            if db::ledger_satisfied_for_automation(&conn, &ck) {
                 continue;
             }
         }

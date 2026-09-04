@@ -21,6 +21,7 @@ export default function BriefsDrawer({ onClose }: { onClose: () => void }) {
   const toast = useStore((s) => s.toast);
   const [editing, setEditing] = useState<BriefRow | "new" | null>(null);
   const [running, setRunning] = useState<number | null>(null);
+  const [toggling, setToggling] = useState<number | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -52,6 +53,10 @@ export default function BriefsDrawer({ onClose }: { onClose: () => void }) {
   };
 
   const toggle = async (b: BriefRow) => {
+    // two quick clicks both computed !enabled from the same stale row and
+    // saved the same value twice - one save at a time per brief
+    if (toggling === b.id) return;
+    setToggling(b.id);
     try {
       await api.briefSave({
         id: b.id, name: b.name, prompt: b.prompt, plan: JSON.parse(b.planJson) as HuntPlan,
@@ -61,6 +66,8 @@ export default function BriefsDrawer({ onClose }: { onClose: () => void }) {
       await loadBriefs();
     } catch (e) {
       toast(String(e), "bad");
+    } finally {
+      setToggling(null);
     }
   };
 
@@ -94,6 +101,7 @@ export default function BriefsDrawer({ onClose }: { onClose: () => void }) {
               key={b.id}
               b={b}
               running={running === b.id}
+              toggling={toggling === b.id}
               onRun={() => runNow(b)}
               onEdit={() => setEditing(b)}
               onToggle={() => toggle(b)}
@@ -118,12 +126,14 @@ export default function BriefsDrawer({ onClose }: { onClose: () => void }) {
 function BriefCard({
   b,
   running,
+  toggling,
   onRun,
   onEdit,
   onToggle,
 }: {
   b: BriefRow;
   running: boolean;
+  toggling: boolean;
   onRun: () => void;
   onEdit: () => void;
   onToggle: () => void;
@@ -189,7 +199,7 @@ function BriefCard({
           <Pencil size={12.5} />
         </button>
         <label className="ml-auto flex cursor-pointer items-center gap-1.5 pr-1 text-[10.5px] text-faint">
-          <input type="checkbox" checked={b.enabled} onChange={onToggle} className="size-3 accent-(--color-accent)" />
+          <input type="checkbox" checked={b.enabled} disabled={toggling} onChange={onToggle} className="size-3 accent-(--color-accent)" />
           Enabled
         </label>
       </div>
@@ -471,7 +481,10 @@ function PlanEditor({ plan, onChange }: { plan: HuntPlan; onChange: (p: HuntPlan
           Min seeders
           <input
             value={plan.minSeeders}
-            onChange={(e) => onChange({ ...plan, minSeeders: Number(e.target.value) || 0 })}
+            onChange={(e) =>
+              // the backend field is an integer; "2.5" would fail deserialization with a raw serde message
+              onChange({ ...plan, minSeeders: Math.max(0, Math.floor(Number(e.target.value) || 0)) })
+            }
             className="w-10 rounded-md border border-line2 bg-bg1 px-1.5 py-0.5 text-center font-mono text-[11px] text-ink outline-none focus:border-accent/50"
           />
         </label>

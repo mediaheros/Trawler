@@ -74,14 +74,23 @@ export default function SettingsView() {
     setDraft((current) => {
       if (
         current === null ||
+        previousBase === null ||
         JSON.stringify(current) === JSON.stringify(previousBase) ||
         JSON.stringify(current) === JSON.stringify(config)
       ) {
         return config;
       }
-      // A save response landed after the user made a newer edit. Keep that
-      // edit dirty instead of replacing it with the submitted snapshot.
-      return current;
+      // A new config landed under a dirty draft (a save response, or the
+      // wizard writing the Prowlarr key). Three-way merge per field: what
+      // the user edited stays, everything untouched follows the new base -
+      // otherwise the next Save wipes the key the wizard just found.
+      const merged = { ...current };
+      for (const key of Object.keys(config) as Array<keyof Config>) {
+        if (JSON.stringify(current[key]) === JSON.stringify(previousBase[key])) {
+          (merged as Record<string, unknown>)[key] = config[key];
+        }
+      }
+      return merged;
     });
     baseConfigRef.current = config;
   }, [config]);
@@ -616,7 +625,9 @@ export default function SettingsView() {
           <div className="mt-3 border-t border-line/60 pt-3">
             <Button
               onClick={async () => {
-                await persist({ ...draft, setupCompleted: false });
+                // from the saved config, not the draft: this button must not
+                // silently commit unrelated unsaved edits
+                if (config) await persist({ ...config, setupCompleted: false });
               }}
               className="text-[12px]"
               title="Re-check qBittorrent and Prowlarr, install anything missing"
@@ -1067,9 +1078,13 @@ function BitportCard({ backend, onBackend }: { backend: string; onBackend: (b: s
             <div className="flex items-center gap-2">
               <Button
                 onClick={async () => {
-                  const url = await api.bitportAuthorizeUrl();
-                  await navigator.clipboard.writeText(url);
-                  toast("Approval link copied — open it in a browser, then paste the code from the address bar", "info");
+                  try {
+                    const url = await api.bitportAuthorizeUrl();
+                    await navigator.clipboard.writeText(url);
+                    toast("Approval link copied — open it in a browser, then paste the code from the address bar", "info");
+                  } catch (e) {
+                    toast(`Couldn't copy the approval link: ${e}`, "bad");
+                  }
                 }}
                 className="shrink-0 px-2.5 py-1.5 text-[11.5px]"
               >

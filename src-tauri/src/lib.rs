@@ -55,30 +55,6 @@ pub struct AppState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let http = reqwest::Client::builder()
-        .cookie_store(true)
-        .user_agent(format!("trawler/{}", env!("CARGO_PKG_VERSION")))
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .expect("failed to build http client");
-
-    let conn = db::open().expect("failed to open trawler.db");
-
-    let state = AppState {
-        http,
-        config: RwLock::new(config::load()),
-        db: Mutex::new(conn),
-        scheduler_busy: AtomicBool::new(false),
-        agent_chat_busy: AtomicBool::new(false),
-        brief_tick_busy: AtomicBool::new(false),
-        rss_busy: AtomicBool::new(false),
-        scout_busy: AtomicBool::new(false),
-        flaresolverr_busy: AtomicBool::new(false),
-        prowlarr_busy: AtomicBool::new(false),
-        grab_claims: std::sync::Arc::new(grab::GrabClaims::default()),
-        discover_cache: Mutex::new(None),
-    };
-
     tauri::Builder::default()
         // Must be first: a second process would otherwise create independent
         // scheduler/config state and can duplicate work. Bring the existing
@@ -97,11 +73,48 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
-        .manage(state)
         .setup(|app| {
-            // a Trawler-managed Prowlarr should come back after reboots
+            use tauri::Manager;
             applog::attach(app.handle());
             applog::info("app", format!("Trawler {} starting", env!("CARGO_PKG_VERSION")));
+            // The database opens HERE, after the single-instance plugin has
+            // run: a second process exits up there without ever touching the
+            // file. A corrupt file (and only a corrupt one - a busy or locked
+            // database is healthy) is moved aside and a fresh one created,
+            // as config.rs does for config.json; the old abort-before-any-
+            // window behaviour made Trawler look uninstalled under autostart.
+            let (conn, kept) = db::open_or_recover().inspect_err(|error| {
+                applog::error("app", format!("trawler.db could not be opened: {error}"));
+            })?;
+            if let Some(kept) = kept {
+                applog::error(
+                    "app",
+                    format!(
+                        "trawler.db was unreadable — it was moved to {} and Trawler started on a fresh database",
+                        kept.display()
+                    ),
+                );
+            }
+            let http = reqwest::Client::builder()
+                .cookie_store(true)
+                .user_agent(format!("trawler/{}", env!("CARGO_PKG_VERSION")))
+                .timeout(std::time::Duration::from_secs(60))
+                .build()?;
+            app.manage(AppState {
+                http,
+                config: RwLock::new(config::load()),
+                db: Mutex::new(conn),
+                scheduler_busy: AtomicBool::new(false),
+                agent_chat_busy: AtomicBool::new(false),
+                brief_tick_busy: AtomicBool::new(false),
+                rss_busy: AtomicBool::new(false),
+                scout_busy: AtomicBool::new(false),
+                flaresolverr_busy: AtomicBool::new(false),
+                prowlarr_busy: AtomicBool::new(false),
+                grab_claims: std::sync::Arc::new(grab::GrabClaims::default()),
+                discover_cache: Mutex::new(None),
+            });
+            // a Trawler-managed Prowlarr should come back after reboots
             let boot_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 use tauri::Manager;

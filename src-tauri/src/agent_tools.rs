@@ -237,7 +237,7 @@ async fn search_releases(state: &AppState, ctx: &mut RunCtx, args: &Value) -> Va
         };
         let already = {
             let conn = state.db.lock().await;
-            db::ledger_satisfied(&conn, &stored.content_key)
+            db::ledger_satisfied_for_automation(&conn, &stored.content_key)
         };
         let id = ctx.store(stored);
         let s = &ctx.results[&id];
@@ -296,7 +296,7 @@ async fn grab_release(state: &AppState, ctx: &mut RunCtx, args: &Value) -> Value
     // Semantic dedupe + rolling budgets, straight from the shared ledger.
     {
         let conn = state.db.lock().await;
-        if db::ledger_satisfied(&conn, &stored.content_key) {
+        if db::ledger_satisfied_for_automation(&conn, &stored.content_key) {
             return err("already grabbed this content (possibly a different release of it)");
         }
         if let Some(brief_id) = ctx.origin.brief_id() {
@@ -320,11 +320,12 @@ async fn grab_release(state: &AppState, ctx: &mut RunCtx, args: &Value) -> Value
             ))
         }
     };
-    if (free as f64) < cfg.agent_min_free_disk_gb * 1e9 {
+    let floor = crate::grab::min_free_bytes(&cfg);
+    if (free as f64) < floor {
         return err(format!(
             "refusing: selected download backend has only {:.0} GB free (floor is {:.0} GB)",
             free as f64 / 1e9,
-            cfg.agent_min_free_disk_gb
+            floor / 1e9
         ));
     }
 
@@ -406,7 +407,7 @@ async fn propose_release(state: &AppState, ctx: &mut RunCtx, args: &Value) -> Va
     .unwrap_or_default();
     let is_new = {
         let conn = state.db.lock().await;
-        if db::ledger_satisfied(&conn, &stored.content_key) {
+        if db::ledger_satisfied_for_automation(&conn, &stored.content_key) {
             return err("already grabbed this content — no proposal needed");
         }
         db::proposal_upsert(&conn, ctx.origin.brief_id(), &stored.content_key, &result_json, &reason)

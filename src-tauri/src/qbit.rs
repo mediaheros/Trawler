@@ -238,6 +238,9 @@ impl<'a> QbitClient<'a> {
             .send()
             .await
             .map_err(|error| {
+                // no request URL in any of these messages: they reach toasts,
+                // the activity feed and the agent
+                let error = error.without_url();
                 if error.is_connect() || error.is_builder() {
                     AppError::Http(error)
                 } else {

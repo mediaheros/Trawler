@@ -316,7 +316,15 @@ export default function SearchView() {
               title="Search failed"
               body={searchError}
             />
-          ) : results && results.indexers.length === 0 ? (
+          ) : !results ? (
+            // typing or switching kind mid-search drops that search on
+            // purpose: a stale list under a new query is worse than none
+            <CenterMessage
+              icon={<SearchIcon size={28} />}
+              title="Search cancelled"
+              body={query.trim() ? `Press Enter to search for “${query.trim()}”.` : "Type something and press Enter."}
+            />
+          ) : results.indexers.length === 0 ? (
             <CenterMessage
               icon={<Waves size={28} />}
               title="No indexers to search yet"

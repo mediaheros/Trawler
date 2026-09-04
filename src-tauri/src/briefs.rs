@@ -51,6 +51,50 @@ fn norm_token(s: &str) -> String {
         .join(" ")
 }
 
+/// Whole-word phrase match over normalized text: "it" must not fire on
+/// "split", and "early" must not fire on "pearly". Multi-word terms match as
+/// consecutive words ("main card" ↔ "UFC.319.Main.Card").
+fn contains_phrase(haystack: &str, phrase: &str) -> bool {
+    let haystack: Vec<&str> = haystack.split_whitespace().collect();
+    let phrase: Vec<&str> = phrase.split_whitespace().collect();
+    !phrase.is_empty()
+        && phrase.len() <= haystack.len()
+        && haystack.windows(phrase.len()).any(|window| window == phrase)
+}
+
+/// Does one plan term describe this release? Whole words first; then the
+/// scene conventions a plain word match would miss: a season marker extends
+/// to its episodes ("s02" ↔ "s02e05"), a term of four or more characters
+/// matches the word it starts ("prelim" ↔ "prelims"), and quality families
+/// go through the parser so "cam" catches HDCAM/CAMRip and "hdr" sees HDR10.
+fn term_matches(norm_title: &str, parsed: &parse::ParsedRelease, term: &str) -> bool {
+    if contains_phrase(norm_title, term) {
+        return true;
+    }
+    let [word] = term.split_whitespace().collect::<Vec<_>>()[..] else {
+        return false;
+    };
+    let mut title_words = norm_title.split_whitespace();
+    if title_words.any(|w| crate::commands::word_matches(w, word)) {
+        return true;
+    }
+    if word.chars().count() >= 4 && norm_title.split_whitespace().any(|w| w.starts_with(word)) {
+        return true;
+    }
+    let family = |value: &Option<String>| {
+        value
+            .as_deref()
+            .map(|v| v.to_lowercase().replace(['-', ':', '+'], " ").trim().to_string())
+    };
+    match word {
+        "hdr" => parsed.hdr.is_some(),
+        "dv" => parsed.hdr.as_deref() == Some("DV"),
+        _ => [&parsed.source, &parsed.codec, &parsed.resolution, &parsed.hdr]
+            .into_iter()
+            .any(|field| family(field).as_deref() == Some(word)),
+    }
+}
+
 impl HuntPlan {
     /// Clamp everything a model could inflate. Called after compile AND after edits.
     pub fn sanitize(mut self) -> Self {
@@ -75,18 +119,18 @@ impl HuntPlan {
     /// Returns Err(reason) on violation — reasons surface in verdict cards.
     pub fn allows(&self, title: &str, size: i64, seeders: Option<i32>) -> std::result::Result<(), String> {
         let norm_title = norm_token(title);
+        let parsed = parse::parse(title);
         for tok in &self.include {
-            if !norm_title.contains(tok.as_str()) {
+            if !term_matches(&norm_title, &parsed, tok) {
                 return Err(format!("missing required term \"{tok}\""));
             }
         }
         for tok in &self.exclude {
-            if norm_title.contains(tok.as_str()) {
+            if term_matches(&norm_title, &parsed, tok) {
                 return Err(format!("contains excluded term \"{tok}\""));
             }
         }
         if !self.resolutions.is_empty() {
-            let parsed = parse::parse(title);
             match parsed.resolution.as_deref() {
                 Some(res) if self.resolutions.iter().any(|r| r == res) => {}
                 Some(res) => return Err(format!("{res} not in allowed resolutions")),
@@ -113,14 +157,23 @@ impl HuntPlan {
 }
 
 fn content_base(clean_title: &str) -> String {
-    clean_title
-        .to_lowercase()
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == ' ')
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    // Every alphanumeric script survives and diacritics fold to ASCII: the old
+    // ASCII-only filter emptied non-Latin titles, so every such show's S01E01
+    // shared one content key and only the first was ever grabbed. Punctuation
+    // is dropped, not spaced, exactly as before - keys already stored in
+    // users' ledgers ("its always sunny") must keep matching.
+    let mut out = String::with_capacity(clean_title.len());
+    for c in clean_title.chars() {
+        let lower = c.to_lowercase().next().unwrap_or(c);
+        if c.is_whitespace() {
+            out.push(' ');
+        } else if let Some(folded) = crate::commands::fold_diacritic(lower) {
+            out.push_str(folded);
+        } else if c.is_alphanumeric() {
+            out.extend(c.to_lowercase());
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Content identity for semantic dedupe: survives group/REPACK/indexer variants.
@@ -233,6 +286,47 @@ mod tests {
     }
 
     #[test]
+    fn plan_terms_match_whole_words_not_substrings() {
+        // a brief for "It" must never accept "Split" as the same title
+        let mut short = plan();
+        short.include = vec!["it".into()];
+        short.exclude.clear();
+        assert!(short.allows("It.2017.1080p.WEB", 1_000_000_000, Some(10)).is_ok());
+        assert!(short.allows("Split.2017.1080p.WEB", 1_000_000_000, Some(10)).is_err());
+        // an excluded word must not fire on a longer word that contains it
+        let mut ex = plan();
+        ex.include = vec!["ufc".into()];
+        ex.exclude = vec!["early".into()];
+        assert!(ex.allows("UFC.319.Pearly.Gates.1080p.WEB", 1_000_000_000, Some(10)).is_ok());
+        assert!(ex.allows("UFC.319.Early.Prelims.1080p.WEB", 1_000_000_000, Some(10)).is_err());
+        // a term of four or more characters still matches the word it starts
+        // ("prelim" vs "prelims"), a season term matches its episode marker,
+        // and scene quality families match through the parser (a "cam"
+        // exclusion must catch HDCAM/CAMRip, "hdr" must see HDR10)
+        let mut fam = plan();
+        fam.include = vec!["ufc".into()];
+        fam.exclude = vec!["prelim".into()];
+        assert!(fam.allows("UFC.319.Prelims.1080p.WEB", 1_000_000_000, Some(10)).is_err());
+        let mut season = plan();
+        season.include = vec!["s02".into()];
+        season.exclude.clear();
+        assert!(season.allows("Show.S02E05.1080p.WEB", 1_000_000_000, Some(10)).is_ok());
+        assert!(season.allows("Show.S03E05.1080p.WEB", 1_000_000_000, Some(10)).is_err());
+        let mut cam = plan();
+        cam.include.clear();
+        cam.exclude = vec!["cam".into()];
+        assert!(cam.allows("Movie.2024.HDCAM.x264", 1_000_000_000, Some(10)).is_err());
+        assert!(cam.allows("Movie.2024.CAMRip.x264", 1_000_000_000, Some(10)).is_err());
+        assert!(cam.allows("Camera.Obscura.2024.1080p.WEB", 1_000_000_000, Some(10)).is_ok());
+        let mut hdr = plan();
+        hdr.include = vec!["hdr".into()];
+        hdr.exclude.clear();
+        hdr.resolutions.clear();
+        assert!(hdr.allows("Movie.2024.2160p.HDR10.WEB", 1_000_000_000, Some(10)).is_ok());
+        assert!(hdr.allows("Movie.2024.2160p.SDR.WEB", 1_000_000_000, Some(10)).is_err());
+    }
+
+    #[test]
     fn sanitize_clamps_model_inflation() {
         let p = HuntPlan {
             queries: (0..20).map(|i| format!("q{i}")).collect(),
@@ -274,6 +368,20 @@ mod tests {
             content_key("UFC.319.Main.Card.1080p.WEB.h264-VERUM"),
             content_key("UFC 319 Main Card 720p HDTV")
         );
+        // non-Latin titles must keep their identity: two different shows'
+        // S01E01 used to collapse onto one key and the second was never grabbed
+        assert_ne!(
+            content_key("進撃の巨人.S01E01.1080p.WEB"),
+            content_key("鬼滅の刃.S01E01.1080p.WEB")
+        );
+        assert_eq!(
+            content_key("Kızılcık.Şerbeti.S03E12.1080p.WEB"),
+            content_key("Kizilcik Serbeti S03E12 720p HDTV")
+        );
+        // ASCII punctuation is dropped, not spaced: keys already stored in
+        // users' ledgers ("its always sunny", "spiderman") must keep matching
+        assert_eq!(content_key("It's.Always.Sunny.S16E03.1080p.WEB"), "tv:its always sunny:s16e03");
+        assert_eq!(content_key("Spider-Man.2002.1080p.BluRay"), "item:spiderman:2002");
     }
 }
 

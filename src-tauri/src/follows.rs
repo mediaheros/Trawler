@@ -133,6 +133,9 @@ pub fn upsert_show(
         .map(|e| e.episodes.as_slice())
         .unwrap_or(&[]);
 
+    // one transaction: a 500-episode show was 500 WAL fsyncs while every UI
+    // command and the RSS sweep waited on the connection lock
+    let tx = conn.unchecked_transaction().map_err(db::db_err)?;
     for ep in episodes {
         // regular numbered episodes only — specials don't fit SxxEyy matching
         let number = match ep.number {
@@ -159,7 +162,7 @@ pub fn upsert_show(
             "wanted"
         };
 
-        conn.execute(
+        tx.execute(
             "INSERT INTO episodes (tvmaze_ep_id, show_id, season, number, title, airstamp, state)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(tvmaze_ep_id) DO UPDATE SET
@@ -180,6 +183,7 @@ pub fn upsert_show(
         )
         .map_err(db::db_err)?;
     }
+    tx.commit().map_err(db::db_err)?;
     Ok(())
 }
 

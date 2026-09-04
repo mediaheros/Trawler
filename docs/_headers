@@ -9,8 +9,11 @@
 /og.png
   Cache-Control: public, max-age=604800
 
-/dl/latest.json
-  Cache-Control: no-cache
-
 /dl/*
   Cache-Control: public, max-age=3600
+
+# Pages merges every matching rule (duplicate headers are comma-joined), so
+# the manifest must first detach the /dl/* value before setting its own
+/dl/latest.json
+  ! Cache-Control
+  Cache-Control: no-cache

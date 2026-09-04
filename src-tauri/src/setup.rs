@@ -319,12 +319,23 @@ fn qbt_ini_path() -> PathBuf {
         .join("qBittorrent.ini")
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
 fn qbt_ini_path() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("qBittorrent")
         .join("qBittorrent.ini")
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn qbt_ini_path() -> PathBuf {
+    // Linux qBittorrent uses QSettings' native format: same INI syntax and
+    // keys, but the file is qBittorrent.conf - seeding a .ini there is a
+    // file it never reads, and the whole Web UI enable step silently fails
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("qBittorrent")
+        .join("qBittorrent.conf")
 }
 
 // ---------------- detection ----------------
@@ -414,8 +425,10 @@ pub(crate) fn kill_process(name: &str) {
 pub(crate) fn kill_process_force(name: &str) {
     #[cfg(windows)]
     {
+        // /T: the whole tree - FlareSolverr's headless Chrome children keep
+        // handles open inside its folder and made every removal "Access denied"
         let mut kill = std::process::Command::new("taskkill");
-        kill.args(["/IM", name, "/F"]);
+        kill.args(["/IM", name, "/F", "/T"]);
         use std::os::windows::process::CommandExt;
         kill.creation_flags(0x0800_0000);
         let _ = kill.output();
@@ -538,8 +551,13 @@ pub async fn status(state: &AppState) -> SetupStatus {
 // ---------------- prowlarr: managed install ----------------
 
 fn spawn_detached(exe: &PathBuf, args: &[String]) -> Result<u32> {
+    spawn_detached_with_env(exe, args, &[])
+}
+
+fn spawn_detached_with_env(exe: &PathBuf, args: &[String], env: &[(&str, &str)]) -> Result<u32> {
     let mut cmd = std::process::Command::new(exe);
     cmd.args(args);
+    cmd.envs(env.iter().copied());
     #[cfg(target_os = "linux")]
     if exe.extension().and_then(|ext| ext.to_str()) == Some("AppImage") {
         // Keep the user-scope qBittorrent route working where FUSE is absent.
@@ -636,7 +654,8 @@ fn seed_managed_prowlarr_config() -> Result<String> {
         xml = upsert_xml_tag(&xml, "AuthenticationMethod", "External");
         xml = upsert_xml_tag(&xml, "AuthenticationRequired", "DisabledForLocalAddresses");
     }
-    std::fs::write(&path, xml)?;
+    // the API key lives in here: owner-only, and never a truncated file
+    crate::config::write_atomic_private(&path, xml.as_bytes())?;
     Ok(key)
 }
 
@@ -1676,7 +1695,10 @@ pub fn start_flaresolverr() -> Result<()> {
         if !exe.exists() {
             return Err(AppError::Other("FlareSolverr isn't installed".into()));
         }
-        spawn_detached(&exe, &[]).map(|_| ())
+        // FlareSolverr defaults to HOST=0.0.0.0: an open headless-browser
+        // proxy on the LAN. The macOS container route pins loopback; the
+        // native route must too.
+        spawn_detached_with_env(&exe, &[], &[("HOST", "127.0.0.1")]).map(|_| ())
     }
 }
 
@@ -2015,8 +2037,35 @@ pub async fn install_flaresolverr(app: &AppHandle) -> Result<()> {
             "the FlareSolverr archive did not contain its expected executable".into(),
         ));
     }
-    let _ = std::fs::remove_dir_all(&target);
-    std::fs::rename(&staging, &target)?;
+    // stop whatever runs from the old tree first: on Windows its Chrome
+    // children hold the folder open, on Linux the old process would keep
+    // :8191 and make the new one look alive
+    kill_process(flaresolverr_process_name());
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    if process_running(flaresolverr_process_name()) {
+        kill_process_force(flaresolverr_process_name());
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    }
+    // move the old tree aside rather than deleting it first: if the swap
+    // fails (a Chrome child still holding the folder on Windows) the previous
+    // install comes back instead of leaving nothing behind the proxy entry
+    let previous = tools.join("FlareSolverr.old");
+    let _ = std::fs::remove_dir_all(&previous);
+    let had_previous = target.exists();
+    if had_previous {
+        std::fs::rename(&target, &previous).map_err(|e| {
+            AppError::Other(format!(
+                "couldn't move the existing FlareSolverr aside ({e}) — is it still running?"
+            ))
+        })?;
+    }
+    if let Err(e) = std::fs::rename(&staging, &target) {
+        if had_previous {
+            let _ = std::fs::rename(&previous, &target);
+        }
+        return Err(AppError::Other(format!("couldn't activate the new FlareSolverr: {e}")));
+    }
+    let _ = std::fs::remove_dir_all(&previous);
     std::mem::forget(staging_guard);
 
     emit(app, "flaresolverr", "log", json!({ "message": "Starting FlareSolverr…" }));
@@ -2069,6 +2118,16 @@ pub fn ensure_qbt_ini_port(ini: &str, credentials: Option<(&str, &str)>, fresh: 
         (r"WebUI\Port".into(), port.to_string()),
         (r"WebUI\LocalHostAuth".into(), "false".into()),
     ];
+    // qBittorrent's default address is "*": whenever Trawler is the party
+    // switching the Web UI on, it would answer its login page to the whole
+    // LAN. Loopback is all Trawler needs; a Web UI the user already ran
+    // keeps whatever address they chose (LAN clients may depend on it).
+    let webui_already_on = ini
+        .lines()
+        .any(|line| line.trim().eq_ignore_ascii_case(r"WebUI\Enabled=true"));
+    if (fresh || !webui_already_on) && !ini.contains(r"WebUI\Address") {
+        wanted.push((r"WebUI\Address".into(), "127.0.0.1".into()));
+    }
     // never clobber a password the user already has
     if !ini.contains(r"WebUI\Password_PBKDF2") {
         if let Some((user, blob)) = credentials {
@@ -2116,9 +2175,12 @@ pub fn ensure_qbt_ini_port(ini: &str, credentials: Option<(&str, &str)>, fresh: 
             prefs_end += 1;
         }
     }
-    // a truly fresh install: pre-accept the notice the user's install click
-    // already implied, or qBittorrent freezes ALL of startup behind a modal
-    if fresh && !lines.iter().any(|l| l.trim() == "[LegalNotice]") {
+    // pre-accept the notice the user's "enable Web UI" click already implied,
+    // or qBittorrent freezes ALL of startup behind a modal. Not only for an
+    // empty file: someone who opened qBittorrent once and closed the notice
+    // without accepting has a populated ini with no [LegalNotice] section,
+    // and used to be stuck on "didn't come up" forever.
+    if !lines.iter().any(|l| l.trim() == "[LegalNotice]") {
         lines.insert(0, String::new());
         lines.insert(0, "Accepted=true".into());
         lines.insert(0, "[LegalNotice]".into());
@@ -2186,7 +2248,9 @@ pub async fn configure_and_launch_qbt(qbit_url: &str) -> Result<()> {
     if let Some(parent) = ini_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&ini_path, updated)?;
+    // the user's whole qBittorrent configuration lives in this file - a
+    // crash mid-write must not truncate it
+    crate::config::write_atomic_private(&ini_path, updated.as_bytes())?;
 
     #[cfg(target_os = "macos")]
     {
@@ -2254,6 +2318,13 @@ pub async fn install_qbt_macos(app: &AppHandle) -> Result<()> {
         .await?
         .error_for_status()
         .map_err(|e| AppError::Other(format!("qBittorrent download failed: {e}")))?;
+    // SourceForge bounces through mirrors; nothing that arrived over plain
+    // http (a downgrade on some hop) gets installed, digest or not
+    if resp.url().scheme() != "https" {
+        return Err(AppError::Other(
+            "the qBittorrent download was redirected to an insecure mirror — not installing it".into(),
+        ));
+    }
     let tools = local_app_data().join("TrawlerTools");
     std::fs::create_dir_all(&tools)?;
     let dmg = tools.join("qbittorrent-download.dmg");
@@ -2264,7 +2335,14 @@ pub async fn install_qbt_macos(app: &AppHandle) -> Result<()> {
         }
     }
     let _guard = TempFile(dmg.clone());
+    // the real image is ~60 MB; a mirror must not be able to fill the disk
+    const MAX_DMG_BYTES: u64 = 256 * 1024 * 1024;
     let total = resp.content_length().unwrap_or(0);
+    if total > MAX_DMG_BYTES {
+        return Err(AppError::Other(format!(
+            "the qBittorrent disk image was unexpectedly large ({total} bytes)"
+        )));
+    }
     {
         let mut out = std::fs::File::create(&dmg)?;
         let mut stream = resp;
@@ -2273,6 +2351,11 @@ pub async fn install_qbt_macos(app: &AppHandle) -> Result<()> {
             use std::io::Write;
             out.write_all(&chunk)?;
             got += chunk.len() as u64;
+            if got > MAX_DMG_BYTES {
+                return Err(AppError::Other(
+                    "the qBittorrent disk image exceeded the 256 MiB safety limit".into(),
+                ));
+            }
         }
         if total > 0 && got != total {
             return Err(AppError::Other(format!(
@@ -2320,9 +2403,11 @@ pub async fn install_qbt_macos(app: &AppHandle) -> Result<()> {
         })
         .ok_or_else(|| AppError::Other("no app bundle inside the qBittorrent disk image".into()))?;
     // qBittorrent's official dmg is Developer ID signed and notarized — a
-    // bundle that fails these checks is not the app we meant to install
+    // bundle that fails these checks is not the app we meant to install.
+    // The requirement matters: without it codesign is satisfied by ANY
+    // internally consistent signature, an ad-hoc one from a bad mirror included.
     let verify = std::process::Command::new("codesign")
-        .args(["--verify", "--deep", "--strict"])
+        .args(["--verify", "--deep", "--strict", "-R=anchor apple generic"])
         .arg(&src)
         .output()
         .map_err(|e| AppError::Other(format!("codesign: {e}")))?;
@@ -3089,6 +3174,27 @@ mod tests {
     }
 
     #[test]
+    fn enabling_the_webui_binds_it_to_loopback_but_never_overrides_a_choice() {
+        // whenever Trawler is the one switching the Web UI on, it must not
+        // expose a LAN login page (qBittorrent's default address is "*");
+        // someone who already ran the Web UI keeps whatever they chose
+        let fresh = ensure_qbt_ini("", Some(("admin", "@ByteArray(a:b)")), true);
+        assert!(fresh.contains(r"WebUI\Address=127.0.0.1"));
+        let was_off = ensure_qbt_ini("[Preferences]\r\nWebUI\\Enabled=false\r\nGeneral\\Locale=en\r\n", None, false);
+        assert!(was_off.contains(r"WebUI\Address=127.0.0.1"));
+        let never_on = ensure_qbt_ini("[Preferences]\r\nGeneral\\Locale=en\r\n", None, false);
+        assert!(never_on.contains(r"WebUI\Address=127.0.0.1"));
+        let explicit = concat!("[Preferences]", "\r\n", r"WebUI\Address=*", "\r\n");
+        let kept = ensure_qbt_ini(explicit, None, false);
+        assert!(kept.contains(r"WebUI\Address=*"));
+        assert!(!kept.contains(r"WebUI\Address=127.0.0.1"));
+        // the Web UI was already on without an address key: that is the
+        // user's running setup (LAN clients may depend on it) - leave it
+        let already_on = ensure_qbt_ini("[Preferences]\r\nWebUI\\Enabled=true\r\n", None, false);
+        assert!(!already_on.contains(r"WebUI\Address"));
+    }
+
+    #[test]
     fn seeds_credentials_and_legal_notice() {
         let blob = "@ByteArray(abc:def)";
         let out = ensure_qbt_ini("", Some(("admin", blob)), true);
@@ -3101,8 +3207,21 @@ mod tests {
         let out2 = ensure_qbt_ini(existing, Some(("admin", blob)), false);
         assert!(out2.contains("USER_OWN"));
         assert!(!out2.contains("abc:def"));
-        // not fresh: no legal notice injected
-        assert!(!out2.contains("[LegalNotice]"));
+        // a populated ini whose notice was never accepted still gets it:
+        // the user's click is the acceptance, and without it startup hangs
+        assert!(out2.contains("[LegalNotice]"));
+        // an existing section is left exactly alone, never duplicated
+        let accepted = "[LegalNotice]\r\nAccepted=false\r\n[Preferences]\r\n";
+        let out3 = ensure_qbt_ini(accepted, None, false);
+        assert_eq!(out3.matches("[LegalNotice]").count(), 1);
+        assert!(out3.contains("Accepted=false"));
+    }
+
+    #[test]
+    fn honors_the_configured_webui_port() {
+        let out = super::ensure_qbt_ini_port("[Preferences]\r\nWebUI\\Port=8080\r\n", None, false, 9090);
+        assert!(out.contains(r"WebUI\Port=9090"));
+        assert!(!out.contains(r"WebUI\Port=8080"));
     }
 
     #[test]

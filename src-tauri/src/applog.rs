@@ -62,7 +62,10 @@ fn value_end(tail: &str, header_style: bool) -> usize {
 /// and any long bare hex run. Public-paste safety is the contract here.
 pub(crate) fn scrub(msg: &str) -> String {
     // pass 1: known credential keys followed by = : or %3D
-    const KEYS: &[&str] = &["apikey", "api_key", "api-key", "passkey", "password", "token", "authkey", "authorization", "bearer", "x-api-key"];
+    const KEYS: &[&str] = &[
+        "apikey", "api_key", "api-key", "passkey", "torrent_pass", "rsskey", "password", "secret",
+        "token", "authkey", "authorization", "bearer", "x-api-key",
+    ];
     let mut out = String::with_capacity(msg.len());
     let mut rest = msg;
     loop {
@@ -82,7 +85,13 @@ pub(crate) fn scrub(msg: &str) -> String {
         } else if tail.starts_with("\":") {
             // JSON: "apikey":"value"
             2
-        } else if tail.len() >= 3 && tail[..3].eq_ignore_ascii_case("%3d") {
+        } else if tail
+            .as_bytes()
+            .get(..3)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"%3d"))
+        {
+            // byte-level: `tail[..3]` panics when a multibyte char straddles
+            // the cut ("token😀"), and a panic here aborts the release build
             3
         } else {
             // the word appeared without a separator ("bearer abc"): treat one
@@ -130,27 +139,54 @@ pub(crate) fn scrub(msg: &str) -> String {
         o
     };
 
-    // pass 2: URL path segments of >=16 hex-ish chars (tracker passkeys live
-    // in the PATH, not the query) and any bare >=20-char hex run
+    // pass 2: hex runs (a tracker passkey as a PATH segment of >=16 hex, or
+    // any bare >=20-char hex run) and mixed letter+digit path segments of
+    // >=20 chars ending at a URL delimiter (base32 / alphanumeric passkeys).
+    // Folder names are letters only or carry dots and hyphens, so the
+    // support bundle keeps them readable.
     let bytes: Vec<char> = out.chars().collect();
     let mut result = String::with_capacity(out.len());
     let mut i = 0;
     while i < bytes.len() {
         let c = bytes[i];
-        if c.is_ascii_hexdigit() {
-            let start_run = i;
-            while i < bytes.len() && (bytes[i].is_ascii_hexdigit() || bytes[i] == '-') {
-                i += 1;
+        if !c.is_ascii_alphanumeric() {
+            result.push(c);
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let after_slash = start > 0 && bytes[start - 1] == '/';
+        let mut hex_end = start;
+        while hex_end < bytes.len() && (bytes[hex_end].is_ascii_hexdigit() || bytes[hex_end] == '-') {
+            hex_end += 1;
+        }
+        let hexlen = bytes[start..hex_end].iter().filter(|c| c.is_ascii_hexdigit()).count();
+        let hex_in_path = after_slash && hex_end < bytes.len() && bytes[hex_end] == '/';
+        if hexlen > 0 && ((hex_in_path && hexlen >= 16) || hexlen >= 20) {
+            result.push_str("•••");
+            i = hex_end;
+            continue;
+        }
+        if after_slash {
+            let mut seg_end = start;
+            while seg_end < bytes.len() && bytes[seg_end].is_ascii_alphanumeric() {
+                seg_end += 1;
             }
-            let run: String = bytes[start_run..i].iter().collect();
-            let hexlen = run.chars().filter(|c| c.is_ascii_hexdigit()).count();
-            let in_path = start_run > 0 && bytes[start_run - 1] == '/'
-                && i < bytes.len() && bytes[i] == '/';
-            if (in_path && hexlen >= 16) || hexlen >= 20 {
+            let terminated = seg_end == bytes.len()
+                || bytes[seg_end].is_whitespace()
+                || matches!(bytes[seg_end], '/' | '?' | '&' | '#' | '"' | '\'' | ')');
+            let segment = &bytes[start..seg_end];
+            let mixed = segment.iter().any(|c| c.is_ascii_digit())
+                && segment.iter().any(|c| c.is_ascii_alphabetic());
+            if terminated && segment.len() >= 20 && mixed {
                 result.push_str("•••");
-            } else {
-                result.push_str(&run);
+                i = seg_end;
+                continue;
             }
+        }
+        if hex_end > start {
+            result.extend(bytes[start..hex_end].iter());
+            i = hex_end;
         } else {
             result.push(c);
             i += 1;
@@ -213,6 +249,10 @@ mod tests {
     fn scrub_survives_unicode_and_leaks_nothing() {
         // Turkish İ changes byte length under to_lowercase — the old version
         // panicked or leaked the secret's head on exactly these
+        // a credential word followed by a multibyte char: the "%3D" probe
+        // must not byte-slice into the middle of it (panic = abort in release)
+        assert_eq!(scrub("token😀"), "token😀");
+        assert_eq!(scrub("search \"passwordéé\" -> 0 releases"), "search \"passwordéé\" -> 0 releases");
         assert_eq!(scrub("İİ apikey=x"), "İİ apikey=•••");
         assert_eq!(scrub("İ apikey=SECRET&x=1"), "İ apikey=•••&x=1");
         assert_eq!(scrub("İ apikey=Ünicode"), "İ apikey=•••");
@@ -242,6 +282,41 @@ mod tests {
         assert_eq!(
             scrub("fetch https://dir.bitport.io/qszik7hip9xqfj26/My%20Files/x.mkv done"),
             "fetch https://dir.bitport.io/•••/My%20Files/x.mkv done"
+        );
+    }
+
+    #[test]
+    fn scrub_covers_tracker_credential_shapes() {
+        // private trackers: torrent_pass / rsskey query keys, and base32 or
+        // mixed-alphanumeric passkeys as a path segment (not only hex)
+        assert_eq!(scrub("announce?torrent_pass=abc123xyz&x=1"), "announce?torrent_pass=•••&x=1");
+        assert_eq!(scrub("rss?rsskey=deadbeef99 ok"), "rss?rsskey=••• ok");
+        assert_eq!(scrub("secret=hunter2&"), "secret=•••&");
+        assert_eq!(
+            scrub("https://tr.example/MFRGGZDFMZTWQ2LKNNWGC3TFON2A/announce timed out"),
+            "https://tr.example/•••/announce timed out"
+        );
+        // release names in a path keep their dots and hyphens and stay readable
+        assert_eq!(
+            scrub("/downloads/Show.S01E01.1080p.WEB-DL.x265-GROUP/file.mkv"),
+            "/downloads/Show.S01E01.1080p.WEB-DL.x265-GROUP/file.mkv"
+        );
+        // a passkey as the LAST path segment, or right before the query
+        assert_eq!(
+            scrub("https://tracker/rss/MFRGGZDFMZTWQ2LKNNWGC3TFON2A?cat=5"),
+            "https://tracker/rss/•••?cat=5"
+        );
+        assert_eq!(scrub("GET /download/12345/a1B2c3D4e5F6g7H8i9J0k1"), "GET /download/12345/•••");
+        // a long hex run followed by another letter is still a hex secret
+        assert_eq!(
+            scrub("/x/0123456789abcdef0123456789abcdef01234567z"),
+            "/x/•••z"
+        );
+        // long folder names made of letters only are paths, not keys - the
+        // support bundle needs them readable
+        assert_eq!(
+            scrub("/mnt/media/TelevisionSeriesArchive/Show/file.mkv"),
+            "/mnt/media/TelevisionSeriesArchive/Show/file.mkv"
         );
     }
 }

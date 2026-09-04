@@ -34,6 +34,45 @@ beforeEach(() => {
   vi.spyOn(api, "briefsList").mockResolvedValue([]);
 });
 
+it("absorbs backend config writes into a dirty Settings draft without losing edits", async () => {
+  // the wizard writes prowlarrApiKey under a user who is mid-edit elsewhere;
+  // the untouched field must follow the new config or the next Save wipes the key
+  const user = userEvent.setup();
+  const base = (await api.getConfig()) as Config;
+  useStore.setState({ config: base });
+  render(<SettingsView />);
+  await user.click(screen.getByRole("button", { name: /notifications/i }));
+  const webhook = screen.getByPlaceholderText(/discord.com\/api\/webhooks/i);
+  await user.type(webhook, "https://discord.com/api/webhooks/1/abc");
+
+  useStore.setState({ config: { ...base, prowlarrApiKey: "wizard-key" } });
+
+  await user.click(screen.getByRole("button", { name: /connections/i }));
+  await waitFor(() => {
+    expect((screen.getByDisplayValue("wizard-key") as HTMLInputElement).value).toBe("wizard-key");
+  });
+  await user.click(screen.getByRole("button", { name: /notifications/i }));
+  expect((screen.getByPlaceholderText(/discord.com\/api\/webhooks/i) as HTMLInputElement).value).toBe(
+    "https://discord.com/api/webhooks/1/abc",
+  );
+});
+
+it("tells the user to search again after typing cancelled an in-flight search", async () => {
+  // typing during a search drops its result on purpose (a stale list under a
+  // new query is worse); the screen must say so instead of "Nothing surfaced"
+  const { default: SearchView } = await import("../views/Search");
+  useStore.setState({
+    query: "expanse s02",
+    hasSearched: true,
+    searching: false,
+    results: null,
+    searchError: null,
+  });
+  render(<SearchView />);
+  expect(screen.queryByText(/nothing surfaced/i)).toBeNull();
+  expect(screen.getByText(/press enter/i)).toBeTruthy();
+});
+
 it("never saves a compiled Brief plan under a different prompt", async () => {
   const user = userEvent.setup();
   const pending = deferred<HuntPlan>();

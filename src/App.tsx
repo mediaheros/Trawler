@@ -32,6 +32,12 @@ export default function App() {
   const [wizardDismissed, setWizardDismissed] = useState(false);
   const showWizard = config !== null && !config.setupCompleted && !wizardDismissed;
 
+  // "Run the setup wizard again" saves setupCompleted=false; the dismissal
+  // from an earlier Skip in this session must not keep the wizard hidden
+  useEffect(() => {
+    if (config && !config.setupCompleted) setWizardDismissed(false);
+  }, [config]);
+
   // WebView2 swallows target="_blank" navigations (no new-window handler),
   // so every external link in the app would be a dead click. Route them
   // through the opener plugin instead.

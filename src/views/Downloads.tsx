@@ -213,9 +213,12 @@ function TorrentCard({
               className="px-2 py-1.5"
               title="Open folder"
               onClick={() => {
-                void import("@tauri-apps/plugin-opener").then((m) =>
-                  m.revealItemInDir(t.content_path).catch(() => m.openPath(t.save_path)),
-                );
+                // reveal is the only opener permission granted; a path that
+                // is not on disk yet (metadata-only torrent, moved files)
+                // must say so instead of failing silently
+                void import("@tauri-apps/plugin-opener")
+                  .then((m) => m.revealItemInDir(t.content_path))
+                  .catch(() => useStore.getState().toast("Couldn't open that folder — it may not exist yet", "bad"));
               }}
             >
               <FolderOpen size={14} />

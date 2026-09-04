@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { ArrowDownCircle, RefreshCw, X } from "lucide-react";
 import { inTauri } from "../lib/api";
 import { checkForUpdate, relaunchApp } from "../lib/updater";
+import { desktopPlatform } from "../lib/platform";
 import { useStore } from "../store";
 import { Button } from "./ui";
 
@@ -77,10 +78,13 @@ export default function UpdateBanner() {
     } catch (e) {
       if (mine !== operation.current || useStore.getState().pendingUpdate !== handle) return;
       setPhase("downloaded");
-      toast(
-        `Update install failed: ${e} — if you installed via deb/rpm, update through your package manager`,
-        "bad",
-      );
+      const hint =
+        desktopPlatform === "linux"
+          ? " — if you installed via deb/rpm, update through your package manager"
+          : desktopPlatform === "macos"
+            ? " — if Trawler runs from the disk image, move it to Applications and try again"
+            : "";
+      toast(`Update install failed: ${e}${hint}`, "bad");
     }
   };
 

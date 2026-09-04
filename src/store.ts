@@ -235,7 +235,11 @@ export const useStore = create<Store>((set, get) => ({
   // typing a new query manually breaks any episode linkage
   setQuery: (query) => {
     ++searchSeq;
-    set({ query, episodeLink: null, searching: false });
+    // typing during a search cancels it, and the list from the search before
+    // that belongs to a query no longer on screen - drop it too, so the view
+    // says "cancelled" instead of showing stale rows under the new words
+    const cancelled = get().searching;
+    set({ query, episodeLink: null, searching: false, ...(cancelled ? { results: null } : {}) });
   },
   /** back to the landing hero: view + search state reset */
   goHome: () => {
@@ -260,7 +264,11 @@ export const useStore = create<Store>((set, get) => ({
   },
   setKind: (kind) => {
     ++searchSeq;
+    const wasSearching = get().searching;
     set({ kind, searching: false });
+    // a kind change mid-search supersedes it - with the new kind, not by
+    // stranding the user on an empty screen
+    if (wasSearching) void get().runSearch();
   },
   // "Best" is already a composite score; a secondary only makes sense for
   // single-key sorts, and never the same key twice
@@ -327,12 +335,24 @@ export const useStore = create<Store>((set, get) => ({
               : []
           : [];
       const res = await api.grab(r, linked);
-      set((s) => ({ grabState: { ...s.grabState, [key]: "done" } }));
-      get().toast(res.detail, "ok");
+      if (!res.ok) {
+        // nothing was sent (another path is mid-grab, or the ledger already
+        // has it): say so, and leave the button usable for a retry
+        set((s) => {
+          const grabState = { ...s.grabState };
+          delete grabState[key];
+          return { grabState };
+        });
+        get().toast(res.detail, "info");
+      } else {
+        set((s) => ({ grabState: { ...s.grabState, [key]: "done" } }));
+        get().toast(res.detail, "ok");
+      }
       // The pre-await snapshot decides the stamping: typing in the search
       // box mid-grab nulls episodeLink, and the ledger would say "have"
-      // while the episode shows wanted forever. (The backend stamps linked
-      // episodes too now — this is belt and braces.)
+      // while the episode shows wanted forever. The backend stamps (or, for
+      // content it already holds, adopts) the linked episodes - either way
+      // the link is spent and the shows need refreshing.
       if (link0 && r.parsed.season === link0.ep.season) {
         const episodeMatch = r.parsed.episode === link0.ep.number;
         const packMatch = r.parsed.seasonPack;
@@ -551,6 +571,8 @@ export const useStore = create<Store>((set, get) => ({
             liveSteps: st.liveSteps.map((x) => ({ ...x, running: false })),
           }));
           get().toast(s.payload.message ?? "agent error", "bad");
+          // the backend persisted a "⚠ …" assistant row before emitting this
+          void get().loadChat();
           break;
         case "done":
           clearAgentWatchdog();

@@ -276,7 +276,10 @@ pub async fn disable_flaresolverr(state: State<'_, AppState>) -> Result<()> {
     if let Ok(client) = crate::commands::prowlarr_pub(&state.http, &cfg) {
         let _ = client.remove_flaresolverr().await;
     }
-    setup::remove_flaresolverr_local()?;
+    // process kills with grace sleeps: off the async worker
+    tokio::task::spawn_blocking(setup::remove_flaresolverr_local)
+        .await
+        .map_err(|e| AppError::Other(format!("FlareSolverr removal task failed: {e}")))??;
     {
         let conn = state.db.lock().await;
         crate::db::log_activity(&conn, "system", None, "FlareSolverr turned off and removed");

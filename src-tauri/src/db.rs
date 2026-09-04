@@ -223,6 +223,29 @@ pub fn open() -> Result<Connection> {
     Ok(conn)
 }
 
+fn db_path() -> Result<std::path::PathBuf> {
+    crate::config::config_path()
+        .parent()
+        .map(|d| d.join("trawler.db"))
+        .ok_or_else(|| AppError::Other("cannot resolve data dir".into()))
+}
+
+/// Move an unopenable database (and its WAL/SHM sidecars) aside so startup
+/// can continue on a fresh file. Returns where the old one was kept.
+pub fn move_aside_corrupt() -> Result<std::path::PathBuf> {
+    let path = db_path()?;
+    let stamp = format!("corrupt-{}-{}", now(), std::process::id());
+    let kept = path.with_extension(format!("db.{stamp}"));
+    std::fs::rename(&path, &kept)?;
+    for sidecar in ["-wal", "-shm"] {
+        let side = std::path::PathBuf::from(format!("{}{sidecar}", path.display()));
+        if side.exists() {
+            let _ = std::fs::rename(&side, format!("{}{sidecar}", kept.display()));
+        }
+    }
+    Ok(kept)
+}
+
 /// A second connection for short-lived background writes (grab recording).
 /// The app's main connection owns schema setup — this one must not migrate.
 pub fn open_existing() -> Result<Connection> {
@@ -294,6 +317,7 @@ pub fn ledger_claim_dispatch(
                 .map_err(|e| AppError::Other(format!("could not encode episode linkage: {e}")))?,
         )
     };
+    let ts = now();
     tx.execute(
         "INSERT INTO grab_ledger (content_key, brief_id, title, info_hash, size, state, ts, ep_ids, backend, bp_token)
          VALUES (?1, ?2, ?3, ?4, ?5, 'dispatching', ?6, ?7, ?8, NULL)",
@@ -303,14 +327,129 @@ pub fn ledger_claim_dispatch(
             claim.title,
             claim.info_hash,
             claim.size,
-            now(),
+            ts,
             eps_json,
             claim.backend
         ],
     )
     .map_err(db_err)?;
+    // The episodes leave 'wanted' with the claim, not after the backend
+    // answers: the RSS sweep and the scheduler both ask "still wanted?" and a
+    // season pack takes seconds to reach qBittorrent - long enough for a
+    // single-episode grab to slip in beside it. Abandoning the claim frees them.
+    for id in claim.ep_ids {
+        tx.execute(
+            "UPDATE episodes SET state = 'grabbed', grabbed_title = ?1, grabbed_at = ?2
+             WHERE tvmaze_ep_id = ?3 AND state = 'wanted'",
+            rusqlite::params![claim.title, ts, id],
+        )
+        .map_err(db_err)?;
+    }
     tx.commit().map_err(db_err)?;
     Ok(true)
+}
+
+/// Is this content already handled as far as AUTOMATED paths are concerned?
+/// Like `ledger_satisfied`, plus content the user deliberately deleted in
+/// Trawler ('deleted'): a finished brief download removed to free disk must
+/// not be pulled straight back by the next RSS sweep or brief run. A torrent
+/// that merely vanished ('removed', reaped after a lost add or a deletion in
+/// qBittorrent's own UI) stays grabbable. Manual grabs and the follow
+/// scheduler (whose episodes were explicitly handed back) use the plain check.
+pub fn ledger_satisfied_for_automation(conn: &Connection, content_key: &str) -> bool {
+    conn.query_row(
+        "SELECT COUNT(*) FROM grab_ledger WHERE content_key = ?1 AND state IN ('dispatching','grabbed','completed','deleted')",
+        [content_key],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|n| n > 0)
+    .unwrap_or(false)
+}
+
+/// Link episodes to content the ledger already holds (a chat, brief or
+/// proposal grab that carried no episode ids). The episodes follow the row's
+/// state, and the row remembers them so completion flips them later. For
+/// completed content only never-stamped episodes are adopted: an episode the
+/// user marked wanted again keeps its grabbed_title, and must not silently
+/// flip back to downloaded with nothing grabbed. Returns false when nothing
+/// was adopted.
+pub fn ledger_adopt_episodes(conn: &Connection, content_key: &str, ep_ids: &[i64]) -> Result<bool> {
+    if ep_ids.is_empty() {
+        return Ok(false);
+    }
+    let row: Option<(i64, String, String, Option<String>)> = conn
+        .query_row(
+            "SELECT id, title, state, ep_ids FROM grab_ledger
+             WHERE content_key = ?1 AND state IN ('dispatching','grabbed','completed')
+             ORDER BY id DESC LIMIT 1",
+            [content_key],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()
+        .map_err(db_err)?;
+    let Some((id, title, state, existing)) = row else {
+        return Ok(false);
+    };
+    let ts = now();
+    let mut adopted: Vec<i64> = vec![];
+    for ep in ep_ids {
+        let changed = if state == "completed" {
+            conn.execute(
+                "UPDATE episodes SET state = 'downloaded', grabbed_title = ?1, grabbed_at = ?2
+                 WHERE tvmaze_ep_id = ?3 AND state = 'wanted' AND grabbed_title IS NULL",
+                rusqlite::params![title, ts, ep],
+            )
+        } else {
+            conn.execute(
+                "UPDATE episodes SET state = 'grabbed', grabbed_title = ?1, grabbed_at = ?2
+                 WHERE tvmaze_ep_id = ?3 AND state = 'wanted'",
+                rusqlite::params![title, ts, ep],
+            )
+        }
+        .map_err(db_err)?;
+        if changed > 0 {
+            adopted.push(*ep);
+        }
+    }
+    if adopted.is_empty() {
+        return Ok(false);
+    }
+    let mut linked = parse_ep_ids(existing.as_deref());
+    for ep in adopted {
+        if !linked.contains(&ep) {
+            linked.push(ep);
+        }
+    }
+    let json = serde_json::to_string(&linked)
+        .map_err(|e| AppError::Other(format!("could not encode episode linkage: {e}")))?;
+    conn.execute("UPDATE grab_ledger SET ep_ids = ?2 WHERE id = ?1", rusqlite::params![id, json])
+        .map_err(db_err)?;
+    Ok(true)
+}
+
+/// Release every open claim held by one backend (the user disconnected the
+/// account): the rows go to 'removed' and their episodes back to 'wanted',
+/// so the content can be grabbed again through whatever backend remains.
+pub fn ledger_release_backend(conn: &Connection, backend: &str) -> Result<usize> {
+    let rows: Vec<(i64, Option<String>)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, ep_ids FROM grab_ledger WHERE backend = ?1 AND state IN ('dispatching','grabbed')",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([backend], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(db_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        rows
+    };
+    for (id, ep_ids) in &rows {
+        conn.execute("UPDATE grab_ledger SET state = 'removed' WHERE id = ?1", [id])
+            .map_err(db_err)?;
+        set_episodes_state_by_ids(conn, &parse_ep_ids(ep_ids.as_deref()), "wanted", None);
+    }
+    Ok(rows.len())
 }
 
 pub fn ledger_finish_dispatch(
@@ -363,12 +502,44 @@ pub fn ledger_set_dispatch_info_hash(
     Ok(())
 }
 
-pub fn ledger_abandon_dispatch(conn: &Connection, content_key: &str) -> Result<()> {
+pub fn ledger_abandon_dispatch(conn: &Connection, content_key: &str, ep_ids: &[i64]) -> Result<()> {
+    // the claim stamped its episodes 'grabbed' under its own title, and the
+    // scheduler may have adopted more into the row since - every one of
+    // those comes back. An episode another live grab owns (stamped under a
+    // different title, e.g. from a stale season-pack selection) is not ours
+    // to hand back.
+    let rows: Vec<(String, Option<String>)> = {
+        let mut stmt = conn
+            .prepare("SELECT title, ep_ids FROM grab_ledger WHERE content_key = ?1 AND state = 'dispatching'")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([content_key], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(db_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        rows
+    };
     conn.execute(
         "DELETE FROM grab_ledger WHERE content_key = ?1 AND state = 'dispatching'",
         [content_key],
     )
     .map_err(db_err)?;
+    for (title, raw) in rows {
+        let mut freed: Vec<i64> = ep_ids.to_vec();
+        for id in parse_ep_ids(raw.as_deref()) {
+            if !freed.contains(&id) {
+                freed.push(id);
+            }
+        }
+        for id in freed {
+            conn.execute(
+                "UPDATE episodes SET state = 'wanted', grabbed_title = NULL, grabbed_at = NULL, last_searched_at = 0
+                 WHERE tvmaze_ep_id = ?1 AND state = 'grabbed' AND grabbed_title = ?2",
+                rusqlite::params![id, title],
+            )
+            .map_err(db_err)?;
+        }
+    }
     Ok(())
 }
 
@@ -399,7 +570,7 @@ pub fn ledger_confirm_missing(conn: &Connection, id: i64, ep_ids: &[i64]) -> Res
     let changed = conn
         .execute(
             "UPDATE grab_ledger SET state = 'removed'
-             WHERE id = ?1 AND state IN ('dispatching','grabbed')",
+             WHERE id = ?1 AND state IN ('dispatching','grabbed','stalled')",
             [id],
         )
         .map_err(db_err)?;
@@ -637,23 +808,6 @@ pub fn stamp_searched(conn: &Connection, ep_ids: &[i64]) {
     let _ = tx.commit();
 }
 
-/// Stamp episodes a grab satisfied. Guarded on state = 'wanted' so a stale
-/// manual grab can't flip an episode the user has since marked downloaded
-/// or ignored back to grabbed — never fight the user.
-pub fn mark_grabbed(conn: &Connection, ep_ids: &[i64], release_title: &str) -> Result<()> {
-    let ts = now();
-    let tx = conn.unchecked_transaction().map_err(db_err)?;
-    for id in ep_ids {
-        tx.execute(
-            "UPDATE episodes SET state = 'grabbed', grabbed_title = ?1, grabbed_at = ?2
-             WHERE tvmaze_ep_id = ?3 AND state = 'wanted'",
-            rusqlite::params![release_title, ts, id],
-        )
-        .map_err(db_err)?;
-    }
-    tx.commit().map_err(db_err)
-}
-
 // ---------- app meta (tiny K/V: last scout pass, migration flags) ----------
 
 pub fn meta_get(conn: &Connection, key: &str) -> Option<String> {
@@ -669,7 +823,35 @@ pub fn meta_set(conn: &Connection, key: &str, value: &str) {
 }
 
 pub fn db_err(e: rusqlite::Error) -> AppError {
-    AppError::Other(format!("database error: {e}"))
+    AppError::Db { code: e.sqlite_error_code(), message: e.to_string() }
+}
+
+/// Only a file SQLite itself declares unreadable is a candidate for the
+/// move-aside at startup. A busy or locked database (a second Trawler
+/// process mid-write, a slow network share) is healthy and must be left alone.
+pub fn is_corruption(error: &AppError) -> bool {
+    matches!(
+        error,
+        AppError::Db {
+            code: Some(rusqlite::ErrorCode::NotADatabase | rusqlite::ErrorCode::DatabaseCorrupt),
+            ..
+        }
+    )
+}
+
+/// Open the database; a corrupt file is moved aside (the path is returned so
+/// startup can say where) and a fresh one created. Any other failure is
+/// returned untouched.
+pub fn open_or_recover() -> Result<(Connection, Option<std::path::PathBuf>)> {
+    match open() {
+        Ok(conn) => Ok((conn, None)),
+        Err(error) if is_corruption(&error) => {
+            let kept = move_aside_corrupt()?;
+            let conn = open()?;
+            Ok((conn, Some(kept)))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub fn now() -> i64 {
@@ -859,23 +1041,7 @@ mod tests {
 
     #[test]
     fn durable_dispatch_claim_blocks_duplicates_until_abandoned() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE grab_ledger (
-               id INTEGER PRIMARY KEY AUTOINCREMENT,
-               content_key TEXT NOT NULL,
-               brief_id INTEGER,
-               title TEXT NOT NULL,
-               info_hash TEXT,
-               size INTEGER NOT NULL DEFAULT 0,
-               state TEXT NOT NULL,
-               ts INTEGER NOT NULL,
-               ep_ids TEXT,
-               backend TEXT NOT NULL,
-               bp_token TEXT
-             );",
-        )
-        .unwrap();
+        let conn = ledger_with_episodes();
 
         assert!(ledger_claim_dispatch(&conn, &DispatchClaim {
             content_key: "release-key",
@@ -899,7 +1065,7 @@ mod tests {
         })
         .unwrap());
 
-        ledger_abandon_dispatch(&conn, "release-key").unwrap();
+        ledger_abandon_dispatch(&conn, "release-key", &[]).unwrap();
         assert!(!ledger_satisfied(&conn, "release-key"));
         assert!(ledger_claim_dispatch(&conn, &DispatchClaim {
             content_key: "release-key",
@@ -975,6 +1141,241 @@ mod tests {
         let absent_id = conn.last_insert_rowid();
         assert!(ledger_confirm_missing(&conn, absent_id, &[8]).unwrap());
         assert!(!ledger_satisfied(&conn, "never-submitted"));
+    }
+
+    fn ledger_with_episodes() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE grab_ledger (
+               id INTEGER PRIMARY KEY AUTOINCREMENT, content_key TEXT NOT NULL,
+               brief_id INTEGER, title TEXT NOT NULL, info_hash TEXT, size INTEGER NOT NULL,
+               state TEXT NOT NULL, ts INTEGER NOT NULL, ep_ids TEXT, backend TEXT NOT NULL,
+               bp_token TEXT
+             );
+             CREATE TABLE episodes (
+               tvmaze_ep_id INTEGER PRIMARY KEY, state TEXT NOT NULL,
+               grabbed_title TEXT, grabbed_at INTEGER, last_searched_at INTEGER DEFAULT 0
+             );
+             CREATE TABLE activity (
+               id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
+               kind TEXT NOT NULL, show_id INTEGER, message TEXT NOT NULL
+             );
+             INSERT INTO episodes (tvmaze_ep_id, state) VALUES (7, 'wanted'), (8, 'wanted'), (9, 'wanted');",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn ep_state(conn: &Connection, id: i64) -> String {
+        conn.query_row("SELECT state FROM episodes WHERE tvmaze_ep_id = ?1", [id], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn claiming_a_dispatch_stamps_its_episodes_and_abandoning_frees_them() {
+        // the RSS sweep and the scheduler race on "is this episode still
+        // wanted?" during the seconds a season pack takes to reach
+        // qBittorrent - the claim itself must take the episodes off the table
+        let conn = ledger_with_episodes();
+        assert!(ledger_claim_dispatch(&conn, &DispatchClaim {
+            content_key: "tv:show:s01pack",
+            brief_id: None,
+            title: "Show.S01.1080p.WEB-PACK",
+            info_hash: None,
+            size: 10,
+            ep_ids: &[7, 8],
+            backend: "qbittorrent",
+        })
+        .unwrap());
+        assert_eq!(ep_state(&conn, 7), "grabbed");
+        assert_eq!(ep_state(&conn, 8), "grabbed");
+        assert_eq!(ep_state(&conn, 9), "wanted");
+
+        ledger_abandon_dispatch(&conn, "tv:show:s01pack", &[7, 8]).unwrap();
+        assert_eq!(ep_state(&conn, 7), "wanted");
+        assert_eq!(ep_state(&conn, 8), "wanted");
+    }
+
+    #[test]
+    fn satisfied_content_adopts_the_episodes_that_asked_for_it() {
+        // a chat/brief/proposal grab carries no episode ids; when the follow
+        // scheduler later finds the content already in the ledger it must
+        // link the episodes to that row instead of leaving them wanted forever
+        let conn = ledger_with_episodes();
+        assert!(ledger_claim_dispatch(&conn, &DispatchClaim {
+            content_key: "tv:show:s01e01",
+            brief_id: None,
+            title: "Show.S01E01.1080p.WEB-CHAT",
+            info_hash: None,
+            size: 10,
+            ep_ids: &[],
+            backend: "qbittorrent",
+        })
+        .unwrap());
+        ledger_finish_dispatch(&conn, "tv:show:s01e01", None, None).unwrap();
+
+        assert!(super::ledger_adopt_episodes(&conn, "tv:show:s01e01", &[7]).unwrap());
+        assert_eq!(ep_state(&conn, 7), "grabbed");
+        let (ep_ids, title): (String, String) = conn
+            .query_row(
+                "SELECT ep_ids, title FROM grab_ledger WHERE content_key = 'tv:show:s01e01'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(parse_ep_ids(Some(&ep_ids)), vec![7]);
+        assert_eq!(
+            conn.query_row("SELECT grabbed_title FROM episodes WHERE tvmaze_ep_id = 7", [], |r| r.get::<_, String>(0)).unwrap(),
+            title
+        );
+
+        // completed content lands the episode as downloaded straight away
+        conn.execute("UPDATE grab_ledger SET state = 'completed'", []).unwrap();
+        assert!(super::ledger_adopt_episodes(&conn, "tv:show:s01e01", &[8]).unwrap());
+        assert_eq!(ep_state(&conn, 8), "downloaded");
+        // nothing to adopt into: leave the episode alone
+        assert!(!super::ledger_adopt_episodes(&conn, "tv:other:s01e01", &[9]).unwrap());
+        assert_eq!(ep_state(&conn, 9), "wanted");
+    }
+
+    #[test]
+    fn abandoning_a_claim_frees_episodes_adopted_into_it_meanwhile() {
+        // the scheduler may adopt an episode into a row that is still
+        // dispatching; if that dispatch then fails, the adopted episode must
+        // come back too, not stay 'grabbed' pointing at a deleted row
+        let conn = ledger_with_episodes();
+        assert!(ledger_claim_dispatch(&conn, &DispatchClaim {
+            content_key: "tv:show:s01pack",
+            brief_id: None,
+            title: "Show.S01.1080p.WEB-PACK",
+            info_hash: None,
+            size: 10,
+            ep_ids: &[7],
+            backend: "qbittorrent",
+        })
+        .unwrap());
+        assert!(super::ledger_adopt_episodes(&conn, "tv:show:s01pack", &[8]).unwrap());
+        assert_eq!(ep_state(&conn, 8), "grabbed");
+
+        ledger_abandon_dispatch(&conn, "tv:show:s01pack", &[7]).unwrap();
+        assert_eq!(ep_state(&conn, 7), "wanted");
+        assert_eq!(ep_state(&conn, 8), "wanted");
+    }
+
+    #[test]
+    fn automation_treats_deliberately_deleted_content_as_had() {
+        // the user deleted a finished brief download in Trawler to free disk;
+        // the next RSS sweep or brief run must not pull it straight back
+        let conn = ledger_with_episodes();
+        conn.execute(
+            "INSERT INTO grab_ledger (content_key, title, size, state, ts, backend)
+             VALUES ('item:ufc 319', 'UFC.319.1080p', 10, 'deleted', 1, 'qbittorrent')",
+            [],
+        )
+        .unwrap();
+        assert!(!ledger_satisfied(&conn, "item:ufc 319"));
+        assert!(super::ledger_satisfied_for_automation(&conn, "item:ufc 319"));
+        // a torrent that merely VANISHED (lost add, deleted in qBittorrent's
+        // own UI by mistake) is retired as 'removed' by the reaper and must
+        // stay grabbable - that is not a decision the user made in Trawler
+        conn.execute("UPDATE grab_ledger SET state = 'removed'", []).unwrap();
+        assert!(!super::ledger_satisfied_for_automation(&conn, "item:ufc 319"));
+        // a dead swarm is not "had" for anyone
+        conn.execute("UPDATE grab_ledger SET state = 'stalled'", []).unwrap();
+        assert!(!super::ledger_satisfied_for_automation(&conn, "item:ufc 319"));
+    }
+
+    #[test]
+    fn adopting_into_completed_content_never_overrides_a_want_again() {
+        // the user marked a downloaded episode wanted again (grabbed_title is
+        // kept on purpose); the old completed row must not flip it back to
+        // downloaded with nothing grabbed
+        let conn = ledger_with_episodes();
+        conn.execute(
+            "INSERT INTO grab_ledger (content_key, title, size, state, ts, backend)
+             VALUES ('tv:show:s01e05', 'Show.S01E05.1080p', 10, 'completed', 1, 'qbittorrent')",
+            [],
+        )
+        .unwrap();
+        conn.execute("UPDATE episodes SET grabbed_title = 'Show.S01E05.1080p' WHERE tvmaze_ep_id = 7", []).unwrap();
+        assert!(!super::ledger_adopt_episodes(&conn, "tv:show:s01e05", &[7]).unwrap());
+        assert_eq!(ep_state(&conn, 7), "wanted");
+        // an episode that was never stamped (agent grab) is adopted as usual
+        assert!(super::ledger_adopt_episodes(&conn, "tv:show:s01e05", &[8]).unwrap());
+        assert_eq!(ep_state(&conn, 8), "downloaded");
+    }
+
+    #[test]
+    fn abandoning_a_claim_only_frees_the_episodes_it_stamped() {
+        // a manual season-pack grab from a stale screen lists an episode the
+        // scheduler already grabbed under another release; the pack's failure
+        // must not hand that episode back
+        let conn = ledger_with_episodes();
+        conn.execute(
+            "UPDATE episodes SET state = 'grabbed', grabbed_title = 'Show.S01E03.1080p-OTHER' WHERE tvmaze_ep_id = 8",
+            [],
+        )
+        .unwrap();
+        assert!(ledger_claim_dispatch(&conn, &DispatchClaim {
+            content_key: "tv:show:s01pack",
+            brief_id: None,
+            title: "Show.S01.1080p.WEB-PACK",
+            info_hash: None,
+            size: 10,
+            ep_ids: &[7, 8],
+            backend: "qbittorrent",
+        })
+        .unwrap());
+        ledger_abandon_dispatch(&conn, "tv:show:s01pack", &[7, 8]).unwrap();
+        assert_eq!(ep_state(&conn, 7), "wanted");
+        assert_eq!(ep_state(&conn, 8), "grabbed", "owned by another live grab");
+    }
+
+    #[test]
+    fn disconnecting_bitport_releases_its_open_claims() {
+        let conn = ledger_with_episodes();
+        conn.execute(
+            "INSERT INTO grab_ledger (content_key, title, size, state, ts, ep_ids, backend)
+             VALUES ('tv:show:s01e01', 'Show.S01E01', 10, 'grabbed', 1, '[7]', 'bitport'),
+                    ('tv:show:s01e02', 'Show.S01E02', 10, 'completed', 1, '[8]', 'bitport'),
+                    ('tv:show:s01e03', 'Show.S01E03', 10, 'grabbed', 1, '[9]', 'qbittorrent')",
+            [],
+        )
+        .unwrap();
+        conn.execute("UPDATE episodes SET state = 'grabbed', grabbed_title = 'x'", []).unwrap();
+        let released = super::ledger_release_backend(&conn, "bitport").unwrap();
+        assert_eq!(released, 1, "only open cloud claims are released");
+        assert_eq!(ep_state(&conn, 7), "wanted");
+        assert_eq!(ep_state(&conn, 8), "grabbed", "completed cloud content stays as it is");
+        assert_eq!(ep_state(&conn, 9), "grabbed", "local grabs are untouched");
+        assert!(!ledger_satisfied(&conn, "tv:show:s01e01"));
+    }
+
+    #[test]
+    fn only_sqlite_corruption_counts_as_corruption() {
+        // garbage bytes: SQLITE_NOTADB - the move-aside case
+        let path = std::env::temp_dir().join(format!(
+            "trawler-notadb-{}-{}",
+            std::process::id(),
+            super::now()
+        ));
+        std::fs::write(&path, b"this is not a database file at all, not even close").unwrap();
+        let conn = Connection::open(&path).unwrap();
+        let error = conn
+            .execute_batch("PRAGMA journal_mode = WAL; CREATE TABLE t (x);")
+            .map_err(super::db_err)
+            .unwrap_err();
+        assert!(super::is_corruption(&error), "{error}");
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+
+        // a schema error on a healthy database is not: leave the file alone
+        let healthy = Connection::open_in_memory().unwrap();
+        let schema = healthy
+            .execute("ALTER TABLE absent ADD COLUMN x TEXT", [])
+            .map_err(super::db_err)
+            .unwrap_err();
+        assert!(!super::is_corruption(&schema));
+        assert!(schema.to_string().starts_with("database error:"));
     }
 
     #[test]

@@ -175,15 +175,19 @@ pub async fn agent_send(app: tauri::AppHandle, state: State<'_, AppState>, text:
                 Ok(Err(e)) => e.to_string(),
                 _ => unreachable!(),
             };
+            // persist first: the UI reloads the transcript on the error
+            // event, and must find this row when it does
+            {
+                let conn = state.db.lock().await;
+                let _ = conn.execute(
+                    "INSERT INTO chat_messages (ts, role, content) VALUES (?1, 'assistant', ?2)",
+                    rusqlite::params![db::now(), format!("⚠ {msg}")],
+                );
+            }
             use tauri::Emitter;
             let _ = app2.emit(
                 "agent-step",
                 serde_json::json!({ "runId": run_id, "kind": "error", "payload": { "message": msg } }),
-            );
-            let conn = state.db.lock().await;
-            let _ = conn.execute(
-                "INSERT INTO chat_messages (ts, role, content) VALUES (?1, 'assistant', ?2)",
-                rusqlite::params![db::now(), format!("⚠ {msg}")],
             );
         }
         state.agent_chat_busy.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -353,6 +357,11 @@ pub struct ProposalRow {
     pub last_seen: i64,
 }
 
+/// A card is only renderable when its stored result is a JSON object.
+fn proposal_result(raw: &str) -> Option<Value> {
+    serde_json::from_str::<Value>(raw).ok().filter(Value::is_object)
+}
+
 #[tauri::command]
 pub async fn proposals_list(state: State<'_, AppState>) -> Result<Vec<ProposalRow>> {
     let conn = state.db.lock().await;
@@ -375,7 +384,7 @@ pub async fn proposals_list(state: State<'_, AppState>) -> Result<Vec<ProposalRo
                 brief_id: r.get(1)?,
                 brief_name: r.get(2)?,
                 content_key: r.get(3)?,
-                result: serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or(Value::Null),
+                result: proposal_result(&r.get::<_, String>(4)?).unwrap_or(Value::Null),
                 reason: r.get(5)?,
                 status: if r.get::<_, String>(6)? == "grabbing" { "pending".into() } else { r.get(6)? },
                 first_seen: r.get(7)?,
@@ -385,7 +394,9 @@ pub async fn proposals_list(state: State<'_, AppState>) -> Result<Vec<ProposalRo
         .map_err(db::db_err)?
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(db::db_err)?;
-    Ok(rows)
+    // an unreadable row would crash the Agent view in render (result.title);
+    // it cannot be approved anyway, so it is left out rather than shown
+    Ok(rows.into_iter().filter(|p| p.result.is_object()).collect())
 }
 
 #[tauri::command]
@@ -470,13 +481,16 @@ pub async fn proposal_resolve(state: State<'_, AppState>, id: i64, approve: bool
             db::log_activity(&conn, "agent", None, &format!("Approved proposal: {title}"));
             Ok(format!("Grabbed {title}"))
         }
-        // another path already has this content in flight — the card settles
-        // with that grab; don't claim it as this approval's doing
+        // another path has this content in flight right now - that grab may
+        // still fail, so the card goes back to pending; if the other grab
+        // lands, the next approval answers AlreadyHad and settles it
         Ok(crate::grab::GrabOutcome::AlreadyClaimed) => {
-            conn.execute("UPDATE proposals SET status = 'approved' WHERE id = ?1", [id])
-                .map_err(db::db_err)?;
-            db::log_activity(&conn, "agent", None, &format!("Approved proposal: {title} (another grab was already in flight)"));
-            Ok(format!("Another Trawler path is already grabbing {title}"))
+            conn.execute(
+                "UPDATE proposals SET status = 'pending', last_seen = ?2 WHERE id = ?1",
+                rusqlite::params![id, db::now()],
+            )
+            .map_err(db::db_err)?;
+            Ok(format!("Another Trawler path is grabbing {title} right now — approve again in a moment if it is still listed"))
         }
         Ok(crate::grab::GrabOutcome::AlreadyHad) => {
             conn.execute("UPDATE proposals SET status = 'approved' WHERE id = ?1", [id])
@@ -499,6 +513,16 @@ pub async fn proposal_resolve(state: State<'_, AppState>, id: i64, approve: bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proposal_cards_need_an_object_result() {
+        // one unreadable result_json row must not take the whole Agent view
+        // down (the card reads result.title in render)
+        assert!(proposal_result("{\"title\":\"x\"}").is_some());
+        assert!(proposal_result("null").is_none());
+        assert!(proposal_result("[1,2]").is_none());
+        assert!(proposal_result("not json").is_none());
+    }
 
     #[test]
     fn chat_exclusion_is_atomic_and_released_on_drop() {

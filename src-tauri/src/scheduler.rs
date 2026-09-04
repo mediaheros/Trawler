@@ -11,6 +11,60 @@ use crate::error::Result;
 use crate::follows::{codec_boost, episode_query, profile_allows, refresh_show, season_query};
 use crate::AppState;
 
+/// qBittorrent reports a finished torrent as exactly 1.0. Anything short of
+/// that is still downloading: 0.999 of a 20 GB pack is 20 MB missing, and a
+/// torrent wedged at 99.9% on a dead piece must not read as complete.
+fn is_complete_progress(progress: f64) -> bool {
+    progress >= 1.0
+}
+
+/// Only a qBittorrent-shaped identity (hex v1 or v2 infohash) may override
+/// title matching; a ledger row carrying anything else falls back to the name.
+fn qbt_comparable_hash(hash: &str) -> bool {
+    matches!(hash.len(), 40 | 64) && hash.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Releases the ledger retired as dead swarms. The planner must skip them:
+/// once `reopen_dead_grabs` hands the episodes back, the very same corpse is
+/// usually still the top-ranked search result (indexer seeder counts are
+/// stale), and re-adding it makes qBittorrent reject a duplicate every cycle.
+pub struct RetiredReleases {
+    titles: std::collections::HashSet<String>,
+    hashes: std::collections::HashSet<String>,
+}
+
+impl RetiredReleases {
+    pub fn contains(&self, r: &EnrichedRelease) -> bool {
+        let by_hash = r
+            .release
+            .info_hash
+            .as_deref()
+            .map(|h| h.to_ascii_lowercase())
+            .or_else(|| magnet_hash(r.release.magnet_url.as_deref()))
+            .is_some_and(|h| self.hashes.contains(&h));
+        by_hash || self.titles.contains(&normalize(&r.release.title))
+    }
+}
+
+fn retired_releases(conn: &rusqlite::Connection) -> RetiredReleases {
+    let mut out = RetiredReleases { titles: Default::default(), hashes: Default::default() };
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT title, info_hash FROM grab_ledger WHERE state = 'stalled' AND backend = 'qbittorrent'",
+    ) {
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))
+            .map(|it| it.flatten().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for (title, hash) in rows {
+            out.titles.insert(normalize(&title));
+            if let Some(h) = hash.filter(|h| qbt_comparable_hash(h)) {
+                out.hashes.insert(h.to_ascii_lowercase());
+            }
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlannedGrab {
@@ -98,9 +152,9 @@ pub async fn plan_for_show(
     let profile = profile_for(show, &cfg.default_quality);
     let now = db::now();
 
-    let episodes = {
+    let (episodes, retired) = {
         let conn = state.db.lock().await;
-        db::list_episodes(&conn, show.tvmaze_id)?
+        (db::list_episodes(&conn, show.tvmaze_id)?, retired_releases(&conn))
     };
 
     let mut actionable: Vec<&EpisodeRow> = episodes
@@ -131,7 +185,8 @@ pub async fn plan_for_show(
         // Season pack first when it would cover several missing episodes.
         if profile.allow_season_packs && eps.len() >= 4 {
             let q = season_query(&show.name, season);
-            let results = perform_search(state, &q, "tv", &[]).await?;
+            let mut results = perform_search(state, &q, "tv", &[]).await?;
+            results.releases.retain(|r| !retired.contains(r));
             if results.indexers.iter().any(|o| o.ok) {
                 // the season query covered every wanted episode in this group
                 searched_ep_ids.extend(eps.iter().map(|e| e.tvmaze_ep_id));
@@ -149,7 +204,8 @@ pub async fn plan_for_show(
 
         for ep in eps {
             let q = episode_query(&show.name, season, ep.number);
-            let results = perform_search(state, &q, "tv", &[]).await?;
+            let mut results = perform_search(state, &q, "tv", &[]).await?;
+            results.releases.retain(|r| !retired.contains(r));
             if results.indexers.iter().any(|o| o.ok) && !searched_ep_ids.contains(&ep.tvmaze_ep_id) {
                 searched_ep_ids.push(ep.tvmaze_ep_id);
             }
@@ -193,12 +249,6 @@ async fn execute_plan(app: &tauri::AppHandle, state: &AppState, plan: &PlannedGr
     let ck = crate::briefs::content_key(&plan.title);
     let (save_path, fresh_ep_ids) = {
         let conn = state.db.lock().await;
-        // The plan was built from a snapshot taken before slow searches — the
-        // RSS sweep (or the user) may have satisfied it meanwhile. The shared
-        // ledger is the source of truth for both paths.
-        if crate::db::ledger_satisfied(&conn, &ck) {
-            return false;
-        }
         let fresh: Vec<i64> = plan
             .ep_ids
             .iter()
@@ -214,6 +264,17 @@ async fn execute_plan(app: &tauri::AppHandle, state: &AppState, plan: &PlannedGr
             .copied()
             .collect();
         if fresh.is_empty() {
+            return false;
+        }
+        // The plan was built from a snapshot taken before slow searches - the
+        // RSS sweep, the agent, a proposal, or the user may have satisfied it
+        // meanwhile. The shared ledger is the source of truth; when it already
+        // holds this content, link these episodes to that grab (a chat or
+        // brief grab carries no episode ids) instead of leaving them wanted.
+        if crate::db::ledger_satisfied(&conn, &ck) {
+            if let Err(e) = crate::db::ledger_adopt_episodes(&conn, &ck, &fresh) {
+                crate::applog::warn("scheduler", format!("could not link episodes to an existing grab: {e}"));
+            }
             return false;
         }
         let sp = conn
@@ -320,16 +381,31 @@ fn reopen_dead_grabs(
             continue;
         }
         let norm = normalize(&t.name);
-        // match by normalized title against still-open grabs
+        // identity first: a magnet grab is renamed by qBittorrent once its
+        // metadata lands, so the ledger title and the torrent name disagree
+        // exactly when it matters; the title is the fallback for rows without
+        // a comparable hash
+        type OpenRow = (i64, String, i64, Option<String>, Option<String>);
         let hit: Option<(i64, String, i64, Option<String>)> = conn
-            .prepare("SELECT id, title, size, ep_ids FROM grab_ledger WHERE state = 'grabbed' AND backend = 'qbittorrent'")
+            .prepare("SELECT id, title, size, ep_ids, info_hash FROM grab_ledger WHERE state = 'grabbed' AND backend = 'qbittorrent'")
             .ok()
             .and_then(|mut stmt| {
                 stmt.query_map([], |r| {
-                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get(3)?))
+                    Ok::<OpenRow, _>((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
                 })
                 .ok()
-                .and_then(|rows| rows.flatten().find(|(_, title, _, _)| normalize(title) == norm))
+                .and_then(|rows| {
+                    // the title still counts when the hash disagrees: stale
+                    // indexer definitions report wrong infohashes, and a row
+                    // carrying one must not sit on a corpse forever
+                    rows.flatten().find(|(_, title, _, _, info_hash)| {
+                        let by_hash = info_hash
+                            .as_deref()
+                            .is_some_and(|h| qbt_comparable_hash(h) && h.eq_ignore_ascii_case(&t.hash));
+                        by_hash || normalize(title) == norm
+                    })
+                })
+                .map(|(id, title, size, ep_ids, _)| (id, title, size, ep_ids))
             });
         if let Some((id, title, size, ep_ids_raw)) = hit {
             let linked_ids = db::parse_ep_ids(ep_ids_raw.as_deref());
@@ -373,7 +449,7 @@ fn reopen_dead_grabs(
                 "error",
                 None,
                 &format!(
-                    "Dead swarm: {} had no peers for over an hour — paused; hunting a replacement",
+                    "Dead swarm: {} had no peers for over an hour — paused; the scheduler will look for another release",
                     title.chars().take(70).collect::<String>()
                 ),
             );
@@ -397,18 +473,10 @@ async fn medic_pass(app: &tauri::AppHandle, state: &AppState, dead: Vec<DeadGrab
         return;
     }
     let auto = cfg.medic_mode == "auto";
-    let q = crate::qbit::QbitClient {
-        http: &state.http,
-        base: cfg.qbit_url.clone(),
-        username: cfg.qbit_username.clone(),
-        password: cfg.qbit_password.clone(),
-    };
 
     // only the ones we actually handle this cycle; the rest stay detectable
+    // (completion_pass already paused every corpse, whatever the medic mode)
     for item in dead.into_iter().take(2) {
-        // pause the dead torrent — recoverable, never deleted
-        let _ = q.torrent_action("stop", &item.qbt_hash).await;
-
         let parsed = crate::parse::parse(&item.title);
         // Equivalence guard, enforced in Rust: significant title tokens (and the
         // episode marker when present) must appear in any replacement.
@@ -829,12 +897,12 @@ async fn completion_pass(app: &tauri::AppHandle, state: &AppState) -> Vec<DeadGr
     }
     let mut done: std::collections::HashSet<String> = torrents
         .iter()
-        .filter(|t| t.progress >= 0.999)
+        .filter(|t| is_complete_progress(t.progress))
         .map(|t| normalize(&t.name))
         .collect();
     let done_hashes: std::collections::HashSet<String> = torrents
         .iter()
-        .filter(|t| t.progress >= 0.999)
+        .filter(|t| is_complete_progress(t.progress))
         .map(|t| t.hash.to_ascii_lowercase())
         .collect();
 
@@ -870,32 +938,42 @@ async fn completion_pass(app: &tauri::AppHandle, state: &AppState) -> Vec<DeadGr
             torrents.iter().map(|t| normalize(&t.name)).collect();
         let all_hashes: std::collections::HashSet<String> =
             torrents.iter().map(|t| t.hash.to_ascii_lowercase()).collect();
-        let cutoff = db::now() - 5 * 60; // covers the add-to-listing gap; a magnet mid-metaDL is already listed
-        let rows: Vec<(i64, String, Option<String>, Option<String>)> = conn
-            .prepare("SELECT id, title, info_hash, ep_ids FROM grab_ledger WHERE state IN ('dispatching','grabbed') AND ts < ?1 AND backend = 'qbittorrent'")
+        // covers the add-to-listing gap with room for a slow dispatch: the
+        // .torrent fetch through Prowlarr can follow five 60 s hops before the
+        // add even starts, and a claim reaped mid-flight would let the add
+        // land with no ledger row to finish (a duplicate grab next cycle)
+        let cutoff = db::now() - 15 * 60;
+        // a stalled row is retired too once its torrent is gone: the user
+        // deleted the corpse, so the release may be picked again
+        type ReapRow = (i64, String, Option<String>, Option<String>, String);
+        let rows: Vec<ReapRow> = conn
+            .prepare("SELECT id, title, info_hash, ep_ids, state FROM grab_ledger WHERE state IN ('dispatching','grabbed','stalled') AND ts < ?1 AND backend = 'qbittorrent'")
             .ok()
             .map(|mut stmt| {
-                stmt.query_map([cutoff], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                stmt.query_map([cutoff], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
                     .map(|it| it.flatten().collect::<Vec<_>>())
                     .unwrap_or_default()
             })
             .unwrap_or_default();
-        for (id, title, info_hash, ep_ids_raw) in rows {
+        for (id, title, info_hash, ep_ids_raw, ledger_state) in rows {
             let hash_present = info_hash
                 .map(|h| all_hashes.contains(&h.to_ascii_lowercase()))
                 .unwrap_or(false);
             if hash_present || all_norms.contains(&normalize(&title)) {
                 continue;
             }
-            if let Err(error) = db::ledger_confirm_missing(
-                &conn,
-                id,
-                &db::parse_ep_ids(ep_ids_raw.as_deref()),
-            ) {
+            // a stalled row's episodes were handed back when it stalled and
+            // may belong to a replacement grab by now - never touch them here
+            let was_stalled = ledger_state == "stalled";
+            let linked = if was_stalled { vec![] } else { db::parse_ep_ids(ep_ids_raw.as_deref()) };
+            if let Err(error) = db::ledger_confirm_missing(&conn, id, &linked) {
                 crate::applog::error(
                     "scheduler",
                     format!("could not retire missing ledger row {id}: {error}"),
                 );
+                continue;
+            }
+            if was_stalled {
                 continue;
             }
             let _ = conn.execute(
@@ -972,22 +1050,24 @@ async fn completion_pass(app: &tauri::AppHandle, state: &AppState) -> Vec<DeadGr
     // and rows carrying ep_ids are the durable episode linkage that survives
     // an unfollow/refollow wiping grabbed_title
     let running_norms: std::collections::HashSet<String> =
-        torrents.iter().filter(|t| t.progress < 0.999).map(|t| normalize(&t.name)).collect();
+        torrents.iter().filter(|t| !is_complete_progress(t.progress)).map(|t| normalize(&t.name)).collect();
     let running_hashes: std::collections::HashSet<String> =
-        torrents.iter().filter(|t| t.progress < 0.999).map(|t| t.hash.to_ascii_lowercase()).collect();
-    type QbitOpenRow = (i64, String, i64, Option<String>, Option<String>);
+        torrents.iter().filter(|t| !is_complete_progress(t.progress)).map(|t| t.hash.to_ascii_lowercase()).collect();
+    // a stalled row is included so a dead swarm that came back to life and
+    // finished still flips to completed (and its episodes to downloaded)
+    type QbitOpenRow = (i64, String, i64, Option<String>, Option<String>, String);
     let open_ledger: Vec<QbitOpenRow> = conn
-        .prepare("SELECT id, title, ts, info_hash, ep_ids FROM grab_ledger WHERE state IN ('dispatching','grabbed') AND backend = 'qbittorrent'")
+        .prepare("SELECT id, title, ts, info_hash, ep_ids, state FROM grab_ledger WHERE state IN ('dispatching','grabbed','stalled') AND backend = 'qbittorrent'")
         .ok()
         .map(|mut stmt| {
             stmt.query_map([], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
             })
             .map(|it| it.flatten().collect::<Vec<_>>())
             .unwrap_or_default()
         })
         .unwrap_or_default();
-    for (id, title, ts, info_hash, ep_ids_raw) in open_ledger {
+    for (id, title, ts, info_hash, ep_ids_raw, ledger_state) in open_ledger {
         let norm = normalize(&title);
         let linked = db::parse_ep_ids(ep_ids_raw.as_deref());
         // hash first — magnet grabs get renamed by qBt once metadata lands,
@@ -1001,6 +1081,11 @@ async fn completion_pass(app: &tauri::AppHandle, state: &AppState) -> Vec<DeadGr
             if seen_norms.insert(norm) && ts >= recent_cutoff {
                 completed_display.push(title.chars().take(60).collect());
             }
+            continue;
+        }
+        // a paused corpse is neither running nor to be re-linked: its
+        // episodes were deliberately handed back to the scheduler
+        if ledger_state == "stalled" {
             continue;
         }
         // resync: the torrent is still running but a refollow reset its
@@ -1025,6 +1110,15 @@ async fn completion_pass(app: &tauri::AppHandle, state: &AppState) -> Vec<DeadGr
         db::log_activity(&conn, "complete", None, &format!("Finished downloading {item}"));
     }
     drop(conn);
+
+    // a dead swarm is paused whatever the medic mode - Settings promises
+    // "Off: just pause and tell me", and a corpse left running keeps its
+    // half-downloaded files busy while the scheduler fetches a replacement
+    for d in &dead {
+        if let Err(e) = q.torrent_action("stop", &d.qbt_hash).await {
+            crate::applog::warn("scheduler", format!("could not pause dead torrent {}: {e}", d.qbt_hash));
+        }
+    }
 
     if !completed_display.is_empty() {
         let (title, body) = if completed_display.len() == 1 {
@@ -1110,7 +1204,7 @@ async fn run_cycle_inner(app: &tauri::AppHandle, state: &AppState) -> Result<usi
     let disk_ok = {
         let cfg = state.config.read().await.clone();
         match crate::grab::selected_backend_free_bytes(&state.http, &cfg).await {
-            Ok(free) => (free as f64) >= cfg.agent_min_free_disk_gb.max(5.0) * 1e9,
+            Ok(free) => (free as f64) >= crate::grab::min_free_bytes(&cfg),
             Err(error) => {
                 crate::applog::warn(
                     "scheduler",
@@ -1144,6 +1238,11 @@ async fn run_cycle_inner(app: &tauri::AppHandle, state: &AppState) -> Result<usi
         if show.status == "Ended" && show.wanted == 0 {
             continue; // dormant
         }
+        // nothing can be grabbed this cycle: searching anyway only loads the
+        // indexers and stamps the back catalog into its 12h throttle
+        if !disk_ok {
+            continue;
+        }
 
         match plan_for_show(state, show, false).await {
             Ok(outcome) => {
@@ -1154,7 +1253,7 @@ async fn run_cycle_inner(app: &tauri::AppHandle, state: &AppState) -> Result<usi
                     db::stamp_searched(&conn, &outcome.searched_ep_ids);
                 }
                 for plan in &outcome.plans {
-                    if !disk_ok || grabs >= MAX_GRABS_PER_CYCLE {
+                    if grabs >= MAX_GRABS_PER_CYCLE {
                         break;
                     }
                     if execute_plan(app, state, plan).await {
@@ -1242,6 +1341,138 @@ mod tests {
             Some("0000000000000000000000000000000000000000".into())
         );
         assert_eq!(magnet_hash(Some("magnet:?xt=urn:btih:not-a-hash")), None);
+    }
+
+    #[test]
+    fn completion_requires_all_bytes() {
+        assert!(!is_complete_progress(0.999));
+        assert!(!is_complete_progress(0.999_999));
+        assert!(is_complete_progress(1.0));
+    }
+
+    #[test]
+    fn only_qbittorrent_hash_forms_override_title_matching() {
+        assert!(qbt_comparable_hash("0123456789abcdef0123456789abcdef01234567"));
+        assert!(qbt_comparable_hash(&"a".repeat(64)));
+        assert!(!qbt_comparable_hash("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"));
+        assert!(!qbt_comparable_hash(""));
+    }
+
+    fn ledger_mem() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE grab_ledger (
+               id INTEGER PRIMARY KEY AUTOINCREMENT, content_key TEXT NOT NULL,
+               brief_id INTEGER, title TEXT NOT NULL, info_hash TEXT, size INTEGER NOT NULL DEFAULT 0,
+               state TEXT NOT NULL, ts INTEGER NOT NULL, ep_ids TEXT,
+               backend TEXT NOT NULL DEFAULT 'qbittorrent', bp_token TEXT
+             );
+             CREATE TABLE episodes (
+               tvmaze_ep_id INTEGER PRIMARY KEY, state TEXT NOT NULL,
+               grabbed_title TEXT, grabbed_at INTEGER, last_searched_at INTEGER DEFAULT 0
+             );
+             CREATE TABLE activity (
+               id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
+               kind TEXT NOT NULL, show_id INTEGER, message TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn qbt(name: &str, hash: &str, state: &str, seeds: i64, age_secs: i64) -> crate::qbit::QbitTorrent {
+        crate::qbit::QbitTorrent {
+            hash: hash.into(),
+            name: name.into(),
+            size: 1_000,
+            progress: 0.0,
+            dlspeed: 0,
+            upspeed: 0,
+            eta: 0,
+            state: state.into(),
+            category: String::new(),
+            save_path: String::new(),
+            added_on: db::now() - age_secs,
+            num_seeds: seeds,
+            num_leechs: 0,
+            ratio: 0.0,
+            content_path: String::new(),
+        }
+    }
+
+    #[test]
+    fn dead_magnet_grab_is_found_by_hash_after_qbittorrent_renamed_it() {
+        let conn = ledger_mem();
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        conn.execute(
+            "INSERT INTO grab_ledger (content_key, title, info_hash, size, state, ts, ep_ids)
+             VALUES ('tv:show:s01e01', 'Show.S01E01.1080p.WEB-GRP', ?1, 0, 'grabbed', ?2, '[7]')",
+            rusqlite::params![hash, db::now()],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO episodes (tvmaze_ep_id, state, grabbed_title) VALUES (7, 'grabbed', 'Show.S01E01.1080p.WEB-GRP')", []).unwrap();
+        // metadata landed: qBittorrent now shows the torrent's real name
+        let torrents = vec![qbt("Show S01E01 (real folder name)", hash, "stalledDL", 0, 2 * 3600)];
+        let dead = reopen_dead_grabs(&conn, &torrents);
+        assert_eq!(dead.len(), 1);
+        assert_eq!(dead[0].qbt_hash, hash);
+        assert_eq!(dead[0].ep_ids, vec![7]);
+        let state: String = conn
+            .query_row("SELECT state FROM grab_ledger WHERE info_hash = ?1", [hash], |r| r.get(0))
+            .unwrap();
+        assert_eq!(state, "stalled");
+        let ep: String = conn
+            .query_row("SELECT state FROM episodes WHERE tvmaze_ep_id = 7", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ep, "wanted");
+    }
+
+    #[test]
+    fn dead_grab_with_a_wrong_indexer_hash_is_still_found_by_title() {
+        // stale indexer definitions report a wrong infoHash; the ledger then
+        // carries a hash qBittorrent never shows, and the title must still work
+        let conn = ledger_mem();
+        conn.execute(
+            "INSERT INTO grab_ledger (content_key, title, info_hash, size, state, ts, ep_ids)
+             VALUES ('tv:show:s01e02', 'Show.S01E02.1080p.WEB-GRP', ?1, 0, 'grabbed', ?2, '[8]')",
+            rusqlite::params!["f".repeat(40), db::now()],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO episodes (tvmaze_ep_id, state, grabbed_title) VALUES (8, 'grabbed', 'Show.S01E02.1080p.WEB-GRP')", []).unwrap();
+        let torrents = vec![qbt("Show.S01E02.1080p.WEB-GRP", &"a".repeat(40), "metaDL", 0, 30 * 60)];
+        let dead = reopen_dead_grabs(&conn, &torrents);
+        assert_eq!(dead.len(), 1);
+        assert_eq!(dead[0].ep_ids, vec![8]);
+    }
+
+    #[test]
+    fn stalled_releases_are_excluded_from_planning() {
+        let conn = ledger_mem();
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        conn.execute(
+            "INSERT INTO grab_ledger (content_key, title, info_hash, size, state, ts)
+             VALUES ('tv:show:s01e01', 'Show.S01E01.1080p.WEB-DEAD', ?1, 0, 'stalled', ?2)",
+            rusqlite::params![hash, db::now()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO grab_ledger (content_key, title, info_hash, size, state, ts)
+             VALUES ('tv:show:s01e02', 'Show.S01E02.1080p.WEB-FINE', NULL, 0, 'grabbed', ?1)",
+            [db::now()],
+        )
+        .unwrap();
+        let retired = retired_releases(&conn);
+        // the dead release is skipped by title...
+        let mut r = release("Show.S01E01.1080p.WEB-DEAD", 1_000, 50);
+        r.release.magnet_url = None;
+        assert!(retired.contains(&r));
+        // ...and by identity when the indexer lists it under another name
+        let mut r2 = release("Show.S01E01.1080p.WEB-DEAD.REPOST", 1_000, 50);
+        r2.release.info_hash = Some(hash.to_uppercase());
+        assert!(retired.contains(&r2));
+        // a live grab and unrelated releases are untouched
+        assert!(!retired.contains(&release("Show.S01E02.1080p.WEB-FINE", 1_000, 50)));
+        assert!(!retired.contains(&release("Show.S01E01.1080p.WEB-OTHER", 1_000, 50)));
     }
 
     #[test]
