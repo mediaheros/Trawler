@@ -259,14 +259,21 @@ pub async fn dispatch(
                         ))
                     })?;
                     let wanted_norm = crate::commands::normalize(&order.title);
-                    let existing = torrents.into_iter().find(|t| match order.info_hash.as_deref() {
-                        Some(h) => t.hash.eq_ignore_ascii_case(h),
-                        // no usable hash (a .torrent whose info dict the
-                        // parser could not walk): match the way the reaper
-                        // does, on the normalized name
-                        None => crate::commands::normalize(&t.name) == wanted_norm,
-                    });
-                    let Some(existing) = existing else {
+                    // by hash first; then by normalized name, the way the
+                    // reaper matches. The name fallback also covers a hash
+                    // the indexer got wrong: qBittorrent's own hash is the
+                    // one that counts and is recorded below.
+                    let mut torrents = torrents;
+                    let idx = order
+                        .info_hash
+                        .as_deref()
+                        .and_then(|h| torrents.iter().position(|t| t.hash.eq_ignore_ascii_case(h)))
+                        .or_else(|| {
+                            torrents
+                                .iter()
+                                .position(|t| crate::commands::normalize(&t.name) == wanted_norm)
+                        });
+                    let Some(existing) = idx.map(|i| torrents.swap_remove(i)) else {
                         return Err(AppError::Other(format!(
                             "qBittorrent rejected \"{}\" — it could not parse the torrent",
                             order.title.chars().take(70).collect::<String>()
@@ -276,13 +283,21 @@ pub async fn dispatch(
                     // not from qBittorrent's state: a torrent may be stopped
                     // for many benign reasons (added paused, finished under a
                     // stop-when-complete seed policy, paused by hand) and all
-                    // of those are adoptable. A stalled ledger row for this
+                    // of those are adoptable. A stalled ledger row for THIS
                     // torrent means Trawler already judged it dead; parking
                     // the episodes on it again would leave them there forever.
+                    // A stalled row that carries a different comparable hash
+                    // is a different torrent (the same release re-uploaded on
+                    // another tracker) and must not block a healthy copy.
                     let is_corpse = {
-                        let conn = db::open_existing()?;
+                        // the torrent is proven present; a database hiccup
+                        // here is not grounds to abandon the claim
+                        let conn = db::open_existing().map_err(|e| {
+                            AppError::DispatchUncertain(format!(
+                                "qBittorrent has the torrent but the ledger could not be opened ({e}); Trawler will reconcile it"
+                            ))
+                        })?;
                         let norm = crate::commands::normalize(&existing.name);
-                        let title_norm = crate::commands::normalize(&order.title);
                         conn.prepare(
                             "SELECT title, info_hash FROM grab_ledger WHERE state = 'stalled' AND backend = 'qbittorrent'",
                         )
@@ -291,10 +306,14 @@ pub async fn dispatch(
                             stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))
                                 .ok()
                                 .map(|rows| {
-                                    rows.flatten().any(|(title, hash)| {
-                                        hash.is_some_and(|h| h.eq_ignore_ascii_case(&existing.hash))
-                                            || crate::commands::normalize(&title) == norm
-                                            || crate::commands::normalize(&title) == title_norm
+                                    rows.flatten().any(|(title, hash)| match hash {
+                                        Some(h) if crate::scheduler::qbt_comparable_hash(&h) => {
+                                            h.eq_ignore_ascii_case(&existing.hash)
+                                        }
+                                        _ => {
+                                            let t = crate::commands::normalize(&title);
+                                            t == norm || t == wanted_norm
+                                        }
                                     })
                                 })
                         })
@@ -315,8 +334,31 @@ pub async fn dispatch(
                             existing.state
                         )));
                     }
-                    if order.info_hash.is_none() {
-                        order.info_hash = Some(existing.hash.clone());
+                    // qBittorrent's own hash is the identity every later pass
+                    // matches on; an indexer's claim that got us here by name
+                    // was wrong
+                    order.info_hash = Some(existing.hash.clone());
+                    // A torrent the user stopped part-way is adoptable but
+                    // would sit there forever: the medic judges only
+                    // stalledDL/metaDL and the completion pass only sees
+                    // "present". Start it unless grabs are meant to arrive
+                    // paused; never touch a finished one (seeding policy).
+                    let stopped = existing.state.starts_with("stopped") || existing.state.starts_with("paused");
+                    if stopped && existing.progress < 1.0 && !cfg.add_paused {
+                        if let Err(e) = q.torrent_action("start", &existing.hash).await {
+                            crate::applog::warn(
+                                "grab",
+                                format!("adopted torrent is stopped and could not be started: {e}"),
+                            );
+                        } else {
+                            crate::applog::info(
+                                "grab",
+                                format!(
+                                    "adopted torrent was stopped at {:.0}% — started it",
+                                    existing.progress * 100.0
+                                ),
+                            );
+                        }
                     }
                     // Make it visible where Trawler's grabs live, but only
                     // when that cannot move anything: never overwrite a
@@ -330,7 +372,7 @@ pub async fn dispatch(
                                 format!("adopted torrent could not be labeled with the {} category: {e}", cfg.qbit_category),
                             );
                         }
-                    } else if existing.category != cfg.qbit_category {
+                    } else if !cfg.qbit_category.is_empty() && existing.category != cfg.qbit_category {
                         crate::applog::info(
                             "grab",
                             format!(

@@ -20,7 +20,7 @@ fn is_complete_progress(progress: f64) -> bool {
 
 /// Only a qBittorrent-shaped identity (hex v1 or v2 infohash) may override
 /// title matching; a ledger row carrying anything else falls back to the name.
-fn qbt_comparable_hash(hash: &str) -> bool {
+pub(crate) fn qbt_comparable_hash(hash: &str) -> bool {
     matches!(hash.len(), 40 | 64) && hash.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
