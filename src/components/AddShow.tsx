@@ -19,16 +19,25 @@ export default function AddShow({ onClose }: { onClose: () => void }) {
   const seq = useRef(0);
   const followingRef = useRef(false);
 
+  // onClose is an inline closure recreated on every parent render, and the
+  // parent re-renders on every 15 s poll. Keying this effect on it re-ran
+  // the cleanup each tick: the sequence bump orphaned any TVmaze search in
+  // flight (spinner forever, results never shown) and the focus() call
+  // yanked the keyboard away from the backfill checkbox and Follow button.
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
   useEffect(() => {
     inputRef.current?.focus();
     const onKey = (e: KeyboardEvent) =>
-      e.key === "Escape" && !followingRef.current && onClose();
+      e.key === "Escape" && !followingRef.current && onCloseRef.current();
     window.addEventListener("keydown", onKey);
+    const seqRef = seq;
     return () => {
-      ++seq.current;
+      // unmount only: drop any search still in flight
+      ++seqRef.current;
       window.removeEventListener("keydown", onKey);
     };
-  }, [onClose]);
+  }, []);
 
   // debounced search-as-you-type against TVmaze
   useEffect(() => {

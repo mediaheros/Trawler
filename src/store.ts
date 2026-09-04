@@ -97,10 +97,13 @@ interface Store {
   // ---- agent ----
   chat: ChatRow[];
   chatLoaded: boolean;
-  loadChat: () => Promise<void>;
+  /** resolves true when the transcript was replaced with stored rows */
+  loadChat: () => Promise<boolean>;
   agentBusy: boolean;
   agentClearing: boolean;
   liveSteps: LiveStep[];
+  /** a run died mid-tool: keep its live cards, the stored rows lack the last one */
+  liveStepsPinned: boolean;
   agentThinking: boolean;
   sendToAgent: (text: string) => Promise<void>;
   clearChat: () => Promise<void>;
@@ -448,7 +451,7 @@ export const useStore = create<Store>((set, get) => ({
     const revision = chatRevision;
     try {
       const rows = await api.agentHistory();
-      if (mine !== chatLoadSeq) return;
+      if (mine !== chatLoadSeq) return false;
       // DB ids are small AUTOINCREMENT integers — the local id counter
       // must start above them or React keys (and the send-rollback
       // filter) collide with persisted history rows
@@ -459,18 +462,31 @@ export const useStore = create<Store>((set, get) => ({
             ? rows
             : [...rows, ...state.chat.filter((message) => message.id < 0)],
         chatLoaded: true,
+        // the stored rows now carry every tool step of a finished run;
+        // keeping liveSteps rendered each step twice under a pulsing avatar.
+        // Whichever reload lands (the run's own, or the Agent view mounting
+        // mid-run) clears them — but never while a run is still producing.
+        liveSteps: state.agentBusy || state.liveStepsPinned ? state.liveSteps : [],
       }));
+      return true;
     } catch (e) {
-      if (mine === chatLoadSeq) get().toast(String(e), "bad");
+      if (mine === chatLoadSeq) {
+        // the composer is disabled until history has loaded; a failed load
+        // must not leave it disabled forever with "Loading conversation…"
+        set({ chatLoaded: true });
+        get().toast(`Couldn't load the conversation history: ${String(e)}`, "bad");
+      }
     }
+    return false;
   },
   agentBusy: false,
   agentClearing: false,
   liveSteps: [],
+  liveStepsPinned: false,
   agentThinking: false,
   sendToAgent: async (text) => {
     if (!text.trim() || get().agentBusy || get().agentClearing || !get().chatLoaded) return;
-    set({ agentBusy: true, liveSteps: [], agentThinking: true });
+    set({ agentBusy: true, liveSteps: [], liveStepsPinned: false, agentThinking: true });
     // optimistic: show the user's message instantly
     const optimisticId = -(chatSeq++);
     ++chatRevision;
@@ -509,7 +525,7 @@ export const useStore = create<Store>((set, get) => ({
       await api.agentClear();
       ++chatLoadSeq;
       ++chatRevision;
-      set({ chat: [], liveSteps: [] });
+      set({ chat: [], liveSteps: [], liveStepsPinned: false });
     } catch (e) {
       get().toast(String(e), "bad");
     } finally {
@@ -569,6 +585,9 @@ export const useStore = create<Store>((set, get) => ({
             agentBusy: false,
             agentThinking: false,
             liveSteps: st.liveSteps.map((x) => ({ ...x, running: false })),
+            // a tool cut off by the deadline was never persisted; the live
+            // card is the only record of what hung, so the reload keeps it
+            liveStepsPinned: true,
           }));
           get().toast(s.payload.message ?? "agent error", "bad");
           // the backend persisted a "⚠ …" assistant row before emitting this
@@ -577,6 +596,8 @@ export const useStore = create<Store>((set, get) => ({
         case "done":
           clearAgentWatchdog();
           set({ agentBusy: false, agentThinking: false });
+          // loadChat clears liveSteps once the stored rows are in; a failed
+          // reload keeps the live cards as the only record of the run
           void get().loadChat();
           void get().loadProposals();
           break;

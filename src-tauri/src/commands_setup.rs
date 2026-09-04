@@ -295,17 +295,23 @@ pub async fn setup_save_prowlarr_key(state: State<'_, AppState>, key: String) ->
     if key.is_empty() {
         return Err(AppError::Other("that key is empty".into()));
     }
+    // save before committing to memory: a refused save (config.json was
+    // unreadable at startup) must not leave the UI believing the change took
     let mut cfg = state.config.write().await;
-    cfg.prowlarr_api_key = key;
-    crate::config::save(&cfg)?;
+    let mut next = cfg.clone();
+    next.prowlarr_api_key = key;
+    crate::config::save(&next)?;
+    *cfg = next;
     Ok(())
 }
 
 #[tauri::command]
 pub async fn setup_finish(state: State<'_, AppState>) -> Result<()> {
     let mut cfg = state.config.write().await;
-    cfg.setup_completed = true;
-    crate::config::save(&cfg)?;
+    let mut next = cfg.clone();
+    next.setup_completed = true;
+    crate::config::save(&next)?;
+    *cfg = next;
     Ok(())
 }
 

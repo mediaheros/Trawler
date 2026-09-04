@@ -280,6 +280,15 @@ async fn grab_release(state: &AppState, ctx: &mut RunCtx, args: &Value) -> Value
     if ctx.grabs_done >= ctx.max_grabs {
         return err("grab budget exhausted for this run");
     }
+    // An unknown size (0) used to sail past every byte rail: the run budget,
+    // the brief's daily cap, and the plan's max-size rule all skip a zero.
+    // Unattended grabs must not take that bet — a person can, via a proposal.
+    if stored.size <= 0 {
+        return err(
+            "this release reports no size, so it cannot be checked against the GB caps — \
+             use propose_release so a person can decide",
+        );
+    }
     let size_gb = stored.size as f64 / 1e9;
     if ctx.gb_done + size_gb > ctx.max_gb {
         return err(format!(

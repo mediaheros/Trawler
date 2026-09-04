@@ -32,7 +32,7 @@ pub(crate) fn prowlarr_pub<'a>(
     prowlarr(http, cfg)
 }
 
-fn qbit<'a>(http: &'a reqwest::Client, cfg: &Config) -> QbitClient<'a> {
+pub(crate) fn qbit<'a>(http: &'a reqwest::Client, cfg: &Config) -> QbitClient<'a> {
     QbitClient {
         http,
         base: cfg.qbit_url.clone(),
@@ -588,15 +588,26 @@ pub async fn grab(
     Ok(GrabResult { ok, detail })
 }
 
+/// What the qBittorrent add established, for the dispatcher to record.
+pub struct GrabCoreOutcome {
+    /// the hash qBittorrent actually tracks, from the magnet or .torrent
+    /// bytes — always preferred over the search result's claim
+    pub info_hash: Option<String>,
+    /// qBittorrent answered "Fails.": the torrent is already present, or it
+    /// could not parse it. The dispatcher tells the two apart by listing.
+    pub duplicate: bool,
+}
+
 /// The qBittorrent add itself, factored out so `grab::dispatch` can run it
-/// on a task that survives caller cancellation. No ledger writes here —
-/// recording belongs to the dispatcher, next to the add.
+/// on a task that survives caller cancellation. The only ledger write here
+/// is the resolved hash on the pending row, so a crash between the add and
+/// finalization still leaves a row reconciliation can match by hash.
 pub async fn perform_grab_core(
     http: &reqwest::Client,
     cfg: &Config,
     order: &crate::grab::GrabOrder,
     content_key: &str,
-) -> Result<()> {
+) -> Result<GrabCoreOutcome> {
     let q = qbit(http, cfg);
     let save_path = order.save_path.clone().unwrap_or_default();
 
@@ -620,12 +631,21 @@ pub async fn perform_grab_core(
         _ => return Err(AppError::NoDownloadSource),
     };
 
-    if order.info_hash.is_none() {
-        let resolved_hash = crate::scheduler::magnet_hash(magnet.as_deref())
-            .or_else(|| torrent_bytes.as_deref().and_then(crate::qbit::torrent_info_hash));
-        if let Some(info_hash) = resolved_hash {
+    // The hash qBittorrent will actually track comes from the magnet or the
+    // .torrent bytes. Indexer definitions go stale and report wrong hashes;
+    // a ledger row carrying one never matches the running torrent, gets
+    // reaped as "vanished", and the release is grabbed again. So the
+    // resolved hash always wins over whatever the search result claimed.
+    let resolved_hash = crate::scheduler::magnet_hash(magnet.as_deref())
+        .or_else(|| torrent_bytes.as_deref().and_then(crate::qbit::torrent_info_hash));
+    if let Some(info_hash) = resolved_hash.as_deref() {
+        let differs = order
+            .info_hash
+            .as_deref()
+            .is_none_or(|claimed| !claimed.eq_ignore_ascii_case(info_hash));
+        if differs {
             let conn = crate::db::open_existing()?;
-            crate::db::ledger_set_dispatch_info_hash(&conn, content_key, &info_hash)?;
+            crate::db::ledger_set_dispatch_info_hash(&conn, content_key, info_hash)?;
         }
     }
 
@@ -634,18 +654,24 @@ pub async fn perform_grab_core(
         "ratio" => Some(cfg.seed_ratio.max(0.0)),
         _ => None, // qBittorrent's own settings
     };
-    q.add(AddTorrent {
-        magnet,
-        torrent_bytes,
-        torrent_name: &order.title,
-        save_path: if save_path.is_empty() { None } else { Some(save_path) },
-        category: if cfg.qbit_category.is_empty() { None } else { Some(cfg.qbit_category.clone()) },
-        paused: cfg.add_paused,
-        ratio_limit,
-    })
-    .await?;
+    let duplicate = match q
+        .add(AddTorrent {
+            magnet,
+            torrent_bytes,
+            torrent_name: &order.title,
+            save_path: if save_path.is_empty() { None } else { Some(save_path) },
+            category: if cfg.qbit_category.is_empty() { None } else { Some(cfg.qbit_category.clone()) },
+            paused: cfg.add_paused,
+            ratio_limit,
+        })
+        .await
+    {
+        Ok(()) => false,
+        Err(AppError::QbitDuplicate) => true,
+        Err(error) => return Err(error),
+    };
 
-    Ok(())
+    Ok(GrabCoreOutcome { info_hash: resolved_hash, duplicate })
 }
 
 // ---------- downloads ----------
@@ -1104,9 +1130,13 @@ async fn bitport_store_and_probe(state: &AppState, token: String) -> Result<Bitp
     let bp = crate::bitport::BitportClient { http: &state.http, token: token.clone() };
     match bp.me().await {
         Ok(quota) => {
+            // save before committing to memory: a refused save must not
+            // report "connected" for a token that will be gone at restart
             let mut cfg = state.config.write().await;
-            cfg.bitport_token = token;
-            crate::config::save(&cfg)?;
+            let mut next = cfg.clone();
+            next.bitport_token = token;
+            crate::config::save(&next)?;
+            *cfg = next;
             crate::applog::info(
                 "bitport",
                 format!("connected — plan {}, {:.0} GB free", quota.plan_name, quota.disk_available as f64 / 1e9),
@@ -1116,8 +1146,10 @@ async fn bitport_store_and_probe(state: &AppState, token: String) -> Result<Bitp
         Err(e) if e.to_string().contains("rejected the token") => Err(e),
         Err(e) => {
             let mut cfg = state.config.write().await;
-            cfg.bitport_token = token;
-            crate::config::save(&cfg)?;
+            let mut next = cfg.clone();
+            next.bitport_token = token;
+            crate::config::save(&next)?;
+            *cfg = next;
             crate::applog::warn(
                 "bitport",
                 format!("connected, but the account probe failed ({e}) — quota will appear once Bitport answers"),
@@ -1156,11 +1188,13 @@ pub async fn bitport_status(state: State<'_, AppState>) -> Result<BitportStatus>
 pub async fn bitport_disconnect(state: State<'_, AppState>) -> Result<()> {
     {
         let mut cfg = state.config.write().await;
-        cfg.bitport_token.clear();
-        if cfg.download_backend == "bitport" {
-            cfg.download_backend = "qbittorrent".into();
+        let mut next = cfg.clone();
+        next.bitport_token.clear();
+        if next.download_backend == "bitport" {
+            next.download_backend = "qbittorrent".into();
         }
-        crate::config::save(&cfg)?;
+        crate::config::save(&next)?;
+        *cfg = next;
     }
     // no token means no completion pass will ever settle the open cloud
     // claims - release them now so their episodes can be grabbed locally

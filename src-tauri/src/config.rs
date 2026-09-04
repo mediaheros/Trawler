@@ -226,8 +226,35 @@ fn load_from_path(path: &std::path::Path) -> Config {
             format!("could not secure existing Trawler configuration files: {error}"),
         );
     }
-    let raw = std::fs::read_to_string(path).ok();
-    let parsed = raw.as_deref().map(serde_json::from_str::<Config>);
+    // bytes, not a string: a file re-saved as UTF-16 by an editor is a
+    // corrupt config to back up and replace, not an unreadable one
+    let raw = match std::fs::read(path) {
+        Ok(raw) => Some(raw),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            // a file that exists but cannot be read right now (permissions,
+            // a sharing violation, a roaming profile mid-sync) is not "no
+            // config": starting with defaults would make the setup wizard
+            // save over it and destroy every stored key and token
+            CONFIG_READ_FAILED.store(true, std::sync::atomic::Ordering::SeqCst);
+            crate::applog::error(
+                "app",
+                format!(
+                    "config.json exists but could not be read ({e}); running with defaults and \
+                     refusing to save settings until Trawler is restarted, so the file is not overwritten"
+                ),
+            );
+            return Config::default();
+        }
+    };
+    let parsed = raw.as_deref().map(|bytes| {
+        std::str::from_utf8(bytes)
+            .map_err(|e| e.to_string())
+            // PowerShell's Out-File and Notepad write a UTF-8 BOM, which
+            // serde_json rejects as "expected value"; it is not corruption
+            .map(|text| text.strip_prefix('\u{FEFF}').unwrap_or(text))
+            .and_then(|text| serde_json::from_str::<Config>(text).map_err(|e| e.to_string()))
+    });
     match parsed {
         Some(Ok(c)) => c,
         Some(Err(e)) => {
@@ -240,7 +267,7 @@ fn load_from_path(path: &std::path::Path) -> Config {
             ));
             let backup_saved = raw
                 .as_deref()
-                .map(|raw| write_private_file(&backup, raw.as_bytes()))
+                .map(|raw| write_private_file(&backup, raw))
                 .transpose();
             let recovery = match backup_saved {
                 Ok(Some(())) => format!("kept a private copy at {}", backup.display()),
@@ -273,7 +300,19 @@ pub fn load() -> Config {
     cfg
 }
 
+/// Set when config.json exists but could not be read at startup. While set,
+/// `save` refuses to run: the in-memory config is defaults, and writing it
+/// would silently replace the user's real settings and secrets.
+static CONFIG_READ_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn save(cfg: &Config) -> Result<()> {
+    if CONFIG_READ_FAILED.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(crate::error::AppError::Other(
+            "config.json could not be read when Trawler started, so settings are not being saved \
+             to avoid overwriting it — restart Trawler and try again"
+                .into(),
+        ));
+    }
     // two concurrent saves must not interleave writes to one tmp file —
     // the rename would make the corruption permanent
     static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -365,9 +404,64 @@ fn replace_file(source: &std::path::Path, destination: &std::path::Path) -> std:
     }
 }
 
+/// Test seam: the read-failed latch is process-global, and tests share one
+/// process. Tests that trip it must clear it so later saves are not refused.
+#[cfg(test)]
+pub(crate) fn reset_read_failed() {
+    CONFIG_READ_FAILED.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{load_from_path, replace_file, write_private_file};
+    use super::{load_from_path, replace_file, reset_read_failed, save, write_private_file, Config};
+
+    // One test, run sequentially, because the read-failed latch is
+    // process-global and tests share a process.
+    #[test]
+    fn unreadable_config_refuses_saves_but_corrupt_config_is_backed_up() {
+        let latched = || super::CONFIG_READ_FAILED.load(std::sync::atomic::Ordering::SeqCst);
+        let root = std::env::temp_dir().join(format!("trawler-cfg-tests-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // 1. a directory in place of the file reads as an error other than
+        //    NotFound on every platform (access denied / is-a-directory):
+        //    run on defaults and refuse to save, before touching any path
+        //    (the parent stays under our own temp root so the permission
+        //    repair never touches the system temp directory)
+        let unreadable = root.join("unreadable");
+        std::fs::create_dir_all(&unreadable).unwrap();
+        let cfg = load_from_path(&unreadable);
+        assert!(!cfg.setup_completed);
+        assert!(latched());
+        let err = save(&Config::default()).unwrap_err().to_string();
+        assert!(err.contains("could not be read"), "{err}");
+        reset_read_failed();
+
+        // 2. a file that exists but is not UTF-8 (an editor's "save as"
+        //    UTF-16) is corruption: back the bytes up, run on defaults, and
+        //    keep saving allowed
+        let dir = root.join("utf16");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(&path, [0xFF, 0xFE, b'{', 0, b'}', 0]).unwrap();
+        let cfg = load_from_path(&path);
+        assert!(!cfg.setup_completed);
+        assert!(!latched(), "corruption must not latch saves off");
+        let backups = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("corrupt-"))
+            .count();
+        assert_eq!(backups, 1, "the original bytes must be kept aside");
+
+        // 3. a missing file is simply defaults, nothing latched
+        let cfg = load_from_path(&root.join("nope").join("config.json"));
+        assert!(!cfg.setup_completed);
+        assert!(!latched());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn atomic_replace_overwrites_an_existing_file() {

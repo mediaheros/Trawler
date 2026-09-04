@@ -20,7 +20,7 @@ fn is_complete_progress(progress: f64) -> bool {
 
 /// Only a qBittorrent-shaped identity (hex v1 or v2 infohash) may override
 /// title matching; a ledger row carrying anything else falls back to the name.
-fn qbt_comparable_hash(hash: &str) -> bool {
+pub(crate) fn qbt_comparable_hash(hash: &str) -> bool {
     matches!(hash.len(), 40 | 64) && hash.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
@@ -354,6 +354,52 @@ async fn execute_plan(app: &tauri::AppHandle, state: &AppState, plan: &PlannedGr
     }
 }
 
+/// Cross-cycle memory for "this ledger row's transfer is not in the backend
+/// listing", shared by the qBittorrent and Bitport reapers so both apply
+/// one rule. Absence becomes evidence only when it has been observed at
+/// least twice AND for at least `WINDOW_SECS` of wall time: one odd listing
+/// (a backend still loading its session after a restart, a pagination
+/// surprise, an empty response) must not release every claim at once, and
+/// two polls seconds apart (the tray's run-now plus the scheduled cycle)
+/// are not two independent observations. A genuinely empty session — the
+/// user deleted their only torrent — still confirms once the window passes.
+#[derive(Default)]
+struct AbsenceStrikes {
+    /// row id → (first time seen missing, observations, any observation
+    /// came from an empty listing)
+    first_missing: std::collections::HashMap<i64, (i64, u32, bool)>,
+}
+
+impl AbsenceStrikes {
+    const WINDOW_SECS: i64 = 10 * 60;
+    /// A listing with nothing in it at all is weaker evidence: a backend
+    /// mid-restart, an expired session, a partial page. It still counts —
+    /// the user may really have removed their only transfer — but only
+    /// after a longer stretch.
+    const EMPTY_LISTING_WINDOW_SECS: i64 = 30 * 60;
+
+    /// The row's transfer is in the listing (or the row has been settled):
+    /// forget any strikes.
+    fn present(&mut self, id: i64) {
+        self.first_missing.remove(&id);
+    }
+
+    /// Record one absent observation; true when the row may be retired.
+    /// The strike is kept until the caller settles the row with `present`,
+    /// so a retire that fails (a busy database) is retried next cycle
+    /// instead of restarting the window.
+    fn missing(&mut self, id: i64, now: i64, listing_empty: bool) -> bool {
+        let slot = self.first_missing.entry(id).or_insert((now, 0, false));
+        slot.1 += 1;
+        // a weak observation anywhere in the streak (not only the current
+        // one) demands the longer window: an empty listing during a restart
+        // followed by one normal miss is still one real observation
+        slot.2 |= listing_empty;
+        let window = if slot.2 { Self::EMPTY_LISTING_WINDOW_SECS } else { Self::WINDOW_SECS };
+        slot.1 >= 2 && now - slot.0 >= window
+    }
+}
+
 /// A grab whose swarm turned out to be dead — candidate for the medic.
 pub struct DeadGrab {
     pub title: String,
@@ -366,17 +412,56 @@ pub struct DeadGrab {
 /// Reopen ledger entries whose torrents are demonstrably dead — stuck fetching
 /// metadata or stalled at 0 seeds for over an hour. Returns them so the medic
 /// can hunt replacements.
+///
+/// "Over an hour" is measured from when Trawler FIRST saw the torrent
+/// stalled with no seeds, not from when it was added: the old check reduced
+/// to "no seeds at this instant" for anything older than an hour, so one
+/// poll during a VPN drop paused every download and re-grabbed all of them.
+/// Nothing is judged while qBittorrent itself is not connected.
 fn reopen_dead_grabs(
     conn: &rusqlite::Connection,
     torrents: &[crate::qbit::QbitTorrent],
+    qbt_connected: bool,
 ) -> Vec<DeadGrab> {
-    let now = db::now();
+    // hash → first time this torrent was seen stalled with zero seeds; an
+    // entry survives a disconnected cycle (the swarm didn't get healthier
+    // because we lost our uplink) but is dropped as soon as the torrent moves
+    static STALL_FIRST_SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, i64>>> =
+        std::sync::OnceLock::new();
+    let mut first_seen = STALL_FIRST_SEEN
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    reopen_dead_grabs_with(conn, torrents, qbt_connected, &mut first_seen, db::now())
+}
+
+fn reopen_dead_grabs_with(
+    conn: &rusqlite::Connection,
+    torrents: &[crate::qbit::QbitTorrent],
+    qbt_connected: bool,
+    first_seen: &mut std::collections::HashMap<String, i64>,
+    now: i64,
+) -> Vec<DeadGrab> {
     let mut dead = vec![];
+    // an empty listing is a qBittorrent still loading its session, not a
+    // world with no stalled torrents: judging on it would wipe every clock
+    if !qbt_connected || torrents.is_empty() {
+        return dead;
+    }
+    let stalled_now: std::collections::HashSet<&str> = torrents
+        .iter()
+        .filter(|t| t.state == "stalledDL" && t.num_seeds == 0 && t.dlspeed == 0)
+        .map(|t| t.hash.as_str())
+        .collect();
+    first_seen.retain(|hash, _| stalled_now.contains(hash.as_str()));
     for t in torrents {
         // A live swarm serves metadata in seconds — 20 minutes of metaDL is a
         // ghost town. Stalled-with-data gets the longer benefit of the doubt.
         let dead_meta = t.state == "metaDL" && now - t.added_on > 20 * 60;
-        let dead_stall = t.state == "stalledDL" && t.num_seeds == 0 && now - t.added_on > 3600;
+        let dead_stall = stalled_now.contains(t.hash.as_str()) && {
+            let since = *first_seen.entry(t.hash.clone()).or_insert(now);
+            now - since >= 3600
+        };
         if !(dead_meta || dead_stall) {
             continue;
         }
@@ -676,17 +761,22 @@ async fn bitport_completion_pass(app: &tauri::AppHandle, state: &AppState) {
         transfers.iter().filter_map(crate::bitport::transfer_hash).collect();
     let live_norms: std::collections::HashSet<String> =
         transfers.iter().map(|t| normalize(&t.name)).collect();
-    // reaping needs TWO consecutive polls agreeing a transfer is gone: one
-    // odd listing (pagination surprise, partial response) must not release
-    // every claim at once. Absence is only evidence when it repeats.
-    static BP_MISSING: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<i64>>> =
+    // Absence is evidence only when it persists (see AbsenceStrikes): one
+    // odd listing (pagination surprise, partial or empty response) must not
+    // release every claim at once.
+    static BP_STRIKES: std::sync::OnceLock<std::sync::Mutex<AbsenceStrikes>> =
         std::sync::OnceLock::new();
-    let missing_lock = BP_MISSING.get_or_init(Default::default);
     let listing_empty = transfers.is_empty();
     let reap_cutoff = db::now() - 5 * 60; // covers the add-to-listing gap
     let recent_cutoff = db::now() - 3 * 86_400; // first cycle after an upgrade may flip a backlog
     let mut completed_display: Vec<String> = vec![];
     let conn = state.db.lock().await;
+    // taken after the last .await: a std MutexGuard is !Send, and this
+    // future runs under tauri::async_runtime::spawn
+    let mut strikes = BP_STRIKES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     type BitportOpenRow =
         (i64, String, Option<String>, Option<String>, Option<String>, i64, String);
     let rows: Vec<BitportOpenRow> = conn
@@ -704,7 +794,7 @@ async fn bitport_completion_pass(app: &tauri::AppHandle, state: &AppState) {
         // an empty listing with open rows is suspicious, not evidence
         crate::applog::warn(
             "bitport",
-            "transfer listing came back empty while cloud grabs are open — not reaping",
+            "transfer listing came back empty while cloud grabs are open — claims are released only if that persists for half an hour",
         );
     }
     for (id, title, info_hash, ep_ids_raw, bp_token, ts, ledger_state) in rows {
@@ -720,7 +810,7 @@ async fn bitport_completion_pass(app: &tauri::AppHandle, state: &AppState) {
             }
         };
         if is_done {
-            missing_lock.lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
+            strikes.present(id);
             let _ = conn.execute("UPDATE grab_ledger SET state = 'completed' WHERE id = ?1", [id]);
             db::set_episodes_state_by_ids(&conn, &db::parse_ep_ids(ep_ids_raw.as_deref()), "downloaded", None);
             db::log_activity(
@@ -741,9 +831,8 @@ async fn bitport_completion_pass(app: &tauri::AppHandle, state: &AppState) {
                     || live_norms.contains(&norm)
             }
         };
-        let mut missing = missing_lock.lock().unwrap_or_else(|p| p.into_inner());
         if is_present {
-            missing.remove(&id);
+            strikes.present(id);
             if ledger_state == "dispatching" {
                 if let Err(error) = db::ledger_confirm_present(
                     &conn,
@@ -759,17 +848,10 @@ async fn bitport_completion_pass(app: &tauri::AppHandle, state: &AppState) {
             }
             continue;
         }
-        // A wholly empty account response remains too weak to retire normal
-        // grabbed rows. For a dispatching row older than 30 minutes, two
-        // agreeing successful empty polls recover a pre-submission crash.
-        let can_count_absence =
-            !listing_empty || (ledger_state == "dispatching" && ts < db::now() - 30 * 60);
-        if !can_count_absence {
-            missing.remove(&id);
-            continue;
-        }
-        if ts < reap_cutoff && missing.contains(&id) {
-            missing.remove(&id);
+        // every absence counts, an empty listing included; the strike window
+        // is what keeps a startup blip or a partial page from being evidence
+        let confirmed = strikes.missing(id, db::now(), listing_empty);
+        if ts < reap_cutoff && confirmed {
             if let Err(error) = db::ledger_confirm_missing(
                 &conn,
                 id,
@@ -781,6 +863,7 @@ async fn bitport_completion_pass(app: &tauri::AppHandle, state: &AppState) {
                 );
                 continue;
             }
+            strikes.present(id);
             db::log_activity(
                 &conn,
                 "system",
@@ -790,10 +873,9 @@ async fn bitport_completion_pass(app: &tauri::AppHandle, state: &AppState) {
                     title.chars().take(60).collect::<String>()
                 ),
             );
-        } else {
-            missing.insert(id); // strike one — reap on the next agreeing poll
         }
     }
+    drop(strikes);
     drop(conn);
     if !completed_display.is_empty() {
         let (title, body) = if completed_display.len() == 1 {
@@ -830,11 +912,29 @@ async fn completion_pass(app: &tauri::AppHandle, state: &AppState) -> Vec<DeadGr
     // listen port is provably inside a Windows-reserved range — that's a
     // diagnosis, not a guess. Rate-limited hard: a laptop that's merely
     // offline must never get its port churned or its activity feed spammed.
-    if let Ok(md) = q.sync_maindata().await {
-        let status = md
-            .pointer("/server_state/connection_status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+    let maindata = q.sync_maindata().await.ok();
+    let connection_status = maindata
+        .as_ref()
+        .and_then(|md| md.pointer("/server_state/connection_status"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    // the dead-swarm medic only judges torrents while qBittorrent has a
+    // working uplink: "disconnected" means every torrent looks dead and none
+    // of them is. No maindata at all (a reverse proxy that hides /sync) is
+    // not evidence either way, so the medic keeps working on the list alone.
+    let qbt_connected = connection_status != "disconnected";
+    if maindata.is_none() {
+        static SAID_IT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID_IT.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            crate::applog::warn(
+                "qbit",
+                "sync/maindata is unavailable — the swarm doctor is off and the medic cannot see the connection state",
+            );
+        }
+    }
+    if maindata.is_some() {
+        let status = connection_status.as_str();
         if status == "disconnected" {
             let now = db::now();
             let (streak, last_move, attempts) = {
@@ -955,11 +1055,34 @@ async fn completion_pass(app: &tauri::AppHandle, state: &AppState) -> Vec<DeadGr
                     .unwrap_or_default()
             })
             .unwrap_or_default();
+        // Absence is evidence only when it persists (see AbsenceStrikes).
+        // qBittorrent answers the WebUI before it has finished loading resume
+        // data after a restart, so one listing can be missing every torrent;
+        // reaping on it released every claim at once and the next cycle
+        // re-grabbed all of them.
+        static QBT_STRIKES: std::sync::OnceLock<std::sync::Mutex<AbsenceStrikes>> =
+            std::sync::OnceLock::new();
+        let mut strikes = QBT_STRIKES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if torrents.is_empty() && !rows.is_empty() {
+            crate::applog::warn(
+                "scheduler",
+                "qBittorrent listed no torrents while grabs are open — claims are released only if that persists",
+            );
+        }
+        let now = db::now();
+        let listing_empty = torrents.is_empty();
         for (id, title, info_hash, ep_ids_raw, ledger_state) in rows {
             let hash_present = info_hash
                 .map(|h| all_hashes.contains(&h.to_ascii_lowercase()))
                 .unwrap_or(false);
             if hash_present || all_norms.contains(&normalize(&title)) {
+                strikes.present(id);
+                continue;
+            }
+            if !strikes.missing(id, now, listing_empty) {
                 continue;
             }
             // a stalled row's episodes were handed back when it stalled and
@@ -973,6 +1096,7 @@ async fn completion_pass(app: &tauri::AppHandle, state: &AppState) -> Vec<DeadGr
                 );
                 continue;
             }
+            strikes.present(id);
             if was_stalled {
                 continue;
             }
@@ -993,7 +1117,7 @@ async fn completion_pass(app: &tauri::AppHandle, state: &AppState) -> Vec<DeadGr
             );
         }
     }
-    let dead = reopen_dead_grabs(&conn, &torrents);
+    let dead = reopen_dead_grabs(&conn, &torrents, qbt_connected);
     // display names dedupe on the normalized torrent title, since an episode
     // grab appears both in episodes and in the shared ledger
     let mut seen_norms: std::collections::HashSet<String> = Default::default();
@@ -1397,6 +1521,7 @@ mod tests {
             num_leechs: 0,
             ratio: 0.0,
             content_path: String::new(),
+            auto_tmm: false,
         }
     }
 
@@ -1413,7 +1538,10 @@ mod tests {
         conn.execute("INSERT INTO episodes (tvmaze_ep_id, state, grabbed_title) VALUES (7, 'grabbed', 'Show.S01E01.1080p.WEB-GRP')", []).unwrap();
         // metadata landed: qBittorrent now shows the torrent's real name
         let torrents = vec![qbt("Show S01E01 (real folder name)", hash, "stalledDL", 0, 2 * 3600)];
-        let dead = reopen_dead_grabs(&conn, &torrents);
+        let now = db::now();
+        // stalled with no seeds for an hour of observed wall time
+        let mut seen = std::collections::HashMap::from([(hash.to_string(), now - 3600)]);
+        let dead = reopen_dead_grabs_with(&conn, &torrents, true, &mut seen, now);
         assert_eq!(dead.len(), 1);
         assert_eq!(dead[0].qbt_hash, hash);
         assert_eq!(dead[0].ep_ids, vec![7]);
@@ -1440,9 +1568,120 @@ mod tests {
         .unwrap();
         conn.execute("INSERT INTO episodes (tvmaze_ep_id, state, grabbed_title) VALUES (8, 'grabbed', 'Show.S01E02.1080p.WEB-GRP')", []).unwrap();
         let torrents = vec![qbt("Show.S01E02.1080p.WEB-GRP", &"a".repeat(40), "metaDL", 0, 30 * 60)];
-        let dead = reopen_dead_grabs(&conn, &torrents);
+        let mut seen = std::collections::HashMap::new();
+        let dead = reopen_dead_grabs_with(&conn, &torrents, true, &mut seen, db::now());
         assert_eq!(dead.len(), 1);
         assert_eq!(dead[0].ep_ids, vec![8]);
+    }
+
+    #[test]
+    fn absence_needs_two_observations_and_ten_minutes() {
+        let t0 = 1_000_000;
+        let w = AbsenceStrikes::WINDOW_SECS;
+        // first sighting never confirms
+        let mut s = AbsenceStrikes::default();
+        assert!(!s.missing(7, t0, false));
+        // a second poll seconds later (run-now + scheduled cycle) is not
+        // an independent observation
+        assert!(!s.missing(7, t0 + 5, false));
+        // exactly two observations spanning the window confirm
+        let mut two = AbsenceStrikes::default();
+        assert!(!two.missing(8, t0, false));
+        assert!(two.missing(8, t0 + w, false));
+        // two observations one second short of the window do not
+        let mut short = AbsenceStrikes::default();
+        assert!(!short.missing(8, t0, false));
+        assert!(!short.missing(8, t0 + w - 1, false));
+        // the strike survives a confirm until the caller settles the row,
+        // so a failed retire is retried next cycle rather than re-windowed
+        assert!(two.missing(8, t0 + w + 1, false));
+        two.present(8);
+        assert!(!two.missing(8, t0 + 3 * w, false));
+        // seen again in between: strikes are forgotten
+        let mut back = AbsenceStrikes::default();
+        assert!(!back.missing(9, t0, false));
+        back.present(9);
+        assert!(!back.missing(9, t0 + 2 * w, false));
+        // an empty listing needs the longer window
+        let mut empty = AbsenceStrikes::default();
+        assert!(!empty.missing(10, t0, true));
+        assert!(!empty.missing(10, t0 + w, true));
+        assert!(empty.missing(10, t0 + AbsenceStrikes::EMPTY_LISTING_WINDOW_SECS, true));
+        // a weak first observation followed by one normal miss is still one
+        // real observation: the longer window applies to the whole streak
+        let mut weak_first = AbsenceStrikes::default();
+        assert!(!weak_first.missing(11, t0, true));
+        assert!(!weak_first.missing(11, t0 + w, false));
+        assert!(weak_first.missing(11, t0 + AbsenceStrikes::EMPTY_LISTING_WINDOW_SECS, false));
+    }
+
+    #[test]
+    fn empty_listing_does_not_touch_stall_clocks() {
+        let conn = ledger_mem();
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let now = db::now();
+        let mut seen = std::collections::HashMap::from([(hash.to_string(), now - 3000)]);
+        // qBittorrent answering before its session has loaded
+        assert!(reopen_dead_grabs_with(&conn, &[], true, &mut seen, now).is_empty());
+        assert_eq!(seen.get(hash), Some(&(now - 3000)));
+    }
+
+    #[test]
+    fn a_single_stalled_sample_does_not_kill_a_grab() {
+        // regression: "stalled, 0 seeds, added over an hour ago" used to be
+        // enough on its own — one offline poll paused every download
+        let conn = ledger_mem();
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        conn.execute(
+            "INSERT INTO grab_ledger (content_key, title, info_hash, size, state, ts, ep_ids)
+             VALUES ('tv:show:s01e01', 'Show.S01E01.1080p.WEB-GRP', ?1, 0, 'grabbed', ?2, '[7]')",
+            rusqlite::params![hash, db::now()],
+        )
+        .unwrap();
+        let torrents = vec![qbt("Show.S01E01.1080p.WEB-GRP", hash, "stalledDL", 0, 5 * 3600)];
+        let now = db::now();
+        let mut seen = std::collections::HashMap::new();
+        // first sighting only starts the clock
+        assert!(reopen_dead_grabs_with(&conn, &torrents, true, &mut seen, now).is_empty());
+        assert_eq!(seen.get(hash), Some(&now));
+        // 30 minutes later, still not enough
+        assert!(reopen_dead_grabs_with(&conn, &torrents, true, &mut seen, now + 1800).is_empty());
+        // an hour after first sighting: dead
+        assert_eq!(reopen_dead_grabs_with(&conn, &torrents, true, &mut seen, now + 3600).len(), 1);
+    }
+
+    #[test]
+    fn nothing_is_judged_while_qbittorrent_is_disconnected() {
+        let conn = ledger_mem();
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        conn.execute(
+            "INSERT INTO grab_ledger (content_key, title, info_hash, size, state, ts, ep_ids)
+             VALUES ('tv:show:s01e01', 'Show.S01E01.1080p.WEB-GRP', ?1, 0, 'grabbed', ?2, '[7]')",
+            rusqlite::params![hash, db::now()],
+        )
+        .unwrap();
+        let torrents = vec![qbt("Show.S01E01.1080p.WEB-GRP", hash, "stalledDL", 0, 5 * 3600)];
+        let now = db::now();
+        let mut seen = std::collections::HashMap::from([(hash.to_string(), now - 7200)]);
+        assert!(reopen_dead_grabs_with(&conn, &torrents, false, &mut seen, now).is_empty());
+        // the clock is kept, not reset, across the outage
+        assert_eq!(seen.get(hash), Some(&(now - 7200)));
+        let state: String = conn
+            .query_row("SELECT state FROM grab_ledger WHERE info_hash = ?1", [hash], |r| r.get(0))
+            .unwrap();
+        assert_eq!(state, "grabbed");
+    }
+
+    #[test]
+    fn a_torrent_that_moves_again_resets_its_stall_clock() {
+        let conn = ledger_mem();
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let now = db::now();
+        let mut seen = std::collections::HashMap::from([(hash.to_string(), now - 3000)]);
+        let mut moving = qbt("Show.S01E01.1080p.WEB-GRP", hash, "downloading", 3, 5 * 3600);
+        moving.dlspeed = 50_000;
+        assert!(reopen_dead_grabs_with(&conn, &[moving], true, &mut seen, now).is_empty());
+        assert!(!seen.contains_key(hash));
     }
 
     #[test]

@@ -234,7 +234,161 @@ pub async fn dispatch(
             crate::applog::info("bitport", format!("sent to cloud: {}", order.title.chars().take(70).collect::<String>()));
                 Ok(tok)
             } else {
-                perform_grab_core(&http, &cfg, &order, &ck).await?;
+                let core = perform_grab_core(&http, &cfg, &order, &ck).await?;
+                // the hash qBittorrent tracks wins over the search result's
+                // claim, and it is what ledger_finish_dispatch records below —
+                // otherwise a stale indexer hash is written straight back
+                // over the corrected one
+                if core.info_hash.is_some() {
+                    order.info_hash = core.info_hash;
+                }
+                if core.duplicate {
+                    // "Fails." means either the torrent is already in
+                    // qBittorrent (a reap that fired on a partial listing, or
+                    // the user added it by hand) or qBittorrent could not
+                    // parse it. Only the first is a grab: confirm by hash.
+                    // Abandoning a real duplicate made the scheduler pick the
+                    // same top release again every cycle, forever.
+                    let q = crate::commands::qbit(&http, &cfg);
+                    // a listing failure here is not a verdict: the add said
+                    // "already have it", so keep the pending row for the
+                    // completion pass to reconcile instead of abandoning it
+                    let torrents = q.list(None).await.map_err(|e| {
+                        AppError::DispatchUncertain(format!(
+                            "qBittorrent reported the torrent as already present but the listing failed ({e}); Trawler will reconcile it"
+                        ))
+                    })?;
+                    let wanted_norm = crate::commands::normalize(&order.title);
+                    // by hash first; then by normalized name, the way the
+                    // reaper matches. The name fallback also covers a hash
+                    // the indexer got wrong: qBittorrent's own hash is the
+                    // one that counts and is recorded below.
+                    let mut torrents = torrents;
+                    let idx = order
+                        .info_hash
+                        .as_deref()
+                        .and_then(|h| torrents.iter().position(|t| t.hash.eq_ignore_ascii_case(h)))
+                        .or_else(|| {
+                            torrents
+                                .iter()
+                                .position(|t| crate::commands::normalize(&t.name) == wanted_norm)
+                        });
+                    let Some(existing) = idx.map(|i| torrents.swap_remove(i)) else {
+                        return Err(AppError::Other(format!(
+                            "qBittorrent rejected \"{}\" — it could not parse the torrent",
+                            order.title.chars().take(70).collect::<String>()
+                        )));
+                    };
+                    // The dead-swarm medic's corpse is known from the ledger,
+                    // not from qBittorrent's state: a torrent may be stopped
+                    // for many benign reasons (added paused, finished under a
+                    // stop-when-complete seed policy, paused by hand) and all
+                    // of those are adoptable. A stalled ledger row for THIS
+                    // torrent means Trawler already judged it dead; parking
+                    // the episodes on it again would leave them there forever.
+                    // A stalled row that carries a different comparable hash
+                    // is a different torrent (the same release re-uploaded on
+                    // another tracker) and must not block a healthy copy.
+                    let is_corpse = {
+                        // the torrent is proven present; a database hiccup
+                        // here is not grounds to abandon the claim
+                        let conn = db::open_existing().map_err(|e| {
+                            AppError::DispatchUncertain(format!(
+                                "qBittorrent has the torrent but the ledger could not be opened ({e}); Trawler will reconcile it"
+                            ))
+                        })?;
+                        let norm = crate::commands::normalize(&existing.name);
+                        conn.prepare(
+                            "SELECT title, info_hash FROM grab_ledger WHERE state = 'stalled' AND backend = 'qbittorrent'",
+                        )
+                        .ok()
+                        .and_then(|mut stmt| {
+                            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))
+                                .ok()
+                                .map(|rows| {
+                                    rows.flatten().any(|(title, hash)| match hash {
+                                        Some(h) if crate::scheduler::qbt_comparable_hash(&h) => {
+                                            h.eq_ignore_ascii_case(&existing.hash)
+                                        }
+                                        _ => {
+                                            let t = crate::commands::normalize(&title);
+                                            t == norm || t == wanted_norm
+                                        }
+                                    })
+                                })
+                        })
+                        .unwrap_or(false)
+                    };
+                    if is_corpse {
+                        return Err(AppError::Other(format!(
+                            "qBittorrent already has \"{}\" but Trawler paused it as a dead swarm — pick another release, or resume it by hand",
+                            order.title.chars().take(70).collect::<String>()
+                        )));
+                    }
+                    // a torrent whose payload is gone or that qBittorrent has
+                    // flagged as broken must not become a "downloaded" episode
+                    if existing.state == "missingFiles" || existing.state == "error" {
+                        return Err(AppError::Other(format!(
+                            "qBittorrent already has \"{}\" but reports it as {} — fix or remove it there first",
+                            order.title.chars().take(70).collect::<String>(),
+                            existing.state
+                        )));
+                    }
+                    // qBittorrent's own hash is the identity every later pass
+                    // matches on; an indexer's claim that got us here by name
+                    // was wrong
+                    order.info_hash = Some(existing.hash.clone());
+                    // A torrent the user stopped part-way is adoptable but
+                    // would sit there forever: the medic judges only
+                    // stalledDL/metaDL and the completion pass only sees
+                    // "present". Start it unless grabs are meant to arrive
+                    // paused; never touch a finished one (seeding policy).
+                    let stopped = existing.state.starts_with("stopped") || existing.state.starts_with("paused");
+                    if stopped && existing.progress < 1.0 && !cfg.add_paused {
+                        if let Err(e) = q.torrent_action("start", &existing.hash).await {
+                            crate::applog::warn(
+                                "grab",
+                                format!("adopted torrent is stopped and could not be started: {e}"),
+                            );
+                        } else {
+                            crate::applog::info(
+                                "grab",
+                                format!(
+                                    "adopted torrent was stopped at {:.0}% — started it",
+                                    existing.progress * 100.0
+                                ),
+                            );
+                        }
+                    }
+                    // Make it visible where Trawler's grabs live, but only
+                    // when that cannot move anything: never overwrite a
+                    // category the user chose, and never touch a torrent under
+                    // Automatic Torrent Management, which relocates its files
+                    // when the category changes.
+                    if !cfg.qbit_category.is_empty() && existing.category.is_empty() && !existing.auto_tmm {
+                        if let Err(e) = q.set_category(&existing.hash, &cfg.qbit_category).await {
+                            crate::applog::warn(
+                                "grab",
+                                format!("adopted torrent could not be labeled with the {} category: {e}", cfg.qbit_category),
+                            );
+                        }
+                    } else if !cfg.qbit_category.is_empty() && existing.category != cfg.qbit_category {
+                        crate::applog::info(
+                            "grab",
+                            format!(
+                                "adopted torrent keeps its own category ({}); it will not appear under Trawler's in Downloads",
+                                if existing.category.is_empty() { "none" } else { existing.category.as_str() }
+                            ),
+                        );
+                    }
+                    crate::applog::info(
+                        "grab",
+                        format!(
+                            "qBittorrent already had \"{}\" — adopting the existing torrent",
+                            order.title.chars().take(70).collect::<String>()
+                        ),
+                    );
+                }
                 Ok(None)
             }
         }

@@ -527,12 +527,9 @@ pub async fn import_disambiguate(
         )
         .await?;
     let text = reply.content.unwrap_or_default();
-    let json_str = text
-        .find('{')
-        .zip(text.rfind('}'))
-        .filter(|(s, e)| s < e)
-        .map(|(s, e)| &text[s..=e])
-        .unwrap_or("{}");
+    // shared with brief compilation: fences, prose and <think> blocks
+    // tolerated, and a miss parses as an empty map below
+    let json_str = crate::llm::extract_json_object(&text);
     // decode per entry: one malformed value must not void the whole batch
     let raw: std::collections::HashMap<String, Value> =
         serde_json::from_str(json_str).unwrap_or_default();

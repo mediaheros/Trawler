@@ -28,6 +28,13 @@ pub enum AppError {
     #[error("qBittorrent login failed — check the username and password")]
     QbitAuth,
 
+    /// qBittorrent answered "Fails." to an add: the torrent is already in the
+    /// session. Not a failure of the grab — the content is there — so the
+    /// dispatcher adopts the existing torrent instead of abandoning the claim
+    /// and retrying the same release every cycle.
+    #[error("qBittorrent already has this torrent")]
+    QbitDuplicate,
+
     #[error("this release has no usable magnet link or download URL")]
     NoDownloadSource,
 

@@ -24,6 +24,10 @@ pub struct QbitTorrent {
     pub ratio: f64,
     #[serde(default)]
     pub content_path: String,
+    /// Automatic Torrent Management: qBittorrent relocates the files when
+    /// such a torrent's category changes, so adoption must not touch it.
+    #[serde(default)]
+    pub auto_tmm: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -259,9 +263,11 @@ impl<'a> QbitClient<'a> {
             return Err(qbit_add_status_error(status, &body));
         }
         if body.contains("Fails") {
-            return Err(AppError::Other(
-                "qBittorrent rejected the torrent (duplicate or invalid)".into(),
-            ));
+            // qBittorrent says "Fails." for a torrent it already holds (and,
+            // rarely, for an unparseable one). Report it as a duplicate: the
+            // dispatcher confirms presence by listing and adopts the existing
+            // torrent, or turns a phantom into a definitive error.
+            return Err(AppError::QbitDuplicate);
         }
         Ok(())
     }
@@ -292,6 +298,17 @@ impl<'a> QbitClient<'a> {
     }
 
     /// action: "stop" | "start" | "delete" | "deleteWithFiles"
+    /// Put an existing torrent under Trawler's category so the Downloads
+    /// view (which lists by category) shows it. Best effort for adoptions.
+    pub async fn set_category(&self, hash: &str, category: &str) -> Result<()> {
+        self.post_authed(
+            "/api/v2/torrents/setCategory",
+            &[("hashes", hash.to_string()), ("category", category.to_string())],
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn torrent_action(&self, action: &str, hash: &str) -> Result<()> {
         match action {
             "stop" | "start" => {
@@ -412,6 +429,76 @@ mod tests {
         assert!(matches!(qbit_add_status_error(500, "oops"), AppError::DispatchUncertain(_)));
         assert!(matches!(qbit_add_status_error(408, "late"), AppError::DispatchUncertain(_)));
         assert!(matches!(qbit_add_status_error(400, "bad torrent"), AppError::Qbit { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_fails_body_is_reported_as_a_duplicate() {
+        // qBittorrent answers 200 "Fails." for a torrent it already holds;
+        // the dispatcher must be able to tell that apart from a hard error
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut request = [0u8; 4096];
+            let (mut version_socket, _) = listener.accept().await.unwrap();
+            let _ = version_socket.read(&mut request).await.unwrap();
+            version_socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n5.0.0",
+                )
+                .await
+                .unwrap();
+            let (mut add_socket, _) = listener.accept().await.unwrap();
+            // drain the whole multipart POST before answering: closing with
+            // unread bytes in the receive buffer makes the kernel send RST,
+            // and the client would see a reset instead of the body
+            let mut received = Vec::new();
+            loop {
+                let n = add_socket.read(&mut request).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                received.extend_from_slice(&request[..n]);
+                let text = String::from_utf8_lossy(&received);
+                let Some(header_end) = text.find("\r\n\r\n") else { continue };
+                let content_length = text
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length: ").or_else(|| l.strip_prefix("Content-Length: ")))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if received.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+            add_socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nFails.",
+                )
+                .await
+                .unwrap();
+        });
+        let http = reqwest::Client::builder().cookie_store(true).build().unwrap();
+        let client = QbitClient {
+            http: &http,
+            base: format!("http://{address}"),
+            username: "user".into(),
+            password: "pass".into(),
+        };
+        let error = client
+            .add(AddTorrent {
+                magnet: Some(
+                    "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567".into(),
+                ),
+                torrent_bytes: None,
+                torrent_name: "Already there",
+                save_path: None,
+                category: None,
+                paused: false,
+                ratio_limit: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AppError::QbitDuplicate));
+        server.await.unwrap();
     }
 
     #[tokio::test]
