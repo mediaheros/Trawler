@@ -460,6 +460,11 @@ export const useStore = create<Store>((set, get) => ({
             ? rows
             : [...rows, ...state.chat.filter((message) => message.id < 0)],
         chatLoaded: true,
+        // the stored rows now carry every tool step of a finished run;
+        // keeping liveSteps rendered each step twice under a pulsing avatar.
+        // Whichever reload lands (the run's own, or the Agent view mounting
+        // mid-run) clears them — but never while a run is still producing.
+        liveSteps: state.agentBusy ? state.liveSteps : [],
       }));
       return true;
     } catch (e) {
@@ -582,24 +587,14 @@ export const useStore = create<Store>((set, get) => ({
           // the backend persisted a "⚠ …" assistant row before emitting this
           void get().loadChat();
           break;
-        case "done": {
+        case "done":
           clearAgentWatchdog();
           set({ agentBusy: false, agentThinking: false });
-          // the reloaded transcript carries the run's tool steps as stored
-          // rows; keeping liveSteps around rendered every step twice under a
-          // still-pulsing avatar until the next send. Clear them once the
-          // stored rows are in — unless a new run has started meanwhile.
-          const revision = chatRevision;
-          void get()
-            .loadChat()
-            .then((replaced) => {
-              // a failed reload keeps the live cards: they are the only
-              // record of the run until the stored rows arrive
-              if (replaced && revision === chatRevision) set({ liveSteps: [] });
-            });
+          // loadChat clears liveSteps once the stored rows are in; a failed
+          // reload keeps the live cards as the only record of the run
+          void get().loadChat();
           void get().loadProposals();
           break;
-        }
       }
     });
   },

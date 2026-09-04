@@ -211,6 +211,8 @@ const COMPILE_PROMPT: &str = r#"You compile a user's media-hunting brief into a 
 }
 Be conservative: include only terms clearly implied by the brief. If the user names a size limit, quality, or things to avoid, encode them. The include list is a hard filter — put ONLY terms that will appear in every valid release name (e.g. "ufc"), NOT descriptive words like "main card" that release names may omit; put soft preferences in notes."#;
 
+const NO_QUERIES: &str = "compiled plan had no queries";
+
 /// One LLM call turning a natural-language brief into a HuntPlan (then sanitized).
 pub async fn compile(client: &LlmClient, brief_prompt: &str) -> Result<HuntPlan> {
     let mut messages = vec![
@@ -226,9 +228,15 @@ pub async fn compile(client: &LlmClient, brief_prompt: &str) -> Result<HuntPlan>
             // it. The assistant turn keeps roles alternating — backends with
             // strict chat templates reject user,user with HTTP 400.
             messages.push(ChatMsg::assistant_text(last_reply.clone()));
-            messages.push(ChatMsg::user(format!(
-                "That reply could not be used ({last_err}). Reply with ONLY the JSON object, no prose, no code fence."
-            )));
+            let ask = if last_err == NO_QUERIES {
+                "That plan had no queries. Reply with ONLY the JSON object again, with at least one search string in \"queries\"."
+                    .to_string()
+            } else {
+                format!(
+                    "That reply could not be parsed ({last_err}). Reply with ONLY the JSON object, no prose, no code fence."
+                )
+            };
+            messages.push(ChatMsg::user(ask));
         }
         let reply = client.chat(&messages, None).await?;
         let text = reply.content.unwrap_or_default();
@@ -238,7 +246,7 @@ pub async fn compile(client: &LlmClient, brief_prompt: &str) -> Result<HuntPlan>
             Ok(plan) => {
                 let plan = plan.sanitize();
                 if plan.queries.is_empty() {
-                    last_err = "compiled plan had no queries".into();
+                    last_err = NO_QUERIES.into();
                     continue;
                 }
                 return Ok(plan);
@@ -283,6 +291,10 @@ mod tests {
         assert_eq!(extract_json_object("no json here"), "no json here");
         // fences and leading prose are tolerated
         assert_eq!(extract_json_object("Sure:\n```json\n{\"q\":[]}\n```"), "{\"q\":[]}");
+        // truncated by max_tokens: no closing brace at all
+        assert_eq!(extract_json_object("{\"a\":1"), "{\"a\":1");
+        // an unterminated think block containing a brace must not panic
+        assert_eq!(extract_json_object("<think>maybe {"), "{");
     }
 
     #[test]

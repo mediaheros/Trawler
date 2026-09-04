@@ -371,23 +371,27 @@ struct AbsenceStrikes {
 
 impl AbsenceStrikes {
     const WINDOW_SECS: i64 = 10 * 60;
+    /// A listing with nothing in it at all is weaker evidence: a backend
+    /// mid-restart, an expired session, a partial page. It still counts —
+    /// the user may really have removed their only transfer — but only
+    /// after a longer stretch.
+    const EMPTY_LISTING_WINDOW_SECS: i64 = 30 * 60;
 
-    /// The row's transfer is in the listing: forget any strikes.
+    /// The row's transfer is in the listing (or the row has been settled):
+    /// forget any strikes.
     fn present(&mut self, id: i64) {
         self.first_missing.remove(&id);
     }
 
     /// Record one absent observation; true when the row may be retired.
-    fn missing(&mut self, id: i64, now: i64) -> bool {
-        let confirmed = {
-            let slot = self.first_missing.entry(id).or_insert((now, 0));
-            slot.1 += 1;
-            slot.1 >= 2 && now - slot.0 >= Self::WINDOW_SECS
-        };
-        if confirmed {
-            self.first_missing.remove(&id);
-        }
-        confirmed
+    /// The strike is kept until the caller settles the row with `present`,
+    /// so a retire that fails (a busy database) is retried next cycle
+    /// instead of restarting the window.
+    fn missing(&mut self, id: i64, now: i64, listing_empty: bool) -> bool {
+        let window = if listing_empty { Self::EMPTY_LISTING_WINDOW_SECS } else { Self::WINDOW_SECS };
+        let slot = self.first_missing.entry(id).or_insert((now, 0));
+        slot.1 += 1;
+        slot.1 >= 2 && now - slot.0 >= window
     }
 }
 
@@ -757,15 +761,17 @@ async fn bitport_completion_pass(app: &tauri::AppHandle, state: &AppState) {
     // release every claim at once.
     static BP_STRIKES: std::sync::OnceLock<std::sync::Mutex<AbsenceStrikes>> =
         std::sync::OnceLock::new();
-    let mut strikes = BP_STRIKES
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
     let listing_empty = transfers.is_empty();
     let reap_cutoff = db::now() - 5 * 60; // covers the add-to-listing gap
     let recent_cutoff = db::now() - 3 * 86_400; // first cycle after an upgrade may flip a backlog
     let mut completed_display: Vec<String> = vec![];
     let conn = state.db.lock().await;
+    // taken after the last .await: a std MutexGuard is !Send, and this
+    // future runs under tauri::async_runtime::spawn
+    let mut strikes = BP_STRIKES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     type BitportOpenRow =
         (i64, String, Option<String>, Option<String>, Option<String>, i64, String);
     let rows: Vec<BitportOpenRow> = conn
@@ -783,7 +789,7 @@ async fn bitport_completion_pass(app: &tauri::AppHandle, state: &AppState) {
         // an empty listing with open rows is suspicious, not evidence
         crate::applog::warn(
             "bitport",
-            "transfer listing came back empty while cloud grabs are open — not reaping",
+            "transfer listing came back empty while cloud grabs are open — claims are released only if that persists for half an hour",
         );
     }
     for (id, title, info_hash, ep_ids_raw, bp_token, ts, ledger_state) in rows {
@@ -839,7 +845,7 @@ async fn bitport_completion_pass(app: &tauri::AppHandle, state: &AppState) {
         }
         // every absence counts, an empty listing included; the strike window
         // is what keeps a startup blip or a partial page from being evidence
-        let confirmed = strikes.missing(id, db::now());
+        let confirmed = strikes.missing(id, db::now(), listing_empty);
         if ts < reap_cutoff && confirmed {
             if let Err(error) = db::ledger_confirm_missing(
                 &conn,
@@ -852,6 +858,7 @@ async fn bitport_completion_pass(app: &tauri::AppHandle, state: &AppState) {
                 );
                 continue;
             }
+            strikes.present(id);
             db::log_activity(
                 &conn,
                 "system",
@@ -863,6 +870,7 @@ async fn bitport_completion_pass(app: &tauri::AppHandle, state: &AppState) {
             );
         }
     }
+    drop(strikes);
     drop(conn);
     if !completed_display.is_empty() {
         let (title, body) = if completed_display.len() == 1 {
@@ -1060,6 +1068,7 @@ async fn completion_pass(app: &tauri::AppHandle, state: &AppState) -> Vec<DeadGr
             );
         }
         let now = db::now();
+        let listing_empty = torrents.is_empty();
         for (id, title, info_hash, ep_ids_raw, ledger_state) in rows {
             let hash_present = info_hash
                 .map(|h| all_hashes.contains(&h.to_ascii_lowercase()))
@@ -1068,7 +1077,7 @@ async fn completion_pass(app: &tauri::AppHandle, state: &AppState) -> Vec<DeadGr
                 strikes.present(id);
                 continue;
             }
-            if !strikes.missing(id, now) {
+            if !strikes.missing(id, now, listing_empty) {
                 continue;
             }
             // a stalled row's episodes were handed back when it stalled and
@@ -1082,6 +1091,7 @@ async fn completion_pass(app: &tauri::AppHandle, state: &AppState) -> Vec<DeadGr
                 );
                 continue;
             }
+            strikes.present(id);
             if was_stalled {
                 continue;
             }
@@ -1560,24 +1570,37 @@ mod tests {
 
     #[test]
     fn absence_needs_two_observations_and_ten_minutes() {
-        let mut s = AbsenceStrikes::default();
         let t0 = 1_000_000;
+        let w = AbsenceStrikes::WINDOW_SECS;
         // first sighting never confirms
-        assert!(!s.missing(7, t0));
+        let mut s = AbsenceStrikes::default();
+        assert!(!s.missing(7, t0, false));
         // a second poll seconds later (run-now + scheduled cycle) is not
         // an independent observation
-        assert!(!s.missing(7, t0 + 5));
-        // the window alone is not enough without a second observation
-        let mut fresh = AbsenceStrikes::default();
-        assert!(!fresh.missing(8, t0));
-        // two observations spanning the window confirm, and the entry is gone
-        assert!(s.missing(7, t0 + AbsenceStrikes::WINDOW_SECS));
-        assert!(!s.first_missing.contains_key(&7));
+        assert!(!s.missing(7, t0 + 5, false));
+        // exactly two observations spanning the window confirm
+        let mut two = AbsenceStrikes::default();
+        assert!(!two.missing(8, t0, false));
+        assert!(two.missing(8, t0 + w, false));
+        // two observations one second short of the window do not
+        let mut short = AbsenceStrikes::default();
+        assert!(!short.missing(8, t0, false));
+        assert!(!short.missing(8, t0 + w - 1, false));
+        // the strike survives a confirm until the caller settles the row,
+        // so a failed retire is retried next cycle rather than re-windowed
+        assert!(two.missing(8, t0 + w + 1, false));
+        two.present(8);
+        assert!(!two.missing(8, t0 + 3 * w, false));
         // seen again in between: strikes are forgotten
         let mut back = AbsenceStrikes::default();
-        assert!(!back.missing(9, t0));
+        assert!(!back.missing(9, t0, false));
         back.present(9);
-        assert!(!back.missing(9, t0 + 2 * AbsenceStrikes::WINDOW_SECS));
+        assert!(!back.missing(9, t0 + 2 * w, false));
+        // an empty listing needs the longer window
+        let mut empty = AbsenceStrikes::default();
+        assert!(!empty.missing(10, t0, true));
+        assert!(!empty.missing(10, t0 + w, true));
+        assert!(empty.missing(10, t0 + AbsenceStrikes::EMPTY_LISTING_WINDOW_SECS, true));
     }
 
     #[test]

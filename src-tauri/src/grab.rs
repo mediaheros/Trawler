@@ -250,19 +250,49 @@ pub async fn dispatch(
                     // Abandoning a real duplicate made the scheduler pick the
                     // same top release again every cycle, forever.
                     let q = crate::commands::qbit(&http, &cfg);
-                    let present = match order.info_hash.as_deref() {
-                        Some(h) => q
-                            .list(None)
-                            .await?
-                            .into_iter()
-                            .any(|t| t.hash.eq_ignore_ascii_case(h)),
-                        None => false,
-                    };
-                    if !present {
+                    // a listing failure here is not a verdict: the add said
+                    // "already have it", so keep the pending row for the
+                    // completion pass to reconcile instead of abandoning it
+                    let torrents = q.list(None).await.map_err(|e| {
+                        AppError::DispatchUncertain(format!(
+                            "qBittorrent reported the torrent as already present but the listing failed ({e}); Trawler will reconcile it"
+                        ))
+                    })?;
+                    let wanted_norm = crate::commands::normalize(&order.title);
+                    let existing = torrents.into_iter().find(|t| match order.info_hash.as_deref() {
+                        Some(h) => t.hash.eq_ignore_ascii_case(h),
+                        // no usable hash (a .torrent whose info dict the
+                        // parser could not walk): match the way the reaper
+                        // does, on the normalized name
+                        None => crate::commands::normalize(&t.name) == wanted_norm,
+                    });
+                    let Some(existing) = existing else {
                         return Err(AppError::Other(format!(
                             "qBittorrent rejected \"{}\" — it could not parse the torrent",
                             order.title.chars().take(70).collect::<String>()
                         )));
+                    };
+                    // a stopped torrent is a corpse the dead-swarm medic
+                    // paused on purpose; adopting it would park the episodes
+                    // on it forever (never stalled again, never reaped)
+                    if existing.state.starts_with("stopped") || existing.state.starts_with("paused") {
+                        return Err(AppError::Other(format!(
+                            "qBittorrent already has \"{}\" but it is stopped — Trawler paused it as a dead swarm; pick another release or resume it by hand",
+                            order.title.chars().take(70).collect::<String>()
+                        )));
+                    }
+                    if order.info_hash.is_none() {
+                        order.info_hash = Some(existing.hash.clone());
+                    }
+                    // make it visible where Trawler's grabs live; the files
+                    // stay wherever the user put them
+                    if !cfg.qbit_category.is_empty() && existing.category != cfg.qbit_category {
+                        if let Err(e) = q.set_category(&existing.hash, &cfg.qbit_category).await {
+                            crate::applog::warn(
+                                "grab",
+                                format!("adopted torrent could not be moved under the {} category: {e}", cfg.qbit_category),
+                            );
+                        }
                     }
                     crate::applog::info(
                         "grab",
