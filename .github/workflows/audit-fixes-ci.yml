@@ -40,30 +40,26 @@ jobs:
           rustup default stable
           rustup component add clippy
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri
-
       - name: Install frontend dependencies
         run: npm ci
 
       - name: Run everything, keep the log
         shell: bash
         run: |
-          set -o pipefail
+          # tee via process substitution keeps the status in this shell
+          exec > >(tee ci-log.txt) 2>&1
           status=0
-          {
-            echo "=== npm test ==="
-            npm test || status=1
-            echo
-            echo "=== cargo clippy --all-targets ==="
-            (cd src-tauri && cargo clippy --all-targets 2>&1) || status=1
-            echo
-            echo "=== cargo test --all-targets ==="
-            (cd src-tauri && cargo test --all-targets 2>&1) || status=1
-            echo
-            echo "=== RESULT: $status (0 = all green) ==="
-          } 2>&1 | tee ci-log.txt
+          echo "=== npm test ==="
+          npm test || status=1
+          echo
+          echo "=== cargo clippy --all-targets ==="
+          (cd src-tauri && cargo clippy --all-targets) || status=1
+          echo
+          echo "=== cargo test --all-targets ==="
+          (cd src-tauri && cargo test --all-targets) || status=1
+          echo
+          echo "=== RESULT: $status (0 = all green) ==="
+          sleep 1
           echo "status=$status" >> "$GITHUB_ENV"
 
       - name: Publish the log to the audit-fixes-ci-log branch
