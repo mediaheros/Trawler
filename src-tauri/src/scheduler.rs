@@ -366,17 +366,54 @@ pub struct DeadGrab {
 /// Reopen ledger entries whose torrents are demonstrably dead — stuck fetching
 /// metadata or stalled at 0 seeds for over an hour. Returns them so the medic
 /// can hunt replacements.
+///
+/// "Over an hour" is measured from when Trawler FIRST saw the torrent
+/// stalled with no seeds, not from when it was added: the old check reduced
+/// to "no seeds at this instant" for anything older than an hour, so one
+/// poll during a VPN drop paused every download and re-grabbed all of them.
+/// Nothing is judged while qBittorrent itself is not connected.
 fn reopen_dead_grabs(
     conn: &rusqlite::Connection,
     torrents: &[crate::qbit::QbitTorrent],
+    qbt_connected: bool,
 ) -> Vec<DeadGrab> {
-    let now = db::now();
+    // hash → first time this torrent was seen stalled with zero seeds; an
+    // entry survives a disconnected cycle (the swarm didn't get healthier
+    // because we lost our uplink) but is dropped as soon as the torrent moves
+    static STALL_FIRST_SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, i64>>> =
+        std::sync::OnceLock::new();
+    let mut first_seen = STALL_FIRST_SEEN
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    reopen_dead_grabs_with(conn, torrents, qbt_connected, &mut first_seen, db::now())
+}
+
+fn reopen_dead_grabs_with(
+    conn: &rusqlite::Connection,
+    torrents: &[crate::qbit::QbitTorrent],
+    qbt_connected: bool,
+    first_seen: &mut std::collections::HashMap<String, i64>,
+    now: i64,
+) -> Vec<DeadGrab> {
     let mut dead = vec![];
+    if !qbt_connected {
+        return dead;
+    }
+    let stalled_now: std::collections::HashSet<&str> = torrents
+        .iter()
+        .filter(|t| t.state == "stalledDL" && t.num_seeds == 0 && t.dlspeed == 0)
+        .map(|t| t.hash.as_str())
+        .collect();
+    first_seen.retain(|hash, _| stalled_now.contains(hash.as_str()));
     for t in torrents {
         // A live swarm serves metadata in seconds — 20 minutes of metaDL is a
         // ghost town. Stalled-with-data gets the longer benefit of the doubt.
         let dead_meta = t.state == "metaDL" && now - t.added_on > 20 * 60;
-        let dead_stall = t.state == "stalledDL" && t.num_seeds == 0 && now - t.added_on > 3600;
+        let dead_stall = stalled_now.contains(t.hash.as_str()) && {
+            let since = *first_seen.entry(t.hash.clone()).or_insert(now);
+            now - since >= 3600
+        };
         if !(dead_meta || dead_stall) {
             continue;
         }
@@ -830,11 +867,19 @@ async fn completion_pass(app: &tauri::AppHandle, state: &AppState) -> Vec<DeadGr
     // listen port is provably inside a Windows-reserved range — that's a
     // diagnosis, not a guess. Rate-limited hard: a laptop that's merely
     // offline must never get its port churned or its activity feed spammed.
-    if let Ok(md) = q.sync_maindata().await {
-        let status = md
-            .pointer("/server_state/connection_status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+    let maindata = q.sync_maindata().await.ok();
+    let connection_status = maindata
+        .as_ref()
+        .and_then(|md| md.pointer("/server_state/connection_status"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    // the dead-swarm medic only judges torrents while qBittorrent has a
+    // working uplink; "firewalled" still reaches peers, "disconnected" (or
+    // no answer at all) means every torrent looks dead and none of them is
+    let qbt_connected = matches!(connection_status.as_str(), "connected" | "firewalled");
+    if maindata.is_some() {
+        let status = connection_status.as_str();
         if status == "disconnected" {
             let now = db::now();
             let (streak, last_move, attempts) = {
@@ -955,13 +1000,40 @@ async fn completion_pass(app: &tauri::AppHandle, state: &AppState) -> Vec<DeadGr
                     .unwrap_or_default()
             })
             .unwrap_or_default();
+        // Same rule as the Bitport pass: absence is evidence only when it
+        // repeats. qBittorrent answers the WebUI before it has finished
+        // loading resume data after a restart, so one listing can be missing
+        // every torrent; reaping on it released every claim at once and the
+        // next cycle re-grabbed all of them.
+        static QBT_MISSING: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<i64>>> =
+            std::sync::OnceLock::new();
+        let mut missing = QBT_MISSING
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if torrents.is_empty() && !rows.is_empty() {
+            crate::applog::warn(
+                "scheduler",
+                "qBittorrent listed no torrents while grabs are open — not reaping (likely still starting up)",
+            );
+        }
+        let listing_usable = !torrents.is_empty();
         for (id, title, info_hash, ep_ids_raw, ledger_state) in rows {
             let hash_present = info_hash
                 .map(|h| all_hashes.contains(&h.to_ascii_lowercase()))
                 .unwrap_or(false);
             if hash_present || all_norms.contains(&normalize(&title)) {
+                missing.remove(&id);
                 continue;
             }
+            if !listing_usable {
+                continue;
+            }
+            if missing.insert(id) {
+                // first strike: remember it, judge next cycle
+                continue;
+            }
+            missing.remove(&id);
             // a stalled row's episodes were handed back when it stalled and
             // may belong to a replacement grab by now - never touch them here
             let was_stalled = ledger_state == "stalled";
@@ -993,7 +1065,7 @@ async fn completion_pass(app: &tauri::AppHandle, state: &AppState) -> Vec<DeadGr
             );
         }
     }
-    let dead = reopen_dead_grabs(&conn, &torrents);
+    let dead = reopen_dead_grabs(&conn, &torrents, qbt_connected);
     // display names dedupe on the normalized torrent title, since an episode
     // grab appears both in episodes and in the shared ledger
     let mut seen_norms: std::collections::HashSet<String> = Default::default();
@@ -1413,7 +1485,10 @@ mod tests {
         conn.execute("INSERT INTO episodes (tvmaze_ep_id, state, grabbed_title) VALUES (7, 'grabbed', 'Show.S01E01.1080p.WEB-GRP')", []).unwrap();
         // metadata landed: qBittorrent now shows the torrent's real name
         let torrents = vec![qbt("Show S01E01 (real folder name)", hash, "stalledDL", 0, 2 * 3600)];
-        let dead = reopen_dead_grabs(&conn, &torrents);
+        let now = db::now();
+        // stalled with no seeds for an hour of observed wall time
+        let mut seen = std::collections::HashMap::from([(hash.to_string(), now - 3600)]);
+        let dead = reopen_dead_grabs_with(&conn, &torrents, true, &mut seen, now);
         assert_eq!(dead.len(), 1);
         assert_eq!(dead[0].qbt_hash, hash);
         assert_eq!(dead[0].ep_ids, vec![7]);
@@ -1440,9 +1515,68 @@ mod tests {
         .unwrap();
         conn.execute("INSERT INTO episodes (tvmaze_ep_id, state, grabbed_title) VALUES (8, 'grabbed', 'Show.S01E02.1080p.WEB-GRP')", []).unwrap();
         let torrents = vec![qbt("Show.S01E02.1080p.WEB-GRP", &"a".repeat(40), "metaDL", 0, 30 * 60)];
-        let dead = reopen_dead_grabs(&conn, &torrents);
+        let mut seen = std::collections::HashMap::new();
+        let dead = reopen_dead_grabs_with(&conn, &torrents, true, &mut seen, db::now());
         assert_eq!(dead.len(), 1);
         assert_eq!(dead[0].ep_ids, vec![8]);
+    }
+
+    #[test]
+    fn a_single_stalled_sample_does_not_kill_a_grab() {
+        // regression: "stalled, 0 seeds, added over an hour ago" used to be
+        // enough on its own — one offline poll paused every download
+        let conn = ledger_mem();
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        conn.execute(
+            "INSERT INTO grab_ledger (content_key, title, info_hash, size, state, ts, ep_ids)
+             VALUES ('tv:show:s01e01', 'Show.S01E01.1080p.WEB-GRP', ?1, 0, 'grabbed', ?2, '[7]')",
+            rusqlite::params![hash, db::now()],
+        )
+        .unwrap();
+        let torrents = vec![qbt("Show.S01E01.1080p.WEB-GRP", hash, "stalledDL", 0, 5 * 3600)];
+        let now = db::now();
+        let mut seen = std::collections::HashMap::new();
+        // first sighting only starts the clock
+        assert!(reopen_dead_grabs_with(&conn, &torrents, true, &mut seen, now).is_empty());
+        assert_eq!(seen.get(hash), Some(&now));
+        // 30 minutes later, still not enough
+        assert!(reopen_dead_grabs_with(&conn, &torrents, true, &mut seen, now + 1800).is_empty());
+        // an hour after first sighting: dead
+        assert_eq!(reopen_dead_grabs_with(&conn, &torrents, true, &mut seen, now + 3600).len(), 1);
+    }
+
+    #[test]
+    fn nothing_is_judged_while_qbittorrent_is_disconnected() {
+        let conn = ledger_mem();
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        conn.execute(
+            "INSERT INTO grab_ledger (content_key, title, info_hash, size, state, ts, ep_ids)
+             VALUES ('tv:show:s01e01', 'Show.S01E01.1080p.WEB-GRP', ?1, 0, 'grabbed', ?2, '[7]')",
+            rusqlite::params![hash, db::now()],
+        )
+        .unwrap();
+        let torrents = vec![qbt("Show.S01E01.1080p.WEB-GRP", hash, "stalledDL", 0, 5 * 3600)];
+        let now = db::now();
+        let mut seen = std::collections::HashMap::from([(hash.to_string(), now - 7200)]);
+        assert!(reopen_dead_grabs_with(&conn, &torrents, false, &mut seen, now).is_empty());
+        // the clock is kept, not reset, across the outage
+        assert_eq!(seen.get(hash), Some(&(now - 7200)));
+        let state: String = conn
+            .query_row("SELECT state FROM grab_ledger WHERE info_hash = ?1", [hash], |r| r.get(0))
+            .unwrap();
+        assert_eq!(state, "grabbed");
+    }
+
+    #[test]
+    fn a_torrent_that_moves_again_resets_its_stall_clock() {
+        let conn = ledger_mem();
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let now = db::now();
+        let mut seen = std::collections::HashMap::from([(hash.to_string(), now - 3000)]);
+        let mut moving = qbt("Show.S01E01.1080p.WEB-GRP", hash, "downloading", 3, 5 * 3600);
+        moving.dlspeed = 50_000;
+        assert!(reopen_dead_grabs_with(&conn, &[moving], true, &mut seen, now).is_empty());
+        assert!(seen.get(hash).is_none());
     }
 
     #[test]
