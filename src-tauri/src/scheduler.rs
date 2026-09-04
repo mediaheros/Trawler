@@ -1681,7 +1681,7 @@ mod tests {
         let mut moving = qbt("Show.S01E01.1080p.WEB-GRP", hash, "downloading", 3, 5 * 3600);
         moving.dlspeed = 50_000;
         assert!(reopen_dead_grabs_with(&conn, &[moving], true, &mut seen, now).is_empty());
-        assert!(seen.get(hash).is_none());
+        assert!(!seen.contains_key(hash));
     }
 
     #[test]
