@@ -783,8 +783,6 @@ const mockBp = {
   retried: new Set<number>(),
   startedAt: Date.now(),
 };
-/** demo items that are finished, for cloud_remove's keep-the-card rule */
-const mockDoneIds = new Set([902, 903]);
 
 function mockBpStatus(): BitportStatus {
   return mockBp.connected
@@ -1146,7 +1144,8 @@ async function mock(cmd: string, args?: Record<string, unknown>): Promise<unknow
     case "cloud_remove": {
       const id = Number((args as { ledgerId?: number })?.ledgerId);
       // a done grab losing its cloud copy keeps its card, as the real backend does
-      if ((args as { deleteCloud?: boolean })?.deleteCloud && mockDoneIds.has(id)) mockBp.cloudDeleted.add(id);
+      const done = mockCloudView().items.some((i) => i.ledgerId === id && i.phase === "done");
+      if ((args as { deleteCloud?: boolean })?.deleteCloud && done) mockBp.cloudDeleted.add(id);
       else mockBp.removed.add(id);
       return;
     }

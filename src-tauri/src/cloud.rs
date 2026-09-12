@@ -439,20 +439,19 @@ async fn reconcile(
 /// a row mid-fetch stops its downloads; a stalled row simply retires.
 async fn vanish_row(state: &AppState, row: &CloudLedgerRow) {
     let conn = state.db.lock().await;
+    // the row's fate first, cleanup only once it is settled: a fetch that
+    // completed the row since the snapshot keeps its record and its files
     let moved = match row.state.as_str() {
         "stalled" => db::ledger_transition(&conn, row.id, &["stalled"], "removed"),
-        "fetching" => {
-            state.cloud.cancel_fetches(row.id);
-            let fetches = db::cloud_fetch_for_ledger(&conn, row.id);
-            drop_parts(&fetches);
-            db::cloud_fetch_delete_for_ledger(&conn, row.id);
-            db::ledger_transition(&conn, row.id, &["fetching"], "removed")
-        }
+        "fetching" => db::ledger_transition(&conn, row.id, &["fetching"], "removed"),
         _ => db::ledger_confirm_missing(&conn, row.id, &row.ep_ids),
     };
     match moved {
         Ok(true) => {
             if row.state == "fetching" {
+                state.cloud.cancel_fetches(row.id);
+                drop_parts(&db::cloud_fetch_for_ledger(&conn, row.id));
+                db::cloud_fetch_delete_for_ledger(&conn, row.id);
                 db::set_episodes_state_by_ids(&conn, &row.ep_ids, "wanted", None);
             }
             if row.state != "stalled" {
@@ -538,16 +537,17 @@ async fn start_fetch(
     let dest_root = resolve_dest_root(&cfg, row.save_path.as_deref());
     let plan = match plan_files(bp, t).await {
         Ok(p) => p,
-        // the transfer is done; a network hiccup or a rejected token on the
-        // listing is not the release's fault — try again next poll.
-        // Anything Bitport itself says about the files is final.
-        Err(AppError::Http(e)) => {
-            crate::applog::warn("bitport", format!("could not list the files of {} yet: {e}", short(&row.title)));
+        // the transfer is done; a listing that failed for any reason other
+        // than a verdict about the files themselves is not the release's
+        // fault — try again next poll
+        Err(PlanError::Retry(e)) => {
+            if !matches!(e, AppError::BitportAuth) {
+                crate::applog::warn("bitport", format!("could not list the files of {} yet: {e}", short(&row.title)));
+            }
             return;
         }
-        Err(AppError::BitportAuth) => return,
-        Err(e) => {
-            stall_row(app, state, row, &e.to_string()).await;
+        Err(PlanError::Definitive(reason)) => {
+            stall_row(app, state, row, &reason).await;
             return;
         }
     };
@@ -619,22 +619,43 @@ pub struct PlannedFile {
     pub size: i64,
 }
 
-async fn plan_files(bp: &BitportClient<'_>, t: &BitportTransfer) -> Result<Vec<PlannedFile>> {
+/// Why a finished transfer could not be turned into a fetch plan.
+enum PlanError {
+    /// the listing itself failed (network, a rejected token, a Bitport
+    /// hiccup in an envelope) — nothing is known about the files yet
+    Retry(AppError),
+    /// Bitport answered and the answer rules the files out
+    Definitive(String),
+}
+
+/// A listing error is a verdict on the files only when Bitport says the
+/// folder or file is gone; everything else (rate limits and gateway errors
+/// arrive as envelopes too) deserves another try.
+fn classify_listing_error(e: AppError) -> PlanError {
+    let msg = e.to_string().to_ascii_lowercase();
+    if msg.contains("not found") || msg.contains("not owned") || msg.contains("not your file") {
+        PlanError::Definitive("its files are no longer in the cloud".into())
+    } else {
+        PlanError::Retry(e)
+    }
+}
+
+async fn plan_files(bp: &BitportClient<'_>, t: &BitportTransfer) -> std::result::Result<Vec<PlannedFile>, PlanError> {
     if let Some(folder) = t.folder_id.as_deref() {
-        let tree = bp.folder(folder, true).await?;
+        let tree = bp.folder(folder, true).await.map_err(classify_listing_error)?;
         return Ok(plan_folder(&tree));
     }
     if let Some(file) = t.file_id.as_deref() {
-        let f = bp.file_info(file).await?;
+        let f = bp.file_info(file).await.map_err(classify_listing_error)?;
         if f.virus != 0 {
-            return Err(AppError::Other(format!("Bitport flagged {} as unsafe (virus scan)", f.name)));
+            return Err(PlanError::Definitive(format!("Bitport flagged {} as unsafe (virus scan)", f.name)));
         }
         if f.size <= 0 {
             return Ok(vec![]);
         }
         return Ok(vec![PlannedFile { code: f.code, rel_path: sanitize_component(&f.name), size: f.size }]);
     }
-    Err(AppError::Other("the finished transfer points at neither a file nor a folder".into()))
+    Err(PlanError::Definitive("the finished transfer points at neither a file nor a folder".into()))
 }
 
 /// Mirror the transfer's folder under the destination, the way qBittorrent
@@ -1305,11 +1326,21 @@ pub async fn locate_new_transfer(bp: &BitportClient<'_>, info_hash: &str) -> Opt
 
 // ---------- user actions ----------
 
-/// Give a grab's failed files another go.
+/// Give a grab another go: failed files are queued again, and a stalled
+/// grab goes back to the cloud phase so the next poll re-reads the
+/// transfer (a Bitport hiccup while listing the files must not be the
+/// end of it). Returns how many things were retried.
 pub async fn retry(state: &AppState, ledger_id: i64) -> Result<usize> {
     let n = {
         let conn = state.db.lock().await;
-        db::cloud_fetch_reset_failed(&conn, ledger_id)
+        let files = db::cloud_fetch_reset_failed(&conn, ledger_id);
+        let row = if db::ledger_transition(&conn, ledger_id, &["stalled"], "grabbed")? {
+            db::ledger_set_note(&conn, ledger_id, "");
+            1
+        } else {
+            0
+        };
+        files + row
     };
     state.cloud.fetch_wake.notify_one();
     state.cloud.wake.notify_one();
@@ -1590,7 +1621,8 @@ fn build_item(
         cloud_status: transfer.map(|t| t.status.clone()).unwrap_or_else(|| "waiting".into()),
         cloud_progress: transfer.map(|t| t.progress).unwrap_or(0.0),
         message: transfer.and_then(|t| t.message.clone()),
-        cloud_copy: transfer.is_some(),
+        // a completed row can only act on a copy it can name by token
+        cloud_copy: transfer.is_some() && (row.state != "completed" || row.bp_token.is_some()),
         files_total: 0,
         files_done: 0,
         files_failed: 0,
@@ -1633,6 +1665,7 @@ fn build_item(
             item.error = row
                 .note
                 .clone()
+                .filter(|n| !n.is_empty())
                 .or_else(|| item.error.clone())
                 .or_else(|| item.message.clone())
                 .or_else(|| Some("Bitport could not deliver this release".into()));

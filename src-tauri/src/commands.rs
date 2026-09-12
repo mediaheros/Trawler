@@ -1338,6 +1338,9 @@ pub async fn bitport_delete(state: State<'_, AppState>, token: String) -> Result
         // in this listing — an older same-hash transfer is not it
         let hash_match = row.bp_token.is_none()
             && row.state != "dispatching"
+            // a grab whose transfer the listing has not shown yet is still
+            // in flight for the poller: leave it to be bound first
+            && row.ts < crate::db::now() - 5 * 60
             && matches!((&row.info_hash, &vic_hash), (Some(a), Some(b)) if a.eq_ignore_ascii_case(b));
         if tok_match || hash_match {
             let moved = crate::db::ledger_transition(

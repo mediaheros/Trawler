@@ -453,31 +453,6 @@ pub fn ledger_adopt_episodes(conn: &Connection, content_key: &str, ep_ids: &[i64
     Ok(true)
 }
 
-/// Release every open claim held by one backend (the user disconnected the
-/// account): the rows go to 'removed' and their episodes back to 'wanted',
-/// so the content can be grabbed again through whatever backend remains.
-pub fn ledger_release_backend(conn: &Connection, backend: &str) -> Result<usize> {
-    let rows: Vec<(i64, Option<String>)> = {
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, ep_ids FROM grab_ledger WHERE backend = ?1 AND state IN ('dispatching','grabbed')",
-            )
-            .map_err(db_err)?;
-        let rows = stmt
-            .query_map([backend], |r| Ok((r.get(0)?, r.get(1)?)))
-            .map_err(db_err)?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(db_err)?;
-        rows
-    };
-    for (id, ep_ids) in &rows {
-        conn.execute("UPDATE grab_ledger SET state = 'removed' WHERE id = ?1", [id])
-            .map_err(db_err)?;
-        set_episodes_state_by_ids(conn, &parse_ep_ids(ep_ids.as_deref()), "wanted", None);
-    }
-    Ok(rows.len())
-}
-
 pub fn ledger_finish_dispatch(
     conn: &Connection,
     content_key: &str,
@@ -1614,23 +1589,31 @@ mod tests {
     }
 
     #[test]
-    fn disconnecting_bitport_releases_its_open_claims() {
+    fn guarded_transitions_move_only_from_expected_states() {
         let conn = ledger_with_episodes();
+        // the cloud read model selects the two columns the migrations add
+        conn.execute_batch(
+            "ALTER TABLE grab_ledger ADD COLUMN save_path TEXT;
+             ALTER TABLE grab_ledger ADD COLUMN note TEXT;",
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO grab_ledger (content_key, title, size, state, ts, ep_ids, backend)
-             VALUES ('tv:show:s01e01', 'Show.S01E01', 10, 'grabbed', 1, '[7]', 'bitport'),
-                    ('tv:show:s01e02', 'Show.S01E02', 10, 'completed', 1, '[8]', 'bitport'),
-                    ('tv:show:s01e03', 'Show.S01E03', 10, 'grabbed', 1, '[9]', 'qbittorrent')",
+             VALUES ('tv:show:s01e01', 'Show.S01E01', 10, 'fetching', 1, '[7]', 'bitport'),
+                    ('tv:show:s01e02', 'Show.S01E02', 10, 'deleted', 1, '[8]', 'bitport')",
             [],
         )
         .unwrap();
-        conn.execute("UPDATE episodes SET state = 'grabbed', grabbed_title = 'x'", []).unwrap();
-        let released = super::ledger_release_backend(&conn, "bitport").unwrap();
-        assert_eq!(released, 1, "only open cloud claims are released");
-        assert_eq!(ep_state(&conn, 7), "wanted");
-        assert_eq!(ep_state(&conn, 8), "grabbed", "completed cloud content stays as it is");
-        assert_eq!(ep_state(&conn, 9), "grabbed", "local grabs are untouched");
-        assert!(!ledger_satisfied(&conn, "tv:show:s01e01"));
+        // a removed row is never resurrected by a pass working from a stale snapshot
+        assert!(!super::ledger_transition(&conn, 2, &["fetching", "grabbed"], "completed").unwrap());
+        assert!(super::ledger_transition(&conn, 1, &["fetching"], "completed").unwrap());
+        assert!(!super::ledger_transition(&conn, 1, &["fetching"], "removed").unwrap(), "already moved on");
+        assert!(!super::ledger_transition(&conn, 1, &[], "removed").unwrap(), "an empty from-list moves nothing");
+        // fetching counts as an active claim: nothing may double-grab it
+        let rows = super::cloud_ledger_rows(&conn, &["completed"]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ep_ids, vec![7]);
+        assert!(ledger_satisfied(&conn, "tv:show:s01e01"));
     }
 
     #[test]

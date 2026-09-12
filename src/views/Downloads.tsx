@@ -94,7 +94,14 @@ export default function DownloadsView() {
       }
       removedRef.current.set(`l:${item.ledgerId}`, Date.now());
       setData((d) => (d ? { ...d, cloud: { ...d.cloud, items: d.cloud.items.filter((x) => x.ledgerId !== item.ledgerId) } } : d));
-      toast(item.phase === "done" ? `Hid ${item.title}` : `Removed ${item.title} from Trawler and Bitport`, "info");
+      toast(
+        item.phase === "done"
+          ? `Hid ${item.title}`
+          : item.cloudCopy && item.token
+            ? `Removed ${item.title} from Trawler and Bitport`
+            : `Removed ${item.title}`,
+        "info",
+      );
     } catch (e) {
       toast(String(e), "bad");
     }
@@ -215,6 +222,15 @@ export default function DownloadsView() {
                   <CloudGrabCard key={item.ledgerId} item={item} onRetry={retryCloud} onRemove={removeCloud} />
                 ))}
               </>
+            )}
+            {scope === "trawler" && cloudOthers.length > 0 && (
+              <button
+                type="button"
+                onClick={() => setScope("all")}
+                className="mt-3 cursor-pointer text-[11px] text-faint underline decoration-line2 underline-offset-2 hover:text-dim"
+              >
+                {cloudOthers.length} other transfer{cloudOthers.length === 1 ? "" : "s"} in your Bitport cloud — show everything
+              </button>
             )}
             {showOthers && (
               <>

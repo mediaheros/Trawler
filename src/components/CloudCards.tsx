@@ -131,8 +131,13 @@ export function CloudGrabCard({
               <FolderOpen size={14} />
             </Button>
           )}
-          {phase === "error" && item.filesFailed > 0 && (
-            <Button variant="ghost" className="px-2 py-1.5" title="Try the failed files again" onClick={() => onRetry(item)}>
+          {phase === "error" && (
+            <Button
+              variant="ghost"
+              className="px-2 py-1.5"
+              title={item.filesFailed > 0 ? "Try the failed files again" : "Try again — re-reads the transfer from Bitport"}
+              onClick={() => onRetry(item)}
+            >
               <RotateCcw size={14} />
             </Button>
           )}
