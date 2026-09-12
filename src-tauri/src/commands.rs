@@ -1330,22 +1330,38 @@ pub async fn bitport_delete(state: State<'_, AppState>, token: String) -> Result
     // different transfer, and Trawler's own must keep running. A row that
     // already knows its token matches by token alone: an older transfer of
     // the same release is not it.
-    for row in crate::db::cloud_ledger_rows(&conn, &["dispatching", "grabbed", "fetching", "completed", "stalled"]) {
+    for row in crate::db::cloud_ledger_rows(&conn, &["dispatching", "grabbed", "fetching", "stalled"]) {
+        // (a completed row keeps its record: the files are on disk whatever
+        // happens to the cloud copy)
         let tok_match = row.bp_token.as_deref() == Some(token.as_str());
+        // a grab still being sent has no token yet and its transfer is not
+        // in this listing — an older same-hash transfer is not it
         let hash_match = row.bp_token.is_none()
+            && row.state != "dispatching"
             && matches!((&row.info_hash, &vic_hash), (Some(a), Some(b)) if a.eq_ignore_ascii_case(b));
         if tok_match || hash_match {
-            state.cloud.cancel_fetches(row.id);
-            crate::db::cloud_fetch_delete_for_ledger(&conn, row.id);
-            let was_open = row.state != "completed";
             let moved = crate::db::ledger_transition(
                 &conn,
                 row.id,
-                &["dispatching", "grabbed", "fetching", "completed", "stalled"],
+                &["dispatching", "grabbed", "fetching", "stalled"],
                 "deleted",
             )
             .unwrap_or(false);
-            if moved && was_open && row.state != "stalled" {
+            if !moved {
+                continue;
+            }
+            state.cloud.cancel_fetches(row.id);
+            let fetches = crate::db::cloud_fetch_for_ledger(&conn, row.id);
+            for f in &fetches {
+                if f.state != "done" {
+                    let final_path = std::path::Path::new(&f.dest_dir).join(&f.rel_path);
+                    let mut part = final_path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+                    part.push(".part");
+                    let _ = std::fs::remove_file(final_path.with_file_name(part));
+                }
+            }
+            crate::db::cloud_fetch_delete_for_ledger(&conn, row.id);
+            if row.state != "stalled" {
                 crate::db::set_episodes_state_by_ids(&conn, &row.ep_ids, "wanted", None);
             }
             freed_name = Some(row.title);

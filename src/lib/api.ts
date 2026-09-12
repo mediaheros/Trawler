@@ -779,9 +779,12 @@ const mockBp = {
   connected: false,
   deleted: new Set<string>(),
   removed: new Set<number>(),
+  cloudDeleted: new Set<number>(),
   retried: new Set<number>(),
   startedAt: Date.now(),
 };
+/** demo items that are finished, for cloud_remove's keep-the-card rule */
+const mockDoneIds = new Set([902, 903]);
 
 function mockBpStatus(): BitportStatus {
   return mockBp.connected
@@ -812,8 +815,12 @@ function mockCloudView(): CloudView {
     { ledgerId: 902, title: "28.Years.Later.2025.1080p.WEB-DL.HEVC.x265.5.1-BONE", token: "bp3", phase: fetching ? "fetching" : "done", cloudStatus: "finished", cloudProgress: 100, message: null, cloudCopy: fetching, filesTotal: 2, filesDone: fetching ? 1 : 2, filesFailed: 0, bytesTotal: fetchTotal, bytesDone: fetchDone, speed: fetching ? 38_000_000 : 0, localPath: "D:\\Media\\Movies\\28.Years.Later.2025.1080p.WEB-DL.HEVC.x265.5.1-BONE", error: null, ts: now - 1800 },
     { ledgerId: 903, title: "Andor.S02E03.Harvest.1080p.HEVC.x265-MeGusta", token: "bp4", phase: "done", cloudStatus: "finished", cloudProgress: 100, message: null, cloudCopy: true, filesTotal: 1, filesDone: 1, filesFailed: 0, bytesTotal: 664_179_969, bytesDone: 664_179_969, speed: 0, localPath: "D:\\Media\\TV\\Andor.S02E03.Harvest.1080p.HEVC.x265-MeGusta.mkv", error: null, ts: now - 7200 },
     { ledgerId: 904, title: "Citizen.Vigilante.2026.1080p.WEBRip.10Bit.DDP5.1.x265-NeoNoir", token: "bp5", phase: "error", cloudStatus: "error", cloudProgress: 0, message: "No peers found", cloudCopy: true, filesTotal: 0, filesDone: 0, filesFailed: 0, bytesTotal: 2_013_234_133, bytesDone: 0, speed: 0, localPath: null, error: "No peers found", ts: now - 10800 },
+    // a local fetch that gave up on one file: the Retry action's home in the demo
+    { ledgerId: 905, title: "Daredevil.Born.Again.S01E01.1080p.WEB.h264-successfulcrab", token: "bp6", phase: mockBp.retried.has(905) ? "fetching" : "error", cloudStatus: "finished", cloudProgress: 100, message: null, cloudCopy: true, filesTotal: 3, filesDone: 2, filesFailed: mockBp.retried.has(905) ? 0 : 1, bytesTotal: 2_421_552_513, bytesDone: 2_300_000_000, speed: 0, localPath: "D:\\Media\\TV\\Daredevil.Born.Again.S01E01.1080p.WEB.h264-successfulcrab", error: mockBp.retried.has(905) ? null : "checksum mismatch (expected 9b238312, got 1f00aa07) — the file was discarded", ts: now - 14400 },
   ] satisfies CloudItem[];
-  const items: CloudItem[] = all.filter((i) => !mockBp.removed.has(i.ledgerId));
+  const items: CloudItem[] = all
+    .filter((i) => !mockBp.removed.has(i.ledgerId))
+    .map((i) => (mockBp.cloudDeleted.has(i.ledgerId) ? { ...i, cloudCopy: false } : i));
   return {
     connected: true,
     authFailed: false,
@@ -1136,9 +1143,13 @@ async function mock(cmd: string, args?: Record<string, unknown>): Promise<unknow
     case "cloud_retry":
       mockBp.retried.add(Number((args as { ledgerId?: number })?.ledgerId));
       return 1;
-    case "cloud_remove":
-      mockBp.removed.add(Number((args as { ledgerId?: number })?.ledgerId));
+    case "cloud_remove": {
+      const id = Number((args as { ledgerId?: number })?.ledgerId);
+      // a done grab losing its cloud copy keeps its card, as the real backend does
+      if ((args as { deleteCloud?: boolean })?.deleteCloud && mockDoneIds.has(id)) mockBp.cloudDeleted.add(id);
+      else mockBp.removed.add(id);
       return;
+    }
     case "logs_recent": {
       const now = Date.now() / 1000;
       return [

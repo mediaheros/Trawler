@@ -490,7 +490,9 @@ fn drop_parts(fetches: &[CloudFetchRow]) {
 async fn stall_row(app: &tauri::AppHandle, state: &AppState, row: &CloudLedgerRow, reason: &str) {
     let moved = {
         let conn = state.db.lock().await;
-        match db::ledger_transition(&conn, row.id, &["dispatching", "grabbed", "fetching"], "stalled") {
+        // (a fetching row never stalls: its files are handled per file and
+        // wait for the user's retry or remove)
+        match db::ledger_transition(&conn, row.id, &["dispatching", "grabbed"], "stalled") {
             Ok(true) => {
                 db::ledger_set_note(&conn, row.id, reason);
                 db::set_episodes_state_by_ids(&conn, &row.ep_ids, "wanted", None);
@@ -1315,16 +1317,24 @@ pub async fn retry(state: &AppState, ledger_id: i64) -> Result<usize> {
 }
 
 /// Delete a transfer from the cloud on the user's behalf. "Already gone" is
-/// the outcome we wanted, whatever Bitport's wording; a rejected token
-/// cannot delete anything, so it is reported as such.
+/// the outcome we wanted, whatever Bitport's wording — but only a listing
+/// that has actually been taken can vouch for "gone"; before the first one
+/// every failure is a failure. A rejected token cannot delete anything.
 async fn delete_cloud_transfer(state: &AppState, cfg: &Config, token: &str) -> Result<()> {
     if cfg.bitport_token.is_empty() {
         return Err(AppError::BitportAuth);
     }
     if let Err(e) = client(&state.http, cfg).delete_transfer(token).await {
-        let still_listed = state.cloud.snapshot.read().await.transfers.iter().any(|t| t.token == token);
+        if matches!(e, AppError::BitportAuth) {
+            return Err(e);
+        }
+        let (listed_once, still_listed) = {
+            let snap = state.cloud.snapshot.read().await;
+            (snap.fetched_at > 0, snap.transfers.iter().any(|t| t.token == token))
+        };
         let msg = e.to_string().to_ascii_lowercase();
-        if still_listed && !msg.contains("not found") && !msg.contains("not owned") {
+        let gone_by_wording = msg.contains("not found") || msg.contains("not owned");
+        if !gone_by_wording && (still_listed || !listed_once) {
             return Err(e);
         }
     }
@@ -1348,15 +1358,12 @@ pub async fn remove(state: &AppState, ledger_id: i64, delete_cloud: bool) -> Res
             .find(|r| r.id == ledger_id)
             .ok_or_else(|| AppError::Other("that cloud grab is no longer listed".into()))?
     };
-    // a row that never learned its token (a grab still being sent) may
-    // still be findable in the last listing by hash or name
-    let token = match row.bp_token.clone() {
-        Some(t) => Some(t),
-        None => {
-            let snap = state.cloud.snapshot.read().await;
-            Listing::new(&snap.transfers).find(&row).map(|t| t.token.clone())
-        }
-    };
+    // Only a token the row itself learned identifies its transfer. Guessing
+    // from the last listing by hash or name could pick an OLDER transfer of
+    // the same release (a kept cloud copy) while the new one is still being
+    // sent; a row without a token simply leaves its transfer alone — the
+    // poller lists it as an orphan under "also in your cloud" later.
+    let token = row.bp_token.clone();
     if row.state == "completed" {
         if delete_cloud {
             let tok = token.ok_or_else(|| AppError::Other("Trawler does not know this grab's cloud transfer any more".into()))?;
@@ -1373,38 +1380,46 @@ pub async fn remove(state: &AppState, ledger_id: i64, delete_cloud: bool) -> Res
     // the cloud delete is the fallible step, so it goes first: a grab whose
     // transfer could not be removed must keep downloading, not be left
     // half-cancelled. A dead token cannot delete anything — the user is
-    // removing the grab on this side, so that proceeds.
+    // removing the grab on this side, so that proceeds, and the log says
+    // what actually happened.
+    let mut cloud_deleted = false;
     if delete_cloud {
         if let Some(tok) = token.as_deref() {
             match delete_cloud_transfer(state, &cfg, tok).await {
-                Ok(()) | Err(AppError::BitportAuth) => {}
+                Ok(()) => cloud_deleted = true,
+                Err(AppError::BitportAuth) => {}
                 Err(e) => return Err(e),
             }
         }
     }
-    // point of no return: downloads stop, partial files go
-    state.cloud.cancel_fetches(ledger_id);
     let conn = state.db.lock().await;
-    let fetches = db::cloud_fetch_for_ledger(&conn, ledger_id);
-    drop_parts(&fetches);
-    db::cloud_fetch_delete_for_ledger(&conn, ledger_id);
     // side effects follow the state the row is in NOW, not when we looked
     let current = db::cloud_ledger_rows(&conn, &["dispatching", "grabbed", "fetching", "completed", "stalled"])
         .into_iter()
         .find(|r| r.id == ledger_id)
         .map(|r| r.state)
         .unwrap_or_default();
+    // the row's fate first; downloads and partial files only go once it is
+    // settled, so a failed UPDATE cannot leave a fetching row with nothing
+    // to fetch and a cancellation that never lifts
     let moved = db::ledger_transition(
         &conn,
         ledger_id,
         &["dispatching", "grabbed", "fetching", "completed", "stalled"],
         "deleted",
     )?;
-    if moved && current != "completed" && current != "stalled" {
+    if !moved {
+        state.cloud.wake.notify_one();
+        return Ok(());
+    }
+    state.cloud.cancel_fetches(ledger_id);
+    drop_parts(&db::cloud_fetch_for_ledger(&conn, ledger_id));
+    db::cloud_fetch_delete_for_ledger(&conn, ledger_id);
+    if current != "completed" && current != "stalled" {
         db::set_episodes_state_by_ids(&conn, &row.ep_ids, "wanted", None);
     }
-    if moved && current != "completed" {
-        let where_ = if delete_cloud && token.is_some() { "Removed from your cloud" } else { "Removed" };
+    if current != "completed" {
+        let where_ = if cloud_deleted { "Removed from your cloud" } else { "Removed" };
         db::log_activity(
             &conn,
             "system",
@@ -1424,17 +1439,23 @@ pub async fn release_all(state: &AppState) -> Result<(usize, usize)> {
     let conn = state.db.lock().await;
     let mut released = 0usize;
     let mut downloading = 0usize;
-    for row in db::cloud_ledger_rows(&conn, &["dispatching", "grabbed", "fetching"]) {
-        if row.state == "fetching" {
-            state.cloud.cancel_fetches(row.id);
-            drop_parts(&db::cloud_fetch_for_ledger(&conn, row.id));
-            db::cloud_fetch_delete_for_ledger(&conn, row.id);
+    for row in db::cloud_ledger_rows(&conn, &["dispatching", "grabbed", "fetching", "stalled"]) {
+        if !db::ledger_transition(&conn, row.id, &["dispatching", "grabbed", "fetching", "stalled"], "removed")? {
+            continue;
         }
-        if db::ledger_transition(&conn, row.id, &["dispatching", "grabbed", "fetching"], "removed")? {
-            db::set_episodes_state_by_ids(&conn, &row.ep_ids, "wanted", None);
-            if row.state == "fetching" {
+        match row.state.as_str() {
+            // a failed cloud grab has no card without a token; retiring it
+            // here also lifts its block on the release for qBittorrent
+            "stalled" => {}
+            "fetching" => {
+                state.cloud.cancel_fetches(row.id);
+                drop_parts(&db::cloud_fetch_for_ledger(&conn, row.id));
+                db::cloud_fetch_delete_for_ledger(&conn, row.id);
+                db::set_episodes_state_by_ids(&conn, &row.ep_ids, "wanted", None);
                 downloading += 1;
-            } else {
+            }
+            _ => {
+                db::set_episodes_state_by_ids(&conn, &row.ep_ids, "wanted", None);
                 released += 1;
             }
         }
@@ -1631,11 +1652,14 @@ fn build_item(
                 item.error = t.message.clone().or_else(|| Some("Bitport reported an error".into()));
                 "error".into()
             }
+            // finished on Bitport, not yet planned or completed here: the
+            // next poll moves it on. "done" is reserved for completed rows
+            // so the card's actions never outrun the record.
             Some(t) if t.is_finished() => {
                 if cfg.bitport_fetch_to_local {
                     "fetching".into()
                 } else {
-                    "done".into()
+                    "cloud".into()
                 }
             }
             Some(t) if t.status == "queued" => "queued".into(),

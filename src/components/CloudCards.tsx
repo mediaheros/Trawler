@@ -52,9 +52,19 @@ export function CloudGrabCard({
           ? 0
           : Math.min(100, item.cloudProgress);
   const eta = phase === "fetching" && item.speed > 0 ? Math.round((item.bytesTotal - item.bytesDone) / item.speed) : -1;
-  const Icon = phase === "done" ? CheckCircle2 : phase === "error" ? AlertTriangle : phase === "fetching" ? CloudDownload : Cloud;
-  const tone =
-    phase === "done" ? "text-ok" : phase === "error" ? "text-bad" : phase === "fetching" ? "text-accent" : "text-accent2";
+  // a done grab that lives nowhere any more (cloud copy deleted, nothing local)
+  const goneEverywhere = phase === "done" && !item.localPath && !item.cloudCopy;
+  const Icon =
+    goneEverywhere ? CloudOff : phase === "done" ? CheckCircle2 : phase === "error" ? AlertTriangle : phase === "fetching" ? CloudDownload : Cloud;
+  const tone = goneEverywhere
+    ? "text-faint"
+    : phase === "done"
+      ? "text-ok"
+      : phase === "error"
+        ? "text-bad"
+        : phase === "fetching"
+          ? "text-accent"
+          : "text-accent2";
 
   return (
     <div className="group rounded-(--radius-card) border border-line bg-bg1 px-4 py-3 transition-colors hover:border-line2">
@@ -70,7 +80,8 @@ export function CloudGrabCard({
               {phase === "queued" && "queued on Bitport"}
               {phase === "cloud" && (CLOUD_STATUS_LABEL[item.cloudStatus] ?? item.cloudStatus)}
               {phase === "fetching" && (item.speed > 0 ? "bringing the files here" : item.message ?? "waiting to fetch")}
-              {phase === "done" && (item.localPath ? "on this computer" : "finished in the cloud")}
+              {phase === "done" &&
+                (item.localPath ? "on this computer" : item.cloudCopy ? "finished in the cloud" : "deleted from the cloud")}
               {phase === "error" && (item.error ?? "failed")}
             </span>
             {phase === "cloud" && item.bytesTotal > 0 && <span className="font-mono">{fmtBytes(item.bytesTotal)}</span>}
@@ -159,9 +170,13 @@ export function CloudGrabCard({
                 ? confirm === "hide"
                   ? "Click again to hide (keeps the files)"
                   : "Hide (keeps the files)"
-                : confirm === "hide"
-                  ? "Click again to remove from Trawler and from Bitport"
-                  : "Remove from Trawler and from Bitport"
+                : item.cloudCopy
+                  ? confirm === "hide"
+                    ? "Click again to remove from Trawler and from Bitport"
+                    : "Remove from Trawler and from Bitport"
+                  : confirm === "hide"
+                    ? "Click again to remove from Trawler"
+                    : "Remove from Trawler"
             }
             onClick={() => {
               if (confirm !== "hide") {

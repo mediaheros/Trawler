@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AlertTriangle, Cloud } from "lucide-react";
 import { api, type BitportStatus, type Config } from "../lib/api";
 import { fmtBytes } from "../lib/format";
@@ -23,6 +23,10 @@ export default function BitportCard({
   const [busy, setBusy] = useState(false);
   const [waiting, setWaiting] = useState(false);
   const [manual, setManual] = useState(false);
+  // the connect flow can wait five minutes; the toast must read the picker
+  // as it is when the flow ends, not as it was when the button was clicked
+  const backendRef = useRef(draft.downloadBackend);
+  backendRef.current = draft.downloadBackend;
 
   useEffect(() => {
     let alive = true;
@@ -46,7 +50,7 @@ export default function BitportCard({
     const free = s.quota ? fmtBytes(s.quota.diskAvailable) + " free in the cloud" : "ready";
     // connected is not the same as used: grabs still go wherever the
     // picker says until the user moves it and saves
-    const hint = draft.downloadBackend === "bitport" ? "" : " — pick \"Bitport cloud\" below and Save to send grabs there";
+    const hint = backendRef.current === "bitport" ? "" : " — pick \"Bitport cloud\" below and Save to send grabs there";
     toast(`Bitport connected — ${free}${hint}`, "ok");
   };
 
