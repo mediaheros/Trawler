@@ -169,6 +169,28 @@ fn judge_callback(query: &str, expected_state: &str) -> CallbackVerdict {
     CallbackVerdict::Denied(denied.unwrap_or_else(|| "no code returned".into()))
 }
 
+/// Without a `state` echo the only thing separating Bitport's redirect from
+/// a script on some local page is the browser's own fetch metadata: a
+/// top-level navigation carries `Sec-Fetch-Mode: navigate` and
+/// `Sec-Fetch-Dest: document`, while `fetch()`, `<img>` and `<script>`
+/// probes carry cors/no-cors and image/script/empty. Headers absent (an
+/// old browser, curl) are accepted — this is a hurdle, not a proof.
+fn looks_like_navigation(request: &str) -> bool {
+    let mut mode: Option<String> = None;
+    let mut dest: Option<String> = None;
+    for line in request.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else { continue };
+        match name.trim().to_ascii_lowercase().as_str() {
+            "sec-fetch-mode" => mode = Some(value.trim().to_ascii_lowercase()),
+            "sec-fetch-dest" => dest = Some(value.trim().to_ascii_lowercase()),
+            _ => {}
+        }
+    }
+    let mode_ok = mode.as_deref().is_none_or(|m| m == "navigate");
+    let dest_ok = dest.as_deref().is_none_or(|d| d == "document");
+    mode_ok && dest_ok
+}
+
 /// Wait for the browser to hand back the authorization code. Ignores the
 /// stray requests browsers make (favicon, prefetch) and keeps listening.
 pub async fn await_code(
@@ -189,7 +211,13 @@ pub async fn await_code(
             Ok(Err(e)) => return Err(AppError::Other(format!("callback listener failed: {e}"))),
         };
         let mut buf = [0u8; 4096];
-        let n = sock.read(&mut buf).await.unwrap_or(0);
+        // a connection that never sends (a browser's speculative preconnect,
+        // a port scanner) must not park the whole flow — and the listener
+        // with it — until the app restarts
+        let n = match tokio::time::timeout(std::time::Duration::from_secs(5), sock.read(&mut buf)).await {
+            Ok(Ok(n)) => n,
+            _ => continue,
+        };
         let req = String::from_utf8_lossy(&buf[..n]);
         let target = req
             .lines()
@@ -200,6 +228,14 @@ pub async fn await_code(
             .unwrap_or("")
             .to_string();
         let query = target.split_once('?').map(|(_, q)| q).unwrap_or("");
+        if !looks_like_navigation(&req) {
+            // a fetch()/<img> from some page on this machine, not the
+            // browser following Bitport's redirect — never act on its code
+            let _ = sock
+                .write_all(callback_page(false, "Ignored", "This request did not come from a browser navigation.").as_bytes())
+                .await;
+            continue;
+        }
         match judge_callback(query, expected_state) {
             CallbackVerdict::ForeignState => {
                 let _ = sock
@@ -248,6 +284,9 @@ const BASE: &str = "https://api.bitport.io/v2";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BitportQuota {
+    /// the account e-mail — shown after connecting so a hijacked callback
+    /// (a code for someone else's account) is visible at a glance
+    pub account: Option<String>,
     pub plan_name: String,
     pub plan_expired: bool,
     /// "YYYY-MM-DD HH:MM:SS" in UTC, as Bitport reports it
@@ -511,8 +550,18 @@ impl BitportClient<'_> {
     }
 }
 
+/// An integer that may arrive as a JSON number or as a numeric string.
+fn json_i64(v: Option<&serde_json::Value>) -> Option<i64> {
+    match v? {
+        serde_json::Value::Number(n) => n.as_i64(),
+        serde_json::Value::String(s) => s.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
 fn parse_quota(d: &serde_json::Value) -> BitportQuota {
     BitportQuota {
+        account: d.get("email").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(String::from),
         plan_name: d.get("plan_name").and_then(|v| v.as_str()).unwrap_or("?").into(),
         plan_expired: d.get("plan_expired").and_then(|v| v.as_bool()).unwrap_or(false),
         plan_expiration: d
@@ -611,7 +660,7 @@ fn parse_file(v: &serde_json::Value) -> Option<CloudFile> {
     Some(CloudFile {
         code,
         name: v.get("name").and_then(|n| n.as_str()).unwrap_or("(unnamed)").to_string(),
-        size: v.get("size").and_then(|s| s.as_i64()).unwrap_or(0),
+        size: json_i64(v.get("size")).unwrap_or(0),
         kind: v.get("type").and_then(|s| s.as_str()).unwrap_or("other").to_string(),
         download_url: v.get("download_url").and_then(|s| s.as_str()).filter(|s| !s.is_empty()).map(String::from),
         crc32: v
@@ -619,7 +668,7 @@ fn parse_file(v: &serde_json::Value) -> Option<CloudFile> {
             .and_then(|s| s.as_str())
             .filter(|s| s.len() == 8 && s.bytes().all(|b| b.is_ascii_hexdigit()))
             .map(|s| s.to_ascii_lowercase()),
-        virus: v.get("virus").and_then(|s| s.as_i64()).unwrap_or(0),
+        virus: json_i64(v.get("virus")).unwrap_or(0),
     })
 }
 
@@ -706,6 +755,18 @@ mod tests {
             judge_callback("error=access_denied&error_description=User+said+no", "expected"),
             CallbackVerdict::Denied("User said no".into())
         );
+    }
+
+    #[test]
+    fn only_browser_navigations_may_deliver_a_code() {
+        let nav = "GET /bitport-callback?code=x HTTP/1.1\r\nHost: 127.0.0.1:8788\r\nSec-Fetch-Mode: navigate\r\nSec-Fetch-Dest: document\r\nSec-Fetch-Site: cross-site\r\n\r\n";
+        assert!(looks_like_navigation(nav));
+        let plain = "GET /bitport-callback?code=x HTTP/1.1\r\nHost: 127.0.0.1:8788\r\n\r\n";
+        assert!(looks_like_navigation(plain), "no metadata at all is accepted");
+        let fetch = "GET /bitport-callback?code=x HTTP/1.1\r\nSec-Fetch-Mode: no-cors\r\nSec-Fetch-Dest: empty\r\n\r\n";
+        assert!(!looks_like_navigation(fetch));
+        let img = "GET /bitport-callback?code=x HTTP/1.1\r\nsec-fetch-mode: no-cors\r\nsec-fetch-dest: image\r\n\r\n";
+        assert!(!looks_like_navigation(img));
     }
 
     #[test]
@@ -844,12 +905,18 @@ mod tests {
         let file = parse_file(first_item(&info)).expect("parses");
         assert_eq!(file.crc32.as_deref(), Some("704ec3c2"));
 
+        assert_eq!(json_i64(Some(&serde_json::json!("129241752"))), Some(129241752));
+        assert_eq!(json_i64(Some(&serde_json::json!(7))), Some(7));
+        assert_eq!(json_i64(Some(&serde_json::json!(null))), None);
+
         let quota = parse_quota(&serde_json::json!({
+            "email": "you@example.com",
             "plan_name": "big", "plan_expired": false,
             "plan_expiration": {"date": "2027-08-16 00:00:00", "timezone_type": 3, "timezone": "UTC"},
             "disk": {"size": 1073741824000i64, "available": 343501989179i64, "used": 730239834821i64}
         }));
         assert_eq!(quota.plan_expiration.as_deref(), Some("2027-08-16 00:00:00"));
+        assert_eq!(quota.account.as_deref(), Some("you@example.com"));
         assert_eq!(quota.disk_available, 343501989179);
     }
 

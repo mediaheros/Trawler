@@ -1,9 +1,15 @@
 import { useState } from "react";
-import { AlertTriangle, CheckCircle2, Cloud, CloudDownload, FolderOpen, RotateCcw, Trash2 } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Cloud, CloudDownload, CloudOff, FolderOpen, RotateCcw, Trash2 } from "lucide-react";
 import type { BitportTransfer, CloudItem } from "../lib/api";
 import { fmtBytes, fmtEta, fmtSpeed } from "../lib/format";
 import { useStore } from "../store";
 import { Button, cx } from "../components/ui";
+
+/** fmtBytes renders 0 as a dash; a download that has not started yet is 0 B */
+const bytes = (n: number) => (n > 0 ? fmtBytes(n) : "0 B");
+
+/** the hover-revealed action strip, also revealed for keyboard focus */
+const ACTIONS = "flex shrink-0 items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100";
 
 /** Bitport's status words, in Trawler's voice. */
 const CLOUD_STATUS_LABEL: Record<string, string> = {
@@ -23,9 +29,15 @@ export function CloudGrabCard({
 }: {
   item: CloudItem;
   onRetry: (item: CloudItem) => void;
-  onRemove: (item: CloudItem) => void;
+  /** deleteCloud: also delete the transfer (and its files) from Bitport */
+  onRemove: (item: CloudItem, deleteCloud: boolean) => void;
 }) {
-  const [confirmRemove, setConfirmRemove] = useState(false);
+  // two-step confirmation, keyed by which action is pending
+  const [confirm, setConfirm] = useState<"hide" | "cloud" | null>(null);
+  const arm = (which: "hide" | "cloud") => {
+    setConfirm(which);
+    window.setTimeout(() => setConfirm((c) => (c === which ? null : c)), 2500);
+  };
   const phase = item.phase;
   // one bar, two meanings: Bitport's progress while it torrents, ours while
   // the files come down — the label says which
@@ -65,7 +77,7 @@ export function CloudGrabCard({
             {phase === "fetching" && (
               <>
                 <span className="font-mono">
-                  {fmtBytes(item.bytesDone)} / {fmtBytes(item.bytesTotal)}
+                  {bytes(item.bytesDone)} / {bytes(item.bytesTotal)}
                 </span>
                 {item.filesTotal > 1 && (
                   <span className="font-mono">
@@ -93,7 +105,7 @@ export function CloudGrabCard({
           </div>
         </div>
 
-        <div className="flex shrink-0 items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+        <div className={ACTIONS}>
           {phase === "done" && item.localPath && (
             <Button
               variant="ghost"
@@ -113,29 +125,46 @@ export function CloudGrabCard({
               <RotateCcw size={14} />
             </Button>
           )}
+          {phase === "done" && item.cloudCopy && (
+            // the cloud copy was kept (cleanup off, or it failed): free the quota
+            <Button
+              variant="ghost"
+              className="px-2 py-1.5 hover:text-bad"
+              title={confirm === "cloud" ? "Click again to delete the cloud copy (local files stay)" : "Delete the cloud copy (local files stay)"}
+              onClick={() => {
+                if (confirm !== "cloud") {
+                  arm("cloud");
+                  return;
+                }
+                setConfirm(null);
+                onRemove(item, true);
+              }}
+            >
+              {confirm === "cloud" ? <span className="text-[10.5px] font-semibold text-bad">sure?</span> : <CloudOff size={14} />}
+            </Button>
+          )}
           <Button
             variant="ghost"
             className="px-2 py-1.5 hover:text-bad"
             title={
               phase === "done"
-                ? confirmRemove
+                ? confirm === "hide"
                   ? "Click again to hide (keeps the files)"
                   : "Hide (keeps the files)"
-                : confirmRemove
+                : confirm === "hide"
                   ? "Click again to remove from Trawler and from Bitport"
                   : "Remove from Trawler and from Bitport"
             }
             onClick={() => {
-              if (!confirmRemove) {
-                setConfirmRemove(true);
-                window.setTimeout(() => setConfirmRemove(false), 2500);
+              if (confirm !== "hide") {
+                arm("hide");
                 return;
               }
-              setConfirmRemove(false);
-              onRemove(item);
+              setConfirm(null);
+              onRemove(item, phase !== "done");
             }}
           >
-            {confirmRemove ? <span className="text-[10.5px] font-semibold text-bad">sure?</span> : <Trash2 size={14} />}
+            {confirm === "hide" ? <span className="text-[10.5px] font-semibold text-bad">sure?</span> : <Trash2 size={14} />}
           </Button>
         </div>
 
@@ -187,13 +216,13 @@ export function OtherCloudCard({ t, onDelete }: { t: BitportTransfer; onDelete: 
           href="https://bitport.io/my-files"
           target="_blank"
           rel="noreferrer"
-          className="shrink-0 rounded-md bg-bg2 px-2 py-1 text-[11px] text-dim opacity-0 transition-all group-hover:opacity-100 hover:bg-bg3 hover:text-ink"
+          className="shrink-0 rounded-md bg-bg2 px-2 py-1 text-[11px] text-dim opacity-0 transition-all group-hover:opacity-100 group-focus-within:opacity-100 hover:bg-bg3 hover:text-ink"
         >
           Open in Bitport
         </a>
         <Button
           variant="ghost"
-          className="px-2 py-1.5 opacity-0 transition-opacity group-hover:opacity-100 hover:text-bad"
+          className="px-2 py-1.5 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100 hover:text-bad"
           title={confirm ? "Click again to delete from Bitport" : "Delete from Bitport"}
           onClick={() => {
             if (!confirm) {

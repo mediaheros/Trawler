@@ -69,11 +69,21 @@ pub async fn selected_backend_free_bytes(
             if !cfg.bitport_fetch_to_local {
                 return Ok(cloud);
             }
-            let dest = crate::cloud::resolve_dest_root(cfg, None);
-            match crate::cloud::local_free_bytes(&dest) {
-                Some(local) => Ok(cloud.min(local)),
-                None => Ok(cloud),
+            // this check has no grab in hand, so it looks at every place a
+            // fetch could land: the fallback folder and both save paths
+            let mut floor = cloud;
+            let mut candidates = vec![crate::cloud::resolve_dest_root(cfg, None)];
+            for p in [cfg.save_path_tv.trim(), cfg.save_path_movies.trim()] {
+                if !p.is_empty() {
+                    candidates.push(std::path::PathBuf::from(p));
+                }
             }
+            for dest in candidates {
+                if let Some(local) = crate::cloud::local_free_bytes(&dest) {
+                    floor = floor.min(local);
+                }
+            }
+            Ok(floor)
         },
         || async {
             let client = crate::qbit::QbitClient {

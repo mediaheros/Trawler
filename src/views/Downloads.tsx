@@ -31,6 +31,7 @@ export default function DownloadsView() {
   const [scope, setScope] = useState<"trawler" | "all">("trawler");
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
   const toast = useStore((s) => s.toast);
+  const config = useStore((s) => s.config);
 
   useEffect(() => {
     let alive = true;
@@ -78,15 +79,21 @@ export default function DownloadsView() {
     }
   };
 
-  const removeCloud = async (item: CloudItem) => {
-    // a finished grab only leaves the list; anything unfinished is taken
-    // out of the cloud too, so it stops eating quota
-    const deleteCloud = item.phase !== "done";
+  const removeCloud = async (item: CloudItem, deleteCloud: boolean) => {
+    // a finished grab only leaves the list (or drops its kept cloud copy);
+    // anything unfinished is taken out of the cloud too
     try {
       await api.cloudRemove(item.ledgerId, deleteCloud);
       removedRef.current.set(`l:${item.ledgerId}`, Date.now());
       setData((d) => (d ? { ...d, cloud: { ...d.cloud, items: d.cloud.items.filter((x) => x.ledgerId !== item.ledgerId) } } : d));
-      toast(deleteCloud ? `Removed ${item.title} from Trawler and Bitport` : `Hid ${item.title}`, "info");
+      toast(
+        item.phase === "done"
+          ? deleteCloud
+            ? `Deleted the cloud copy of ${item.title}`
+            : `Hid ${item.title}`
+          : `Removed ${item.title} from Trawler and Bitport`,
+        "info",
+      );
     } catch (e) {
       toast(String(e), "bad");
     }
@@ -107,6 +114,9 @@ export default function DownloadsView() {
   const cloudOthers = data?.cloud.others.filter((t) => !hidden(`t:${t.token}`)) ?? [];
   const showOthers = scope === "all" && cloudOthers.length > 0;
   const nothingAtAll = !!data && data.torrents.length === 0 && cloudItems.length === 0 && !showOthers;
+  // a cloud-only setup has no qBittorrent to reach: its silence is not a
+  // warning unless local torrents are actually expected
+  const cloudOnly = config?.downloadBackend === "bitport" && !!data?.cloud.connected && (data?.torrents.length ?? 0) === 0;
 
   return (
     <div className="flex h-full flex-col">
@@ -143,7 +153,7 @@ export default function DownloadsView() {
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto px-6 pb-6">
-        {(error ?? data?.qbitError) && data && (
+        {(error ?? data?.qbitError) && data && !cloudOnly && (
           <div className="mb-3 flex items-center gap-2 rounded-lg border border-warn/25 bg-warn/8 px-3 py-1.5 text-[11.5px] text-warn">
             qBittorrent didn't answer the last check — the local list may be stale
           </div>
@@ -166,15 +176,17 @@ export default function DownloadsView() {
               <div key={i} className="skeleton h-[74px] rounded-(--radius-card)" />
             ))}
           </div>
-        ) : data.qbitError && nothingAtAll ? (
+        ) : data.qbitError && nothingAtAll && !cloudOnly ? (
           <CenterMessage icon={<HardDrive size={28} />} title="Can't reach qBittorrent" body={data.qbitError} />
         ) : nothingAtAll ? (
           <CenterMessage
-            icon={<HardDrive size={28} />}
+            icon={cloudOnly ? <Cloud size={28} /> : <HardDrive size={28} />}
             title={scope === "trawler" ? "Nothing grabbed yet" : "No torrents"}
             body={
               scope === "trawler"
-                ? "Releases you grab land here, tagged with the trawler category."
+                ? cloudOnly
+                  ? "Releases you grab go to your Bitport cloud and land here on their way to this computer."
+                  : "Releases you grab land here, tagged with the trawler category."
                 : undefined
             }
           />

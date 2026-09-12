@@ -18,13 +18,27 @@ export default function BitportCard({
   const toast = useStore((s) => s.toast);
   const loadConfig = useStore((s) => s.loadConfig);
   const [status, setStatus] = useState<BitportStatus | null>(null);
+  const [statusError, setStatusError] = useState<string | null>(null);
   const [code, setCode] = useState("");
   const [busy, setBusy] = useState(false);
   const [waiting, setWaiting] = useState(false);
   const [manual, setManual] = useState(false);
 
   useEffect(() => {
-    void api.bitportStatus().then(setStatus).catch(() => {});
+    let alive = true;
+    api
+      .bitportStatus()
+      .then((s) => {
+        if (alive) setStatus(s);
+      })
+      // a failed probe must not masquerade as "not connected" — that would
+      // invite a second OAuth flow on top of a working account
+      .catch((e) => {
+        if (alive) setStatusError(String(e));
+      });
+    return () => {
+      alive = false;
+    };
   }, []);
 
   const announce = (s: BitportStatus) => {
@@ -80,7 +94,14 @@ export default function BitportCard({
       title="Bitport cloud"
       sub="Optional — Bitport does the torrenting on its servers; Trawler brings the finished files here over plain HTTPS"
     >
-      {status?.connected ? (
+      {statusError && !status ? (
+        <div className="flex items-center gap-2.5 rounded-lg border border-warn/25 bg-warn/8 px-3 py-2 text-[11.5px] text-warn">
+          <AlertTriangle size={14} className="shrink-0" />
+          <span className="min-w-0 flex-1 truncate" title={statusError}>
+            Couldn't read the Bitport connection state: {statusError}
+          </span>
+        </div>
+      ) : status?.connected ? (
         <div className="space-y-3.5">
           {status.authFailed && (
             <div className="flex items-center gap-2.5 rounded-lg border border-bad/30 bg-bad/8 px-3 py-2 text-[11.5px] text-bad">
@@ -98,6 +119,11 @@ export default function BitportCard({
             <div>
               <div className="flex items-baseline justify-between text-[11.5px]">
                 <span className="text-dim">
+                  {quota.account && (
+                    <span className="mr-2 font-mono text-ink" title="The Bitport account Trawler is connected to">
+                      {quota.account}
+                    </span>
+                  )}
                   Plan <span className="font-medium text-ink">{quota.planName}</span>
                   {quota.planExpired ? (
                     <span className="ml-1.5 text-bad">expired</span>
@@ -127,7 +153,9 @@ export default function BitportCard({
             </div>
           )}
 
-          <Field label="Where do grabs go?" hint="Applies after Save — every grab path honors it">
+          {/* not a <label>: a label's click would land on the first button and flip the choice */}
+          <div>
+            <div className="mb-1 text-[11.5px] font-medium text-dim">Where do grabs go?</div>
             <Segmented
               value={draft.downloadBackend === "bitport" ? "bitport" : "qbittorrent"}
               onChange={(b) => set({ downloadBackend: b })}
@@ -136,7 +164,8 @@ export default function BitportCard({
                 { value: "bitport", label: "Bitport cloud" },
               ]}
             />
-          </Field>
+            <div className="mt-1 text-[11px] text-faint">Applies after Save — every grab path honors it</div>
+          </div>
 
           <div className="space-y-2 rounded-lg border border-line bg-bg2/40 px-3 py-2.5">
             <div className="text-[11.5px] font-medium text-dim">When Bitport finishes a transfer</div>
@@ -164,6 +193,7 @@ export default function BitportCard({
               <input
                 type="checkbox"
                 checked={draft.bitportFetchToLocal && draft.bitportDeleteAfterFetch}
+                disabled={!draft.bitportFetchToLocal}
                 onChange={(e) => set({ bitportDeleteAfterFetch: e.target.checked })}
                 className="mt-0.5 size-3.5 accent-(--color-accent)"
               />

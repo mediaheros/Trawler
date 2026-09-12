@@ -48,16 +48,23 @@ impl RetiredReleases {
 
 fn retired_releases(conn: &rusqlite::Connection) -> RetiredReleases {
     let mut out = RetiredReleases { titles: Default::default(), hashes: Default::default() };
+    // both backends: a release Bitport gave up on must leave the ranking
+    // just like a dead local swarm, or the planner picks it again every
+    // cycle only for the dispatcher to refuse it (episodes flapping
+    // grabbed → wanted each time)
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT title, info_hash FROM grab_ledger WHERE state = 'stalled' AND backend = 'qbittorrent'",
+        "SELECT title, info_hash, backend FROM grab_ledger WHERE state = 'stalled'",
     ) {
         let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, String>(2)?))
+            })
             .map(|it| it.flatten().collect::<Vec<_>>())
             .unwrap_or_default();
-        for (title, hash) in rows {
+        for (title, hash, backend) in rows {
             out.titles.insert(normalize(&title));
-            if let Some(h) = hash.filter(|h| qbt_comparable_hash(h)) {
+            // cloud rows carry the magnet's btih, always comparable
+            if let Some(h) = hash.filter(|h| backend != "qbittorrent" || qbt_comparable_hash(h)) {
                 out.hashes.insert(h.to_ascii_lowercase());
             }
         }

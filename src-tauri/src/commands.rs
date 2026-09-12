@@ -1294,18 +1294,26 @@ pub async fn bitport_delete(state: State<'_, AppState>, token: String) -> Result
         snap.transfers.retain(|t| t.token != token);
     }
     let vic_hash = victim.as_ref().and_then(crate::bitport::transfer_hash);
-    let vic_norm = victim.as_ref().map(|t| normalize(&t.name));
     let conn = state.db.lock().await;
     let mut freed_name: Option<String> = None;
-    for row in crate::db::cloud_ledger_rows(&conn, &["dispatching", "grabbed", "fetching", "completed"]) {
+    // identity only — a same-named transfer the user added by hand is a
+    // different transfer, and Trawler's own must keep running
+    for row in crate::db::cloud_ledger_rows(&conn, &["dispatching", "grabbed", "fetching", "completed", "stalled"]) {
         let tok_match = row.bp_token.as_deref() == Some(token.as_str());
         let hash_match =
             matches!((&row.info_hash, &vic_hash), (Some(a), Some(b)) if a.eq_ignore_ascii_case(b));
-        let norm_match = vic_norm.as_ref().is_some_and(|n| &normalize(&row.title) == n);
-        if tok_match || hash_match || norm_match {
+        if tok_match || hash_match {
+            state.cloud.cancel_fetches(row.id);
             crate::db::cloud_fetch_delete_for_ledger(&conn, row.id);
-            let _ = crate::db::ledger_set_state(&conn, row.id, "deleted");
-            if row.state != "completed" {
+            let was_open = row.state != "completed";
+            let moved = crate::db::ledger_transition(
+                &conn,
+                row.id,
+                &["dispatching", "grabbed", "fetching", "completed", "stalled"],
+                "deleted",
+            )
+            .unwrap_or(false);
+            if moved && was_open && row.state != "stalled" {
                 crate::db::set_episodes_state_by_ids(&conn, &row.ep_ids, "wanted", None);
             }
             freed_name = Some(row.title);

@@ -5,8 +5,9 @@
 //! Lifecycle of a cloud grab (ledger states, `backend = 'bitport'`):
 //!
 //!   dispatching ─► grabbed ─► fetching ─► completed
-//!        │            │
-//!        │            └─► stalled   (Bitport reported `error`)
+//!        │            │           │
+//!        │            └─► stalled ┘  (Bitport reported `error`, or the
+//!        │                            files could not be listed/fetched)
 //!        └─► removed / deleted      (vanished from the account / user)
 //!
 //! `grabbed` means Bitport is torrenting. `fetching` means every file of the
@@ -14,6 +15,11 @@
 //! them into the grab's save path. Only a verified local copy makes an
 //! episode `downloaded` — the cloud alone never does (unless the user turns
 //! local fetching off in Settings).
+//!
+//! Every state change goes through `db::ledger_transition`, which moves a
+//! row only from an expected prior state: the poller and the fetcher work
+//! from snapshots taken before their awaits, and a grab the user removed in
+//! the meantime must stay removed.
 //!
 //! Traffic discipline: the transfer listing is the whole account history
 //! (140 KB on a real account, no pagination), so it is polled every
@@ -52,6 +58,13 @@ const VIEW_ACTIVE_SECS: i64 = 45;
 const SHOW_COMPLETED_SECS: i64 = 7 * 86_400;
 /// headroom demanded on the local disk beyond the file itself
 const LOCAL_DISK_MARGIN: i64 = 200 * 1024 * 1024;
+/// a dispatching row younger than this belongs to a grab still in flight:
+/// the dispatcher has not finished writing it and the transfer may not be
+/// listed yet — the poller leaves it alone entirely
+const DISPATCH_GRACE_SECS: i64 = 5 * 60;
+/// longest path component written to disk (bytes); leaves room for the
+/// destination folder and the `.part` suffix under Windows' 260-char limit
+const MAX_COMPONENT_BYTES: usize = 150;
 
 #[derive(Debug, Clone, Default)]
 pub struct CloudSnapshot {
@@ -77,6 +90,8 @@ pub struct CloudState {
     pub snapshot: RwLock<CloudSnapshot>,
     progress: StdMutex<HashMap<i64, FetchProgress>>,
     active_fetches: StdMutex<HashSet<i64>>,
+    /// ledger ids whose in-flight downloads must stop (the grab was removed)
+    cancelled: StdMutex<HashSet<i64>>,
     /// Bitport answered 401: the token is dead and Settings must say so
     pub auth_failed: AtomicBool,
     view_active_until: AtomicI64,
@@ -84,7 +99,6 @@ pub struct CloudState {
     pub wake: Notify,
     /// poke the fetcher (new fetch rows, a retry)
     pub fetch_wake: Notify,
-    poll_busy: AtomicBool,
     /// no overall timeout — the shared client's 60 s would kill any real
     /// download; a stalled body is caught by the read timeout instead
     download_http: reqwest::Client,
@@ -102,11 +116,11 @@ impl Default for CloudState {
             snapshot: RwLock::new(CloudSnapshot::default()),
             progress: StdMutex::new(HashMap::new()),
             active_fetches: StdMutex::new(HashSet::new()),
+            cancelled: StdMutex::new(HashSet::new()),
             auth_failed: AtomicBool::new(false),
             view_active_until: AtomicI64::new(0),
             wake: Notify::new(),
             fetch_wake: Notify::new(),
-            poll_busy: AtomicBool::new(false),
             download_http,
         }
     }
@@ -125,6 +139,16 @@ impl CloudState {
 
     fn view_active(&self) -> bool {
         self.view_active_until.load(Ordering::SeqCst) > db::now()
+    }
+
+    /// Stop every download of this grab at the next chunk. Entries are
+    /// never reused: ledger ids only grow.
+    pub fn cancel_fetches(&self, ledger_id: i64) {
+        self.cancelled.lock().unwrap_or_else(|p| p.into_inner()).insert(ledger_id);
+    }
+
+    fn is_cancelled(&self, ledger_id: i64) -> bool {
+        self.cancelled.lock().unwrap_or_else(|p| p.into_inner()).contains(&ledger_id)
     }
 
     fn progress_of(&self, fetch_id: i64) -> Option<(i64, f64)> {
@@ -172,27 +196,20 @@ fn client<'a>(http: &'a reqwest::Client, cfg: &Config) -> BitportClient<'a> {
     BitportClient { http, token: cfg.bitport_token.clone() }
 }
 
+fn short(title: &str) -> String {
+    title.chars().take(60).collect()
+}
+
 // ---------- poller ----------
 
 pub async fn poll_loop(app: tauri::AppHandle) {
     tokio::time::sleep(Duration::from_secs(12)).await;
     loop {
         let state = app.state::<AppState>();
-        let secs = if state.cloud.poll_busy.swap(true, Ordering::SeqCst) {
-            ACTIVE_POLL_SECS
-        } else {
-            struct Busy<'a>(&'a AtomicBool);
-            impl Drop for Busy<'_> {
-                fn drop(&mut self) {
-                    self.0.store(false, Ordering::SeqCst);
-                }
-            }
-            let _busy = Busy(&state.cloud.poll_busy);
-            match poll_once(&app, &state).await {
-                Poll::NotConnected => 30,
-                Poll::Active => ACTIVE_POLL_SECS,
-                Poll::Idle => IDLE_POLL_SECS,
-            }
+        let secs = match poll_once(&app, &state).await {
+            Poll::NotConnected => 30,
+            Poll::Active => ACTIVE_POLL_SECS,
+            Poll::Idle => IDLE_POLL_SECS,
         };
         let wake = state.cloud.wake.notified();
         tokio::select! {
@@ -202,15 +219,14 @@ pub async fn poll_loop(app: tauri::AppHandle) {
     }
 }
 
-pub enum Poll {
+enum Poll {
     NotConnected,
     Active,
     Idle,
 }
 
-/// One listing, one reconciliation. Public so a connect or a grab can ask
-/// for an immediate pass instead of waiting for the cadence.
-pub async fn poll_once(app: &tauri::AppHandle, state: &AppState) -> Poll {
+/// One listing, one reconciliation.
+async fn poll_once(app: &tauri::AppHandle, state: &AppState) -> Poll {
     let cfg = state.config.read().await.clone();
     if cfg.bitport_token.is_empty() {
         *state.cloud.snapshot.write().await = CloudSnapshot::default();
@@ -248,7 +264,7 @@ pub async fn poll_once(app: &tauri::AppHandle, state: &AppState) -> Poll {
                 crate::applog::warn("bitport", format!("transfer poll failed: {e}"));
             }
             snap.last_error = Some(e.to_string());
-            return if has_open_rows(state).await || state.cloud.view_active() { Poll::Active } else { Poll::Idle };
+            return if work_pending(state).await || state.cloud.view_active() { Poll::Active } else { Poll::Idle };
         }
     };
     state.cloud.auth_failed.store(false, Ordering::SeqCst);
@@ -268,16 +284,19 @@ pub async fn poll_once(app: &tauri::AppHandle, state: &AppState) -> Poll {
     }
     reconcile(app, state, &cfg, &bp, &transfers).await;
     finalize_all(app, state, &cfg, &bp).await;
-    if has_open_rows(state).await || state.cloud.view_active() {
+    if work_pending(state).await || state.cloud.view_active() {
         Poll::Active
     } else {
         Poll::Idle
     }
 }
 
-async fn has_open_rows(state: &AppState) -> bool {
+/// Is anything still moving? Rows Bitport is working on, or files still to
+/// bring down. A grab whose every file failed is waiting for the user and
+/// does not keep the fast cadence alive.
+async fn work_pending(state: &AppState) -> bool {
     let conn = state.db.lock().await;
-    !db::cloud_ledger_rows(&conn, &["dispatching", "grabbed", "fetching"]).is_empty()
+    !db::cloud_ledger_rows(&conn, &["dispatching", "grabbed"]).is_empty() || db::cloud_fetch_open_count(&conn) > 0
 }
 
 /// Index a listing three ways. Rows carrying a token match by token ONLY —
@@ -321,7 +340,8 @@ impl<'a> Listing<'a> {
 /// when local fetching is off), errored transfers stall their row and hand
 /// the episodes back, and transfers that have VANISHED from the account
 /// release their claim — but only after `AbsenceStrikes` has seen them
-/// missing long enough.
+/// missing long enough. Rows already fetching or stalled are only watched
+/// for that disappearance.
 async fn reconcile(
     app: &tauri::AppHandle,
     state: &AppState,
@@ -332,62 +352,57 @@ async fn reconcile(
     let listing = Listing::new(transfers);
     let rows = {
         let conn = state.db.lock().await;
-        db::cloud_ledger_rows(&conn, &["dispatching", "grabbed"])
+        db::cloud_ledger_rows(&conn, &["dispatching", "grabbed", "fetching", "stalled"])
     };
     let listing_empty = transfers.is_empty();
     let now = db::now();
-    let reap_cutoff = now - 5 * 60; // covers the add-to-listing gap
+    let grace_cutoff = now - DISPATCH_GRACE_SECS;
     static STRIKES: std::sync::OnceLock<StdMutex<crate::scheduler::AbsenceStrikes>> =
         std::sync::OnceLock::new();
     // strike bookkeeping is synchronous: the guard is !Send and must never
     // cross an await
     let verdicts: Vec<(CloudLedgerRow, Option<&BitportTransfer>, bool)> = {
         let mut strikes = STRIKES.get_or_init(Default::default).lock().unwrap_or_else(|p| p.into_inner());
-        if listing_empty && !rows.is_empty() {
+        if listing_empty && rows.iter().any(|r| r.state != "stalled") {
             crate::applog::warn(
                 "bitport",
                 "transfer listing came back empty while cloud grabs are open — claims are released only if that persists for half an hour",
             );
         }
-        rows.into_iter()
-            .map(|row| {
-                let found = listing.find(&row);
-                let confirmed_missing = match found {
-                    Some(_) => {
-                        strikes.present(row.id);
-                        false
-                    }
-                    None => strikes.missing(row.id, now, listing_empty) && row.ts < reap_cutoff,
-                };
-                (row, found, confirmed_missing)
-            })
-            .collect()
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            // the dispatcher owns a fresh dispatching row: it may still be
+            // resolving the magnet, and confirming or binding it here would
+            // make `ledger_finish_dispatch` lose its record
+            if row.state == "dispatching" && row.ts >= grace_cutoff {
+                strikes.present(row.id);
+                continue;
+            }
+            let found = listing.find(&row);
+            let confirmed_missing = match found {
+                Some(_) => {
+                    strikes.present(row.id);
+                    false
+                }
+                None => strikes.missing(row.id, now, listing_empty) && row.ts < grace_cutoff,
+            };
+            out.push((row, found, confirmed_missing));
+        }
+        out
     };
     for (row, found, confirmed_missing) in verdicts {
         let Some(t) = found else {
             if confirmed_missing {
-                let conn = state.db.lock().await;
-                match db::ledger_confirm_missing(&conn, row.id, &row.ep_ids) {
-                    Ok(_) => {
-                        STRIKES.get_or_init(Default::default).lock().unwrap_or_else(|p| p.into_inner()).present(row.id);
-                        db::log_activity(
-                            &conn,
-                            "system",
-                            None,
-                            &format!(
-                                "{} vanished from your Bitport cloud — its claim is released, Trawler can grab again",
-                                short(&row.title)
-                            ),
-                        );
-                    }
-                    Err(error) => crate::applog::error(
-                        "bitport",
-                        format!("could not retire missing ledger row {}: {error}", row.id),
-                    ),
-                }
+                vanish_row(state, &row).await;
             }
             continue;
         };
+        match row.state.as_str() {
+            // the fetcher and finalize own these; the transfer being listed
+            // is all that matters here
+            "fetching" | "stalled" => continue,
+            _ => {}
+        }
         {
             let conn = state.db.lock().await;
             if row.bp_token.is_none() {
@@ -401,42 +416,99 @@ async fn reconcile(
             }
         }
         if t.is_error() {
-            fail_row(app, state, &row, t).await;
+            let reason = t.message.clone().unwrap_or_else(|| "Bitport reported an error".into());
+            stall_row(app, state, &row, &reason).await;
         } else if t.is_finished() {
             if cfg.bitport_fetch_to_local {
-                start_fetch(app, state, cfg, bp, &row, t).await;
+                start_fetch(app, state, &row, bp, t).await;
             } else {
-                complete_row(app, state, cfg, bp, &row, None, Some(&t.token)).await;
+                complete_row(app, state, cfg, bp, &row, &["dispatching", "grabbed"], None, Some(&t.token)).await;
             }
         }
     }
 }
 
-fn short(title: &str) -> String {
-    title.chars().take(60).collect()
+/// The transfer is gone from the account (deleted in Bitport's own UI, or
+/// an add that never stuck). Open rows release their claim and episodes;
+/// a row mid-fetch stops its downloads; a stalled row simply retires.
+async fn vanish_row(state: &AppState, row: &CloudLedgerRow) {
+    let conn = state.db.lock().await;
+    let moved = match row.state.as_str() {
+        "stalled" => db::ledger_transition(&conn, row.id, &["stalled"], "removed"),
+        "fetching" => {
+            state.cloud.cancel_fetches(row.id);
+            let fetches = db::cloud_fetch_for_ledger(&conn, row.id);
+            drop_parts(&fetches);
+            db::cloud_fetch_delete_for_ledger(&conn, row.id);
+            db::ledger_transition(&conn, row.id, &["fetching"], "removed")
+        }
+        _ => db::ledger_confirm_missing(&conn, row.id, &row.ep_ids),
+    };
+    match moved {
+        Ok(true) => {
+            if row.state == "fetching" {
+                db::set_episodes_state_by_ids(&conn, &row.ep_ids, "wanted", None);
+            }
+            if row.state != "stalled" {
+                db::log_activity(
+                    &conn,
+                    "system",
+                    None,
+                    &format!(
+                        "{} vanished from your Bitport cloud — its claim is released, Trawler can grab again",
+                        short(&row.title)
+                    ),
+                );
+            }
+        }
+        Ok(false) => {}
+        Err(error) => crate::applog::error(
+            "bitport",
+            format!("could not retire missing ledger row {}: {error}", row.id),
+        ),
+    }
 }
 
-/// Bitport gave up on the transfer. The row stalls (so the dispatcher
-/// refuses the same release again), the episodes go back to wanted so the
-/// scheduler can pick another release, and the transfer stays in the cloud
-/// list with its message until the user removes it.
-async fn fail_row(app: &tauri::AppHandle, state: &AppState, row: &CloudLedgerRow, t: &BitportTransfer) {
-    let reason = t.message.clone().unwrap_or_else(|| "Bitport reported an error".into());
-    {
-        let conn = state.db.lock().await;
-        if let Err(e) = db::ledger_set_state(&conn, row.id, "stalled") {
-            crate::applog::error("bitport", format!("could not stall ledger row {}: {e}", row.id));
-            return;
+/// Remove every partial file of a grab, best effort — a download still
+/// holding its file finishes the job itself once it sees the cancellation.
+fn drop_parts(fetches: &[CloudFetchRow]) {
+    for f in fetches {
+        if f.state != "done" {
+            let _ = std::fs::remove_file(part_path_for(&Path::new(&f.dest_dir).join(&f.rel_path)));
         }
-        db::set_episodes_state_by_ids(&conn, &row.ep_ids, "wanted", None);
-        db::log_activity(
-            &conn,
-            "system",
-            None,
-            &format!("Bitport could not download {}: {reason} — Trawler will look for another release", short(&row.title)),
-        );
     }
-    crate::applog::warn("bitport", format!("transfer failed in the cloud: {} ({reason})", short(&row.title)));
+}
+
+/// The cloud gave up (Bitport's own `error`, files that cannot be listed,
+/// nothing fetchable). The row stalls so the planner and the dispatcher
+/// refuse the same release, the episodes go back to wanted so another
+/// release can be picked, and the transfer stays visible with its reason
+/// until the user removes it.
+async fn stall_row(app: &tauri::AppHandle, state: &AppState, row: &CloudLedgerRow, reason: &str) {
+    let moved = {
+        let conn = state.db.lock().await;
+        match db::ledger_transition(&conn, row.id, &["dispatching", "grabbed", "fetching"], "stalled") {
+            Ok(true) => {
+                db::set_episodes_state_by_ids(&conn, &row.ep_ids, "wanted", None);
+                db::log_activity(
+                    &conn,
+                    "system",
+                    None,
+                    &format!("Bitport could not deliver {}: {reason} — Trawler will look for another release", short(&row.title)),
+                );
+                true
+            }
+            Ok(false) => false,
+            Err(e) => {
+                crate::applog::error("bitport", format!("could not stall ledger row {}: {e}", row.id));
+                false
+            }
+        }
+    };
+    if !moved {
+        return;
+    }
+    crate::applog::warn("bitport", format!("cloud grab failed: {} ({reason})", short(&row.title)));
     crate::notify::dispatch(
         app,
         crate::notify::Kind::Error,
@@ -449,23 +521,27 @@ async fn fail_row(app: &tauri::AppHandle, state: &AppState, row: &CloudLedgerRow
 async fn start_fetch(
     app: &tauri::AppHandle,
     state: &AppState,
-    cfg: &Config,
-    bp: &BitportClient<'_>,
     row: &CloudLedgerRow,
+    bp: &BitportClient<'_>,
     t: &BitportTransfer,
 ) {
-    let dest_root = resolve_dest_root(cfg, row.save_path.as_deref());
+    let cfg = state.config.read().await.clone();
+    let dest_root = resolve_dest_root(&cfg, row.save_path.as_deref());
     let plan = match plan_files(bp, t).await {
         Ok(p) => p,
+        // the transfer is done; a network hiccup on the listing is not —
+        // try again next poll. Anything Bitport itself says is final.
+        Err(AppError::Http(e)) => {
+            crate::applog::warn("bitport", format!("could not list the files of {} yet: {e}", short(&row.title)));
+            return;
+        }
         Err(e) => {
-            // the transfer is done; the listing hiccup is not — try again next poll
-            crate::applog::warn("bitport", format!("could not list the files of {}: {e}", short(&row.title)));
+            stall_row(app, state, row, &e.to_string()).await;
             return;
         }
     };
     if plan.is_empty() {
-        crate::applog::warn("bitport", format!("{} finished in the cloud with no fetchable files", short(&row.title)));
-        complete_row(app, state, cfg, bp, row, None, Some(&t.token)).await;
+        stall_row(app, state, row, "the finished transfer holds no fetchable files").await;
         return;
     }
     let dest = dest_root.to_string_lossy().into_owned();
@@ -475,8 +551,18 @@ async fn start_fetch(
         let conn = state.db.lock().await;
         // idempotent against a poll that raced a previous plan
         if !db::cloud_fetch_for_ledger(&conn, row.id).is_empty() {
-            let _ = db::ledger_set_state(&conn, row.id, "fetching");
+            let _ = db::ledger_transition(&conn, row.id, &["dispatching", "grabbed"], "fetching");
             return;
+        }
+        // the row must still be ours to move: a grab removed while the
+        // files were being listed must not come back as fetching
+        match db::ledger_transition(&conn, row.id, &["dispatching", "grabbed"], "fetching") {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(e) => {
+                crate::applog::error("bitport", format!("could not mark ledger row {} fetching: {e}", row.id));
+                return;
+            }
         }
         let rows: Vec<db::NewCloudFetch<'_>> = plan
             .iter()
@@ -491,10 +577,7 @@ async fn start_fetch(
             .collect();
         if let Err(e) = db::cloud_fetch_insert(&conn, &rows) {
             crate::applog::error("bitport", format!("could not queue the files of {}: {e}", short(&row.title)));
-            return;
-        }
-        if let Err(e) = db::ledger_set_state(&conn, row.id, "fetching") {
-            crate::applog::error("bitport", format!("could not mark ledger row {} fetching: {e}", row.id));
+            // no rows: finalize will hand the row back to grabbed for another plan
             return;
         }
         db::log_activity(
@@ -535,13 +618,18 @@ async fn plan_files(bp: &BitportClient<'_>, t: &BitportTransfer) -> Result<Vec<P
         if f.virus != 0 {
             return Err(AppError::Other(format!("Bitport flagged {} as unsafe (virus scan)", f.name)));
         }
+        if f.size <= 0 {
+            return Ok(vec![]);
+        }
         return Ok(vec![PlannedFile { code: f.code, rel_path: sanitize_component(&f.name), size: f.size }]);
     }
-    Err(AppError::Other("finished transfer points at neither a file nor a folder".into()))
+    Err(AppError::Other("the finished transfer points at neither a file nor a folder".into()))
 }
 
 /// Mirror the transfer's folder under the destination, the way qBittorrent
-/// lays a multi-file torrent out. Flagged files are left in the cloud.
+/// lays a multi-file torrent out. Flagged and empty files are left in the
+/// cloud. Two names that sanitize to the same path (or differ only by
+/// case, which Windows ignores) get a numbered suffix so neither is lost.
 pub fn plan_folder(tree: &CloudFolder) -> Vec<PlannedFile> {
     fn walk(folder: &CloudFolder, base: &str, out: &mut Vec<PlannedFile>) {
         for f in &folder.files {
@@ -550,6 +638,7 @@ pub fn plan_folder(tree: &CloudFolder) -> Vec<PlannedFile> {
                 continue;
             }
             if f.size <= 0 {
+                crate::applog::warn("bitport", format!("skipping {} — Bitport lists it as empty", f.name));
                 continue;
             }
             out.push(PlannedFile {
@@ -565,12 +654,43 @@ pub fn plan_folder(tree: &CloudFolder) -> Vec<PlannedFile> {
     }
     let mut out = vec![];
     walk(tree, &sanitize_component(&tree.name), &mut out);
+    dedupe_paths(&mut out);
     out
+}
+
+fn dedupe_paths(files: &mut [PlannedFile]) {
+    let mut seen: HashSet<String> = HashSet::new();
+    for f in files.iter_mut() {
+        let mut candidate = f.rel_path.clone();
+        let mut n = 1;
+        while !seen.insert(candidate.to_lowercase()) {
+            n += 1;
+            candidate = numbered(&f.rel_path, n);
+        }
+        f.rel_path = candidate;
+    }
+}
+
+/// `dir/name.ext` → `dir/name (n).ext`
+fn numbered(rel_path: &str, n: usize) -> String {
+    let (dir, name) = match rel_path.rsplit_once('/') {
+        Some((d, f)) => (Some(d), f),
+        None => (None, rel_path),
+    };
+    let renamed = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => format!("{stem} ({n}).{ext}"),
+        _ => format!("{name} ({n})"),
+    };
+    match dir {
+        Some(d) => format!("{d}/{renamed}"),
+        None => renamed,
+    }
 }
 
 /// A cloud name as one safe path component on every platform: Windows'
 /// forbidden characters and reserved device names, control characters,
-/// trailing dots and spaces, and the two dot entries.
+/// trailing dots and spaces, the two dot entries, and a length cap that
+/// keeps the extension.
 pub fn sanitize_component(name: &str) -> String {
     let mut out: String = name
         .chars()
@@ -583,17 +703,42 @@ pub fn sanitize_component(name: &str) -> String {
     while out.ends_with('.') || out.ends_with(' ') {
         out.pop();
     }
-    let out = out.trim_start().to_string();
+    let mut out = out.trim_start().to_string();
     if out.is_empty() || out == "." || out == ".." {
         return "_".into();
     }
+    if out.len() > MAX_COMPONENT_BYTES {
+        out = truncate_keeping_extension(&out, MAX_COMPONENT_BYTES);
+    }
     let stem = out.split('.').next().unwrap_or("").to_ascii_uppercase();
-    const RESERVED: [&str; 22] = [
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-    ];
-    if RESERVED.contains(&stem.as_str()) {
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.chars().count() == 4
+            && matches!(stem.chars().nth(3), Some('1'..='9') | Some('¹') | Some('²') | Some('³')));
+    if reserved {
         return format!("_{out}");
+    }
+    out
+}
+
+fn truncate_keeping_extension(name: &str, max_bytes: usize) -> String {
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() && e.len() <= 16 => (s, Some(e)),
+        _ => (name, None),
+    };
+    let ext_len = ext.map(|e| e.len() + 1).unwrap_or(0);
+    let budget = max_bytes.saturating_sub(ext_len).max(1);
+    let mut cut = budget.min(stem.len());
+    while cut > 0 && !stem.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out = stem[..cut].trim_end_matches([' ', '.']).to_string();
+    if out.is_empty() {
+        out = "_".into();
+    }
+    if let Some(e) = ext {
+        out.push('.');
+        out.push_str(e);
     }
     out
 }
@@ -630,22 +775,30 @@ pub fn local_free_bytes(dir: &Path) -> Option<i64> {
     }
 }
 
-/// Retire a row as done. `local_path` is Some when the files landed here.
+/// Retire a row as done, if it is still in one of `from`. `local_path` is
+/// Some when the files landed here.
+#[allow(clippy::too_many_arguments)]
 async fn complete_row(
     app: &tauri::AppHandle,
     state: &AppState,
     cfg: &Config,
     bp: &BitportClient<'_>,
     row: &CloudLedgerRow,
+    from: &[&str],
     local_path: Option<&str>,
     token: Option<&str>,
 ) {
     let recent = row.ts >= db::now() - 3 * 86_400; // first cycle after an upgrade may flip a backlog
     {
         let conn = state.db.lock().await;
-        if let Err(e) = db::ledger_set_state(&conn, row.id, "completed") {
-            crate::applog::error("bitport", format!("could not complete ledger row {}: {e}", row.id));
-            return;
+        match db::ledger_transition(&conn, row.id, from, "completed") {
+            Ok(true) => {}
+            // removed meanwhile, or another pass got here first
+            Ok(false) => return,
+            Err(e) => {
+                crate::applog::error("bitport", format!("could not complete ledger row {}: {e}", row.id));
+                return;
+            }
         }
         db::set_episodes_state_by_ids(&conn, &row.ep_ids, "downloaded", None);
         let message = match local_path {
@@ -666,8 +819,6 @@ async fn complete_row(
             Some(tok) => match bp.delete_transfer(tok).await {
                 Ok(()) => {
                     crate::applog::info("bitport", format!("removed {} from the cloud after a verified download", short(&row.title)));
-                    // the snapshot still lists it — refresh soon
-                    state.cloud.wake.notify_one();
                     let mut snap = state.cloud.snapshot.write().await;
                     snap.transfers.retain(|t| t.token != tok);
                 }
@@ -709,9 +860,10 @@ async fn finalize_row(
         db::cloud_fetch_for_ledger(&conn, row.id)
     };
     if fetches.is_empty() {
-        // planned rows lost (a manual database repair?) — plan again next poll
+        // a plan whose rows never landed (an insert that failed) — plan
+        // again next poll; a row removed meanwhile is left alone by the guard
         let conn = state.db.lock().await;
-        let _ = db::ledger_set_state(&conn, row.id, "grabbed");
+        let _ = db::ledger_transition(&conn, row.id, &["fetching"], "grabbed");
         return;
     }
     if !fetches.iter().all(|f| f.state == "done") {
@@ -719,7 +871,7 @@ async fn finalize_row(
     }
     let local = local_root_of(&fetches);
     let token = fetches.first().map(|f| f.bp_token.clone());
-    complete_row(app, state, cfg, bp, row, Some(&local), token.as_deref()).await;
+    complete_row(app, state, cfg, bp, row, &["fetching"], Some(&local), token.as_deref()).await;
 }
 
 /// The one path that holds a grab locally: the transfer folder for a
@@ -738,7 +890,8 @@ pub async fn fetch_loop(app: tauri::AppHandle) {
     loop {
         let state = app.state::<AppState>();
         let connected = !state.config.read().await.bitport_token.is_empty();
-        if connected {
+        // a dead token would just burn attempts on every file
+        if connected && !state.cloud.auth_failed.load(Ordering::SeqCst) {
             let open = {
                 let conn = state.db.lock().await;
                 db::cloud_fetch_open(&conn)
@@ -746,7 +899,7 @@ pub async fn fetch_loop(app: tauri::AppHandle) {
             let now = db::now();
             for row in open {
                 let already = state.cloud.active_fetches.lock().unwrap_or_else(|p| p.into_inner()).contains(&row.id);
-                if already {
+                if already || state.cloud.is_cancelled(row.ledger_id) {
                     continue;
                 }
                 if row.attempts > 0 && row.updated_at + backoff_secs(row.attempts) > now {
@@ -774,29 +927,58 @@ fn backoff_secs(attempts: i64) -> i64 {
     (30i64 << (attempts - 1).clamp(0, 6)).min(30 * 60)
 }
 
+/// Why a fetch stopped short of "done".
+enum FetchFailure {
+    /// the grab was removed (or its row vanished) while the download ran
+    Cancelled,
+    /// Bitport refused the token, or the account is disconnected — not the
+    /// file's fault, so it costs no attempt
+    Auth,
+    /// anything else; counts against `MAX_ATTEMPTS`
+    Failed(String),
+}
+
+impl From<AppError> for FetchFailure {
+    fn from(e: AppError) -> Self {
+        match e {
+            AppError::BitportAuth => FetchFailure::Auth,
+            other => FetchFailure::Failed(other.to_string()),
+        }
+    }
+}
+
 async fn fetch_task(app: tauri::AppHandle, row: CloudFetchRow) {
     let state = app.state::<AppState>();
     let outcome = fetch_one(&state, &row).await;
+    let part = part_path_for(&Path::new(&row.dest_dir).join(&row.rel_path));
+    // what a retry can resume from — visible in the bar between attempts
+    let on_disk = std::fs::metadata(&part).map(|m| m.len() as i64).unwrap_or(0);
     let attempts = row.attempts + 1;
     {
         let conn = state.db.lock().await;
         match &outcome {
             Ok(()) => {}
-            Err(e) if attempts >= MAX_ATTEMPTS => {
-                db::cloud_fetch_set_state(&conn, row.id, "failed", 0, Some(&e.to_string()), false);
-                crate::applog::error(
-                    "bitport",
-                    format!("giving up on {} after {attempts} attempts: {e}", row.rel_path),
-                );
+            Err(FetchFailure::Cancelled) => {
+                let _ = std::fs::remove_file(&part);
+            }
+            Err(FetchFailure::Auth) => {
+                db::cloud_fetch_set_state(&conn, row.id, "pending", on_disk, Some("waiting for Bitport access"), false);
+            }
+            Err(FetchFailure::Failed(e)) if attempts >= MAX_ATTEMPTS => {
+                db::cloud_fetch_set_state(&conn, row.id, "failed", on_disk, Some(e), true);
+                crate::applog::error("bitport", format!("giving up on {} after {attempts} attempts: {e}", row.rel_path));
                 db::log_activity(
                     &conn,
                     "system",
                     None,
-                    &format!("Could not bring {} down from the cloud: {e}", row.rel_path.rsplit('/').next().unwrap_or(&row.rel_path)),
+                    &format!(
+                        "Could not bring {} down from the cloud: {e}",
+                        row.rel_path.rsplit('/').next().unwrap_or(&row.rel_path)
+                    ),
                 );
             }
-            Err(e) => {
-                db::cloud_fetch_set_state(&conn, row.id, "pending", 0, Some(&e.to_string()), false);
+            Err(FetchFailure::Failed(e)) => {
+                db::cloud_fetch_set_state(&conn, row.id, "pending", on_disk, Some(e), true);
                 crate::applog::warn(
                     "bitport",
                     format!("fetch of {} failed (attempt {attempts}): {e} — retrying in {} s", row.rel_path, backoff_secs(attempts)),
@@ -822,15 +1004,21 @@ async fn fetch_task(app: tauri::AppHandle, row: CloudFetchRow) {
 
 /// Stream one file to `<dest>/<rel_path>.part`, resuming whatever an
 /// earlier attempt left behind, then verify size and CRC32 and rename.
-async fn fetch_one(state: &AppState, row: &CloudFetchRow) -> Result<()> {
+async fn fetch_one(state: &AppState, row: &CloudFetchRow) -> std::result::Result<(), FetchFailure> {
     let cfg = state.config.read().await.clone();
     if cfg.bitport_token.is_empty() {
-        return Err(AppError::Other("Bitport is not connected".into()));
+        return Err(FetchFailure::Auth);
+    }
+    if state.cloud.is_cancelled(row.ledger_id) {
+        return Err(FetchFailure::Cancelled);
     }
     let bp = client(&state.http, &cfg);
     {
         let conn = state.db.lock().await;
-        db::cloud_fetch_set_state(&conn, row.id, "fetching", row.bytes_done, None, true);
+        // zero rows updated means the grab was removed since the scan
+        if !db::cloud_fetch_set_state(&conn, row.id, "fetching", row.bytes_done, None, false) {
+            return Err(FetchFailure::Cancelled);
+        }
     }
     // a fresh signed link every attempt: the listing's link may be a week old
     let info = bp.file_info(&row.file_code).await?;
@@ -842,14 +1030,14 @@ async fn fetch_one(state: &AppState, row: &CloudFetchRow) -> Result<()> {
     }
     let url = info
         .download_url
-        .ok_or_else(|| AppError::Other("Bitport returned no download link for the file".into()))?;
+        .ok_or_else(|| FetchFailure::Failed("Bitport returned no download link for the file".into()))?;
 
     let final_path = Path::new(&row.dest_dir).join(&row.rel_path);
     let part_path = part_path_for(&final_path);
     if let Some(parent) = final_path.parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(|e| {
-            AppError::Other(format!("could not create {}: {e}", parent.display()))
-        })?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| FetchFailure::Failed(format!("could not create {}: {e}", parent.display())))?;
     }
     if let Ok(meta) = tokio::fs::metadata(&final_path).await {
         if meta.is_file() && meta.len() as i64 == size {
@@ -867,7 +1055,7 @@ async fn fetch_one(state: &AppState, row: &CloudFetchRow) -> Result<()> {
     if let Some(free) = local_free_bytes(Path::new(&row.dest_dir)) {
         let needed = size - offset + LOCAL_DISK_MARGIN;
         if free < needed {
-            return Err(AppError::Other(format!(
+            return Err(FetchFailure::Failed(format!(
                 "not enough free space at {} — needs {}, has {}",
                 row.dest_dir,
                 fmt_bytes(needed),
@@ -894,7 +1082,8 @@ async fn fetch_one(state: &AppState, row: &CloudFetchRow) -> Result<()> {
             Ok(hasher)
         })
         .await
-        .map_err(|e| AppError::Other(format!("checksum task failed: {e}")))??;
+        .map_err(|e| FetchFailure::Failed(format!("checksum task failed: {e}")))?
+        .map_err(|e| FetchFailure::Failed(format!("could not read the partial file: {e}")))?;
         hasher = h;
     }
     state.cloud.progress_set(row.id, offset);
@@ -903,9 +1092,11 @@ async fn fetch_one(state: &AppState, row: &CloudFetchRow) -> Result<()> {
     if offset > 0 && offset < size {
         request = request.header(reqwest::header::RANGE, format!("bytes={offset}-"));
     }
-    let mut file: Option<tokio::fs::File> = None;
     if offset < size {
-        let resp = request.send().await.map_err(|e| AppError::Http(e.without_url()))?;
+        let resp = request
+            .send()
+            .await
+            .map_err(|e| FetchFailure::Failed(format!("download request failed: {}", e.without_url())))?;
         let status = resp.status();
         let append = match status.as_u16() {
             206 => true,
@@ -917,59 +1108,75 @@ async fn fetch_one(state: &AppState, row: &CloudFetchRow) -> Result<()> {
                 }
                 false
             }
-            403 => return Err(AppError::Other("the download link was refused (expired or revoked) — will fetch a fresh one".into())),
-            404 => return Err(AppError::Other("the file is no longer in the cloud".into())),
-            _ => return Err(AppError::Other(format!("the download server answered {status}"))),
+            403 => return Err(FetchFailure::Failed("the download link was refused (expired or revoked) — will fetch a fresh one".into())),
+            404 => return Err(FetchFailure::Failed("the file is no longer in the cloud".into())),
+            _ => return Err(FetchFailure::Failed(format!("the download server answered {status}"))),
         };
         let mut f = if append {
             tokio::fs::OpenOptions::new().append(true).open(&part_path).await
         } else {
             tokio::fs::File::create(&part_path).await
         }
-        .map_err(|e| AppError::Other(format!("could not open {}: {e}", part_path.display())))?;
+        .map_err(|e| FetchFailure::Failed(format!("could not open {}: {e}", part_path.display())))?;
         let mut resp = resp;
         loop {
+            if state.cloud.is_cancelled(row.ledger_id) {
+                let _ = f.flush().await;
+                drop(f);
+                return Err(FetchFailure::Cancelled);
+            }
             let chunk = match resp.chunk().await {
                 Ok(Some(c)) => c,
                 Ok(None) => break,
                 Err(e) => {
                     let _ = f.flush().await;
-                    return Err(AppError::Other(format!("download interrupted at {}: {}", fmt_bytes(offset), e.without_url())));
+                    return Err(FetchFailure::Failed(format!(
+                        "download interrupted at {}: {}",
+                        fmt_bytes(offset),
+                        e.without_url()
+                    )));
                 }
             };
             f.write_all(&chunk)
                 .await
-                .map_err(|e| AppError::Other(format!("could not write {}: {e}", part_path.display())))?;
+                .map_err(|e| FetchFailure::Failed(format!("could not write {}: {e}", part_path.display())))?;
             hasher.update(&chunk);
             offset += chunk.len() as i64;
             state.cloud.progress_set(row.id, offset);
             if offset > size {
-                return Err(AppError::Other(format!(
+                return Err(FetchFailure::Failed(format!(
                     "the download server sent more than the file's {} — refusing the file",
                     fmt_bytes(size)
                 )));
             }
         }
-        f.flush().await.map_err(|e| AppError::Other(format!("could not flush {}: {e}", part_path.display())))?;
-        file = Some(f);
+        f.flush()
+            .await
+            .map_err(|e| FetchFailure::Failed(format!("could not flush {}: {e}", part_path.display())))?;
+        // the handle must be gone before the rename below (Windows)
+        drop(f);
     }
-    drop(file);
     if offset != size {
-        return Err(AppError::Other(format!("download ended early: {} of {}", fmt_bytes(offset), fmt_bytes(size))));
+        return Err(FetchFailure::Failed(format!("download ended early: {} of {}", fmt_bytes(offset), fmt_bytes(size))));
     }
     if let Some(expected) = crc_expected.as_deref() {
         let got = format!("{:08x}", hasher.finalize());
         if got != expected {
             let _ = tokio::fs::remove_file(&part_path).await;
-            return Err(AppError::Other(format!("checksum mismatch (expected {expected}, got {got}) — the file was discarded")));
+            return Err(FetchFailure::Failed(format!(
+                "checksum mismatch (expected {expected}, got {got}) — the file was discarded"
+            )));
         }
+    }
+    if state.cloud.is_cancelled(row.ledger_id) {
+        return Err(FetchFailure::Cancelled);
     }
     if tokio::fs::metadata(&final_path).await.is_ok() {
         let _ = tokio::fs::remove_file(&final_path).await;
     }
     tokio::fs::rename(&part_path, &final_path)
         .await
-        .map_err(|e| AppError::Other(format!("could not move the finished file into place: {e}")))?;
+        .map_err(|e| FetchFailure::Failed(format!("could not move the finished file into place: {e}")))?;
     {
         let conn = state.db.lock().await;
         db::cloud_fetch_set_state(&conn, row.id, "done", size, None, false);
@@ -1051,13 +1258,15 @@ pub async fn retry(state: &AppState, ledger_id: i64) -> Result<usize> {
         db::cloud_fetch_reset_failed(&conn, ledger_id)
     };
     state.cloud.fetch_wake.notify_one();
+    state.cloud.wake.notify_one();
     Ok(n)
 }
 
-/// Remove a cloud grab from Trawler: the transfer (and its files) in the
-/// cloud when asked, every partial file on disk, the fetch rows, and the
-/// ledger claim. A finished grab keeps its local files and its episodes
-/// stay downloaded; anything unfinished hands its episodes back.
+/// Remove a cloud grab from Trawler: its downloads stop, every partial file
+/// on disk and the fetch rows go, the transfer (and its files) in the cloud
+/// too when asked, and the ledger claim is released. A finished grab keeps
+/// its local files and its episodes stay downloaded; anything unfinished
+/// hands its episodes back.
 pub async fn remove(state: &AppState, ledger_id: i64, delete_cloud: bool) -> Result<()> {
     let cfg = state.config.read().await.clone();
     let (row, fetches) = {
@@ -1069,29 +1278,36 @@ pub async fn remove(state: &AppState, ledger_id: i64, delete_cloud: bool) -> Res
         let fetches = db::cloud_fetch_for_ledger(&conn, ledger_id);
         (row, fetches)
     };
+    // downloads stop before anything else is touched
+    state.cloud.cancel_fetches(ledger_id);
     if delete_cloud && !cfg.bitport_token.is_empty() {
         if let Some(tok) = row.bp_token.as_deref() {
-            match client(&state.http, &cfg).delete_transfer(tok).await {
-                Ok(()) => {}
-                // already gone is the outcome we wanted
-                Err(e) if e.to_string().contains("not found") => {}
-                Err(e) => return Err(e),
+            if let Err(e) = client(&state.http, &cfg).delete_transfer(tok).await {
+                // already gone is the outcome we wanted: the listing is the
+                // authority, not the wording of Bitport's error
+                let still_listed = state.cloud.snapshot.read().await.transfers.iter().any(|t| t.token == tok);
+                let msg = e.to_string().to_ascii_lowercase();
+                if still_listed && !msg.contains("not found") && !msg.contains("not owned") {
+                    return Err(e);
+                }
             }
             let mut snap = state.cloud.snapshot.write().await;
             snap.transfers.retain(|t| t.token != tok);
         }
     }
-    for f in &fetches {
-        if f.state != "done" {
-            let part = part_path_for(&Path::new(&f.dest_dir).join(&f.rel_path));
-            let _ = tokio::fs::remove_file(&part).await;
-        }
-    }
+    drop_parts(&fetches);
     let conn = state.db.lock().await;
     db::cloud_fetch_delete_for_ledger(&conn, ledger_id);
-    db::ledger_set_state(&conn, ledger_id, "deleted")?;
-    if row.state != "completed" {
+    let moved = db::ledger_transition(
+        &conn,
+        ledger_id,
+        &["dispatching", "grabbed", "fetching", "completed", "stalled"],
+        "deleted",
+    )?;
+    if moved && row.state != "completed" && row.state != "stalled" {
         db::set_episodes_state_by_ids(&conn, &row.ep_ids, "wanted", None);
+    }
+    if moved && row.state != "completed" {
         db::log_activity(
             &conn,
             "system",
@@ -1117,6 +1333,9 @@ pub struct CloudItem {
     pub cloud_status: String,
     pub cloud_progress: f64,
     pub message: Option<String>,
+    /// the transfer still exists in the account (a done grab whose cloud
+    /// copy was kept can be deleted from there)
+    pub cloud_copy: bool,
     pub files_total: i64,
     pub files_done: i64,
     pub files_failed: i64,
@@ -1138,7 +1357,7 @@ pub struct CloudView {
     pub fetched_at: i64,
     pub quota: Option<BitportQuota>,
     pub items: Vec<CloudItem>,
-    /// transfers in the account that Trawler did not create
+    /// transfers in the account that no card above accounts for
     pub others: Vec<BitportTransfer>,
     pub fetch_speed: f64,
     pub fetch_to_local: bool,
@@ -1163,11 +1382,13 @@ pub async fn view(state: &AppState, cfg: &Config) -> CloudView {
     state.cloud.mark_view_active();
     let listing = Listing::new(&snap.transfers);
     let cutoff = db::now() - SHOW_COMPLETED_SECS;
-    let (rows, fetches_by_ledger, all_identities) = {
+    let (rows, fetches_by_ledger) = {
         let conn = state.db.lock().await;
+        // open and stalled rows always (they wait for Trawler or the user);
+        // finished ones for a week
         let rows: Vec<CloudLedgerRow> = db::cloud_ledger_rows(&conn, &["dispatching", "grabbed", "fetching", "completed", "stalled"])
             .into_iter()
-            .filter(|r| matches!(r.state.as_str(), "dispatching" | "grabbed" | "fetching") || r.ts >= cutoff)
+            .filter(|r| r.state != "completed" || r.ts >= cutoff)
             .collect();
         let mut fetches: HashMap<i64, Vec<CloudFetchRow>> = HashMap::new();
         for r in &rows {
@@ -1175,33 +1396,27 @@ pub async fn view(state: &AppState, cfg: &Config) -> CloudView {
                 fetches.insert(r.id, db::cloud_fetch_for_ledger(&conn, r.id));
             }
         }
-        // every transfer Trawler ever created, whatever its row's state now
-        let idents: Vec<(Option<String>, Option<String>)> = conn
-            .prepare("SELECT bp_token, info_hash FROM grab_ledger WHERE backend = 'bitport'")
-            .ok()
-            .map(|mut stmt| {
-                stmt.query_map([], |r| Ok((r.get(0)?, r.get::<_, Option<String>>(1)?.map(|h| h.to_ascii_lowercase()))))
-                    .map(|it| it.flatten().collect::<Vec<_>>())
-                    .unwrap_or_default()
-            })
-            .unwrap_or_default();
-        (rows, fetches, idents)
+        (rows, fetches)
     };
     let mut items: Vec<CloudItem> = rows
         .iter()
         .map(|row| build_item(state, cfg, row, listing.find(row), fetches_by_ledger.get(&row.id)))
         .collect();
     items.sort_by(|a, b| b.ts.cmp(&a.ts));
-    let own_tokens: HashSet<&str> = all_identities.iter().filter_map(|(t, _)| t.as_deref()).collect();
-    let own_hashes: HashSet<&str> = all_identities.iter().filter_map(|(_, h)| h.as_deref()).collect();
+    // only transfers a card above stands for are hidden from the account
+    // list — everything else stays visible and deletable, including a
+    // finished grab the user hid while its cloud copy lives on
+    let shown: HashSet<&str> = items.iter().filter_map(|i| i.token.as_deref()).collect();
     let others: Vec<BitportTransfer> = snap
         .transfers
         .iter()
-        .filter(|t| {
-            !own_tokens.contains(t.token.as_str())
-                && !bitport::transfer_hash(t).map(|h| own_hashes.contains(h.as_str())).unwrap_or(false)
+        .filter(|t| !shown.contains(t.token.as_str()))
+        .map(|t| BitportTransfer {
+            // the magnet can carry private-tracker passkeys; the webview
+            // has no use for it
+            src: None,
+            ..t.clone()
         })
-        .cloned()
         .collect();
     CloudView {
         connected,
@@ -1231,6 +1446,7 @@ fn build_item(
         cloud_status: transfer.map(|t| t.status.clone()).unwrap_or_else(|| "waiting".into()),
         cloud_progress: transfer.map(|t| t.progress).unwrap_or(0.0),
         message: transfer.and_then(|t| t.message.clone()),
+        cloud_copy: transfer.is_some(),
         files_total: 0,
         files_done: 0,
         files_failed: 0,
@@ -1250,7 +1466,7 @@ fn build_item(
             .iter()
             .map(|f| match f.state.as_str() {
                 "done" => f.size,
-                _ => state.cloud.progress_of(f.id).map(|(b, _)| b).unwrap_or(0),
+                _ => state.cloud.progress_of(f.id).map(|(b, _)| b).unwrap_or(f.bytes_done),
             })
             .sum();
         item.speed = fs.iter().filter_map(|f| state.cloud.progress_of(f.id)).map(|(_, s)| s).sum();
@@ -1261,7 +1477,11 @@ fn build_item(
         "dispatching" => "sending".into(),
         "completed" => "done".into(),
         "stalled" => {
-            item.error = item.error.clone().or_else(|| item.message.clone()).or_else(|| Some("Bitport reported an error".into()));
+            item.error = item
+                .error
+                .clone()
+                .or_else(|| item.message.clone())
+                .or_else(|| Some("Bitport could not deliver this release".into()));
             "error".into()
         }
         "fetching" => {
@@ -1316,16 +1536,33 @@ mod tests {
         assert_eq!(sanitize_component(".."), "_");
         assert_eq!(sanitize_component(""), "_");
         assert_eq!(sanitize_component("con.mkv"), "_con.mkv");
+        assert_eq!(sanitize_component("COM¹"), "_COM¹");
+        assert_eq!(sanitize_component("COMMON.txt"), "COMMON.txt");
         assert_eq!(sanitize_component("a/b\\c"), "a_b_c");
         assert_eq!(sanitize_component("Sintel.mp4"), "Sintel.mp4");
+        // a release name that would blow Windows' path limit keeps its extension
+        let long = format!("{}.mkv", "x".repeat(400));
+        let cut = sanitize_component(&long);
+        assert!(cut.len() <= MAX_COMPONENT_BYTES, "{}", cut.len());
+        assert!(cut.ends_with(".mkv"));
+        let multibyte = format!("{}.srt", "é".repeat(300));
+        let cut = sanitize_component(&multibyte);
+        assert!(cut.len() <= MAX_COMPONENT_BYTES && cut.ends_with(".srt"));
     }
 
     #[test]
-    fn folder_plans_mirror_the_tree_and_skip_flagged_files() {
+    fn folder_plans_mirror_the_tree_skip_flagged_files_and_dedupe_names() {
         let tree = CloudFolder {
             code: Some("root".into()),
             name: "Show.S01".into(),
-            files: vec![file("Show.S01E01.mkv", "f1", 100, 0), file("bad.exe", "f2", 5, 1), file("empty.nfo", "f3", 0, 0)],
+            files: vec![
+                file("Show.S01E01.mkv", "f1", 100, 0),
+                file("bad.exe", "f2", 5, 1),
+                file("empty.nfo", "f3", 0, 0),
+                file("a?b.mkv", "f5", 10, 0),
+                file("a*b.mkv", "f6", 11, 0),
+                file("A_B.mkv", "f7", 12, 0),
+            ],
             folders: vec![CloudFolder {
                 code: Some("sub".into()),
                 name: "Subs: en".into(),
@@ -1338,9 +1575,14 @@ mod tests {
             plan,
             vec![
                 PlannedFile { code: "f1".into(), rel_path: "Show.S01/Show.S01E01.mkv".into(), size: 100 },
+                PlannedFile { code: "f5".into(), rel_path: "Show.S01/a_b.mkv".into(), size: 10 },
+                PlannedFile { code: "f6".into(), rel_path: "Show.S01/a_b (2).mkv".into(), size: 11 },
+                PlannedFile { code: "f7".into(), rel_path: "Show.S01/A_B (3).mkv".into(), size: 12 },
                 PlannedFile { code: "f4".into(), rel_path: "Show.S01/Subs_ en/Show.S01E01.en.srt".into(), size: 7 },
             ]
         );
+        assert_eq!(numbered("dir/noext", 2), "dir/noext (2)");
+        assert_eq!(numbered("x.tar.gz", 3), "x.tar (3).gz");
     }
 
     #[test]
@@ -1380,6 +1622,12 @@ mod tests {
         assert_eq!(backoff_secs(2), 60);
         assert_eq!(backoff_secs(3), 120);
         assert_eq!(backoff_secs(9), 30 * 60);
+    }
+
+    #[test]
+    fn auth_failures_cost_no_attempt() {
+        assert!(matches!(FetchFailure::from(AppError::BitportAuth), FetchFailure::Auth));
+        assert!(matches!(FetchFailure::from(AppError::Other("x".into())), FetchFailure::Failed(_)));
     }
 
     #[test]

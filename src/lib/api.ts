@@ -238,6 +238,8 @@ export interface QbitTorrent {
 }
 
 export interface BitportQuota {
+  /** the account e-mail, so a wrong account is visible right after connecting */
+  account: string | null;
   planName: string;
   planExpired: boolean;
   /** "YYYY-MM-DD HH:MM:SS" UTC, as Bitport reports it */
@@ -282,6 +284,8 @@ export interface CloudItem {
   cloudStatus: string;
   cloudProgress: number;
   message: string | null;
+  /** the transfer still exists in the account (a kept cloud copy can be deleted) */
+  cloudCopy: boolean;
   filesTotal: number;
   filesDone: number;
   filesFailed: number;
@@ -777,7 +781,7 @@ function mockBpStatus(): BitportStatus {
     ? {
         connected: true,
         authFailed: false,
-        quota: { planName: "big", planExpired: false, planExpiration: "2027-08-16 00:00:00", diskSize: 1073741824000, diskAvailable: 343501989179, diskUsed: 730239834821 },
+        quota: { account: "you@example.com", planName: "big", planExpired: false, planExpiration: "2027-08-16 00:00:00", diskSize: 1073741824000, diskAvailable: 343501989179, diskUsed: 730239834821 },
         getAccessUrl: "https://bitport.io/get-access",
         defaultDownloadDir: "C:\\Users\\you\\Downloads\\Trawler",
       }
@@ -796,12 +800,13 @@ function mockCloudView(): CloudView {
   const fetchDone = Math.min(fetchTotal, 400_000_000 + elapsed * 38_000_000);
   const fetching = fetchDone < fetchTotal;
   const now = Math.floor(Date.now() / 1000);
-  const items: CloudItem[] = [
-    { ledgerId: 901, title: "Lioness.S03E04.1080p.WEB.h264-ETHEL", token: "bp2", phase: "cloud", cloudStatus: "downloading", cloudProgress: Math.min(99, 61 + elapsed * 0.4), message: null, filesTotal: 0, filesDone: 0, filesFailed: 0, bytesTotal: 1_944_671_130, bytesDone: 0, speed: 0, localPath: null, error: null, ts: now - 240 },
-    { ledgerId: 902, title: "28.Years.Later.2025.1080p.WEB-DL.HEVC.x265.5.1-BONE", token: "bp3", phase: fetching ? "fetching" : "done", cloudStatus: "finished", cloudProgress: 100, message: null, filesTotal: 2, filesDone: fetching ? 1 : 2, filesFailed: 0, bytesTotal: fetchTotal, bytesDone: fetchDone, speed: fetching ? 38_000_000 : 0, localPath: "D:\\Media\\Movies\\28.Years.Later.2025.1080p.WEB-DL.HEVC.x265.5.1-BONE", error: null, ts: now - 1800 },
-    { ledgerId: 903, title: "Andor.S02E03.Harvest.1080p.HEVC.x265-MeGusta", token: "bp4", phase: "done", cloudStatus: "finished", cloudProgress: 100, message: null, filesTotal: 1, filesDone: 1, filesFailed: 0, bytesTotal: 664_179_969, bytesDone: 664_179_969, speed: 0, localPath: "D:\\Media\\TV\\Andor.S02E03.Harvest.1080p.HEVC.x265-MeGusta.mkv", error: null, ts: now - 7200 },
-    { ledgerId: 904, title: "Citizen.Vigilante.2026.1080p.WEBRip.10Bit.DDP5.1.x265-NeoNoir", token: "bp5", phase: "error", cloudStatus: "error", cloudProgress: 0, message: "No peers found", filesTotal: 0, filesDone: 0, filesFailed: 0, bytesTotal: 2_013_234_133, bytesDone: 0, speed: 0, localPath: null, error: "No peers found", ts: now - 10800 },
-  ].filter((i) => !mockBp.removed.has(i.ledgerId)) as CloudItem[];
+  const all = [
+    { ledgerId: 901, title: "Lioness.S03E04.1080p.WEB.h264-ETHEL", token: "bp2", phase: "cloud", cloudStatus: "downloading", cloudProgress: Math.min(99, 61 + elapsed * 0.4), message: null, cloudCopy: true, filesTotal: 0, filesDone: 0, filesFailed: 0, bytesTotal: 1_944_671_130, bytesDone: 0, speed: 0, localPath: null, error: null, ts: now - 240 },
+    { ledgerId: 902, title: "28.Years.Later.2025.1080p.WEB-DL.HEVC.x265.5.1-BONE", token: "bp3", phase: fetching ? "fetching" : "done", cloudStatus: "finished", cloudProgress: 100, message: null, cloudCopy: fetching, filesTotal: 2, filesDone: fetching ? 1 : 2, filesFailed: 0, bytesTotal: fetchTotal, bytesDone: fetchDone, speed: fetching ? 38_000_000 : 0, localPath: "D:\\Media\\Movies\\28.Years.Later.2025.1080p.WEB-DL.HEVC.x265.5.1-BONE", error: null, ts: now - 1800 },
+    { ledgerId: 903, title: "Andor.S02E03.Harvest.1080p.HEVC.x265-MeGusta", token: "bp4", phase: "done", cloudStatus: "finished", cloudProgress: 100, message: null, cloudCopy: true, filesTotal: 1, filesDone: 1, filesFailed: 0, bytesTotal: 664_179_969, bytesDone: 664_179_969, speed: 0, localPath: "D:\\Media\\TV\\Andor.S02E03.Harvest.1080p.HEVC.x265-MeGusta.mkv", error: null, ts: now - 7200 },
+    { ledgerId: 904, title: "Citizen.Vigilante.2026.1080p.WEBRip.10Bit.DDP5.1.x265-NeoNoir", token: "bp5", phase: "error", cloudStatus: "error", cloudProgress: 0, message: "No peers found", cloudCopy: true, filesTotal: 0, filesDone: 0, filesFailed: 0, bytesTotal: 2_013_234_133, bytesDone: 0, speed: 0, localPath: null, error: "No peers found", ts: now - 10800 },
+  ] satisfies CloudItem[];
+  const items: CloudItem[] = all.filter((i) => !mockBp.removed.has(i.ledgerId));
   return {
     connected: true,
     authFailed: false,

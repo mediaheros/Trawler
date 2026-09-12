@@ -290,7 +290,7 @@ pub fn open_existing() -> Result<Connection> {
 /// Is this content already satisfied (grabbed or completed)?
 pub fn ledger_satisfied(conn: &Connection, content_key: &str) -> bool {
     conn.query_row(
-        "SELECT COUNT(*) FROM grab_ledger WHERE content_key = ?1 AND state IN ('dispatching','grabbed','completed')",
+        "SELECT COUNT(*) FROM grab_ledger WHERE content_key = ?1 AND state IN ('dispatching','grabbed','fetching','completed')",
         [content_key],
         |r| r.get::<_, i64>(0),
     )
@@ -322,7 +322,7 @@ pub fn ledger_claim_dispatch(
     .map_err(db_err)?;
     let active = tx
         .query_row(
-            "SELECT COUNT(*) FROM grab_ledger WHERE content_key = ?1 AND state IN ('dispatching','grabbed','completed')",
+            "SELECT COUNT(*) FROM grab_ledger WHERE content_key = ?1 AND state IN ('dispatching','grabbed','fetching','completed')",
             [claim.content_key],
             |row| row.get::<_, i64>(0),
         )
@@ -381,7 +381,7 @@ pub fn ledger_claim_dispatch(
 /// scheduler (whose episodes were explicitly handed back) use the plain check.
 pub fn ledger_satisfied_for_automation(conn: &Connection, content_key: &str) -> bool {
     conn.query_row(
-        "SELECT COUNT(*) FROM grab_ledger WHERE content_key = ?1 AND state IN ('dispatching','grabbed','completed','deleted')",
+        "SELECT COUNT(*) FROM grab_ledger WHERE content_key = ?1 AND state IN ('dispatching','grabbed','fetching','completed','deleted')",
         [content_key],
         |r| r.get::<_, i64>(0),
     )
@@ -403,7 +403,7 @@ pub fn ledger_adopt_episodes(conn: &Connection, content_key: &str, ep_ids: &[i64
     let row: Option<(i64, String, String, Option<String>)> = conn
         .query_row(
             "SELECT id, title, state, ep_ids FROM grab_ledger
-             WHERE content_key = ?1 AND state IN ('dispatching','grabbed','completed')
+             WHERE content_key = ?1 AND state IN ('dispatching','grabbed','fetching','completed')
              ORDER BY id DESC LIMIT 1",
             [content_key],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
@@ -674,10 +674,22 @@ pub fn ledger_set_bp_token(conn: &Connection, id: i64, token: &str) {
     );
 }
 
-pub fn ledger_set_state(conn: &Connection, id: i64, state: &str) -> Result<()> {
-    conn.execute("UPDATE grab_ledger SET state = ?2 WHERE id = ?1", rusqlite::params![id, state])
-        .map_err(db_err)?;
-    Ok(())
+/// Move a row to `to` only if it is still in one of `from`. Every cloud
+/// transition goes through here: the poller and the fetcher both act on
+/// snapshots taken before their awaits, and a row the user removed in the
+/// meantime must stay removed — never be resurrected or completed.
+/// Returns whether the row moved; callers skip episode side effects on
+/// false.
+pub fn ledger_transition(conn: &Connection, id: i64, from: &[&str], to: &str) -> Result<bool> {
+    if from.is_empty() {
+        return Ok(false);
+    }
+    let placeholders = from.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!("UPDATE grab_ledger SET state = ?1 WHERE id = ?2 AND state IN ({placeholders})");
+    let mut params: Vec<rusqlite::types::Value> = vec![to.to_string().into(), id.into()];
+    params.extend(from.iter().map(|s| rusqlite::types::Value::from(s.to_string())));
+    let changed = conn.execute(&sql, rusqlite::params_from_iter(params)).map_err(db_err)?;
+    Ok(changed > 0)
 }
 
 /// Is there a stalled cloud row for this hash? A release Bitport already
@@ -785,7 +797,8 @@ pub fn cloud_fetch_for_ledger(conn: &Connection, ledger_id: i64) -> Vec<CloudFet
 }
 
 /// Move one fetch to a new state; `bytes_done` and `error` are replaced,
-/// `attempts` grows when asked.
+/// `attempts` grows when asked. Returns whether the row still existed —
+/// false means the grab was removed while the fetch ran.
 pub fn cloud_fetch_set_state(
     conn: &Connection,
     id: i64,
@@ -793,12 +806,25 @@ pub fn cloud_fetch_set_state(
     bytes_done: i64,
     error: Option<&str>,
     bump_attempts: bool,
-) {
-    let _ = conn.execute(
+) -> bool {
+    conn.execute(
         "UPDATE cloud_fetch SET state = ?2, bytes_done = ?3, error = ?4,
                 attempts = attempts + ?5, updated_at = ?6 WHERE id = ?1",
         rusqlite::params![id, state, bytes_done, error, if bump_attempts { 1 } else { 0 }, now()],
-    );
+    )
+    .map(|n| n > 0)
+    .unwrap_or(false)
+}
+
+/// Files still to fetch (or mid-fetch) across every grab — what keeps the
+/// fetcher and the fast poll cadence alive.
+pub fn cloud_fetch_open_count(conn: &Connection) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM cloud_fetch WHERE state IN ('pending','fetching')",
+        [],
+        |r| r.get::<_, i64>(0),
+    )
+    .unwrap_or(0)
 }
 
 /// The file-info endpoint knows the size and checksum better than the
@@ -894,7 +920,7 @@ pub fn set_episodes_state_by_ids(conn: &Connection, ids: &[i64], state: &str, gr
 /// The upgrade scout uses this to see what quality the user already has.
 pub fn ledger_entries(conn: &Connection, content_key: &str) -> Vec<(String, i64)> {
     conn.prepare(
-        "SELECT title, size FROM grab_ledger WHERE content_key = ?1 AND state IN ('grabbed','completed')",
+        "SELECT title, size FROM grab_ledger WHERE content_key = ?1 AND state IN ('grabbed','fetching','completed')",
     )
     .ok()
     .map(|mut stmt| {
