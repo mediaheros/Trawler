@@ -107,6 +107,16 @@ pub struct Config {
     pub download_backend: String,
     /// Bitport bearer token (empty = not connected); the connect flow mints it
     pub bitport_token: String,
+    /// bring finished cloud transfers to this machine over HTTPS (the whole
+    /// point of the backend); off = files stay in the cloud and episodes are
+    /// marked downloaded when Bitport finishes
+    pub bitport_fetch_to_local: bool,
+    /// delete the transfer (and its files) from the cloud once every file
+    /// has landed locally and verified — keeps the small cloud quota free
+    pub bitport_delete_after_fetch: bool,
+    /// where fetched files land when the grab carried no save path of its
+    /// own (empty = <Downloads>/Trawler)
+    pub bitport_download_dir: String,
     /// weekly propose-only re-search for better-quality copies of recent grabs
     pub upgrade_scout_enabled: bool,
     /// how far back a download still counts as "recent" for the scout (days)
@@ -149,6 +159,9 @@ impl Default for Config {
             rss_minutes: 15,
             download_backend: "qbittorrent".into(),
             bitport_token: String::new(),
+            bitport_fetch_to_local: true,
+            bitport_delete_after_fetch: true,
+            bitport_download_dir: String::new(),
             upgrade_scout_enabled: false,
             upgrade_window_days: 30,
         }

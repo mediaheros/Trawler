@@ -12,6 +12,7 @@ mod db;
 mod error;
 mod follows;
 mod bitport;
+mod cloud;
 mod grab;
 mod launch_visibility;
 mod llm;
@@ -51,6 +52,8 @@ pub struct AppState {
     pub grab_claims: std::sync::Arc<grab::GrabClaims>,
     /// (fetched_at, payload) for the discovery rows
     pub discover_cache: Mutex<Option<(i64, serde_json::Value)>>,
+    /// the Bitport cloud backend's poller snapshot and fetch progress
+    pub cloud: cloud::CloudState,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -113,6 +116,7 @@ pub fn run() {
                 prowlarr_busy: AtomicBool::new(false),
                 grab_claims: std::sync::Arc::new(grab::GrabClaims::default()),
                 discover_cache: Mutex::new(None),
+                cloud: cloud::CloudState::default(),
             });
             // a Trawler-managed Prowlarr should come back after reboots
             let boot_handle = app.handle().clone();
@@ -154,6 +158,10 @@ pub fn run() {
             tauri::async_runtime::spawn(rss::rss_loop(rss_handle));
             let scout_handle = app.handle().clone();
             tauri::async_runtime::spawn(upgrade::scout_loop(scout_handle));
+            // the cloud backend: one poller owns every Bitport call, one
+            // fetcher brings finished transfers to this machine
+            tauri::async_runtime::spawn(cloud::poll_loop(app.handle().clone()));
+            tauri::async_runtime::spawn(cloud::fetch_loop(app.handle().clone()));
             let brief_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 use std::sync::atomic::Ordering;
@@ -264,6 +272,8 @@ pub fn run() {
             commands::bitport_status,
             commands::bitport_disconnect,
             commands::bitport_delete,
+            commands::cloud_retry,
+            commands::cloud_remove,
             commands::logs_recent,
             commands::logs_support_bundle,
             commands_discover::calendar_range,

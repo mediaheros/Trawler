@@ -409,10 +409,114 @@ pub(crate) fn torrent_info_hash(input: &[u8]) -> Option<String> {
     None
 }
 
+/// The raw bencoded value stored under `key` in a bencoded dictionary.
+fn bencode_dict_get<'a>(dict: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+    if dict.first() != Some(&b'd') {
+        return None;
+    }
+    let mut cursor = 1usize;
+    while *dict.get(cursor)? != b'e' {
+        let key_end = bencode_value_end(dict, cursor, 0)?;
+        let colon = dict[cursor..key_end].iter().position(|byte| *byte == b':')? + cursor;
+        let found = &dict[colon + 1..key_end];
+        let value_start = key_end;
+        let value_end = bencode_value_end(dict, value_start, 0)?;
+        if found == key {
+            return Some(&dict[value_start..value_end]);
+        }
+        cursor = value_end;
+    }
+    None
+}
+
+/// The bytes of a bencoded string value.
+fn bencode_string(value: &[u8]) -> Option<&[u8]> {
+    let colon = value.iter().position(|byte| *byte == b':')?;
+    let length = std::str::from_utf8(&value[..colon]).ok()?.parse::<usize>().ok()?;
+    value.get(colon + 1..colon + 1 + length)
+}
+
+/// The raw items of a bencoded list value.
+fn bencode_list_items(value: &[u8]) -> Vec<&[u8]> {
+    let mut items = vec![];
+    if value.first() != Some(&b'l') {
+        return items;
+    }
+    let mut cursor = 1usize;
+    while cursor < value.len() && value[cursor] != b'e' {
+        let Some(end) = bencode_value_end(value, cursor, 0) else { break };
+        items.push(&value[cursor..end]);
+        cursor = end;
+    }
+    items
+}
+
+/// A magnet link equivalent to a .torrent file: btih, display name and every
+/// tracker from `announce` / `announce-list`. Bitport's API accepts only a
+/// URL or a magnet (multipart uploads are refused with code 102), so this is
+/// how a torrent-only release reaches the cloud. Trackers are included on
+/// purpose — a private torrent has no DHT and cannot be found without them.
+pub(crate) fn magnet_from_torrent(input: &[u8]) -> Option<String> {
+    let hash = torrent_info_hash(input)?;
+    let mut magnet = format!("magnet:?xt=urn:btih:{hash}");
+    let name = bencode_dict_get(input, b"info")
+        .and_then(|info| bencode_dict_get(info, b"name"))
+        .and_then(bencode_string)
+        .map(|n| String::from_utf8_lossy(n).into_owned())
+        .filter(|n| !n.trim().is_empty());
+    if let Some(name) = name {
+        let dn: String = url::form_urlencoded::byte_serialize(name.as_bytes()).collect();
+        magnet.push_str("&dn=");
+        magnet.push_str(&dn);
+    }
+    let mut trackers: Vec<String> = vec![];
+    let mut push = |raw: &[u8]| {
+        let tr = String::from_utf8_lossy(raw).trim().to_string();
+        if !tr.is_empty() && !trackers.contains(&tr) {
+            trackers.push(tr);
+        }
+    };
+    if let Some(announce) = bencode_dict_get(input, b"announce").and_then(bencode_string) {
+        push(announce);
+    }
+    if let Some(list) = bencode_dict_get(input, b"announce-list") {
+        for tier in bencode_list_items(list) {
+            for item in bencode_list_items(tier) {
+                if let Some(tr) = bencode_string(item) {
+                    push(tr);
+                }
+            }
+        }
+    }
+    for tr in trackers {
+        let encoded: String = url::form_urlencoded::byte_serialize(tr.as_bytes()).collect();
+        magnet.push_str("&tr=");
+        magnet.push_str(&encoded);
+    }
+    Some(magnet)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn magnet_from_torrent_carries_hash_name_and_every_tracker() {
+        let torrent = b"d8:announce20:udp://a.example:691113:announce-listll20:udp://a.example:6911el20:http://b.example/annee4:infod4:name4:test6:lengthi1eee";
+        let magnet = magnet_from_torrent(torrent).expect("valid torrent");
+        assert!(magnet.starts_with("magnet:?xt=urn:btih:"), "{magnet}");
+        assert_eq!(
+            crate::scheduler::magnet_hash(Some(&magnet)),
+            torrent_info_hash(torrent),
+            "the magnet's btih is the torrent's info hash"
+        );
+        assert!(magnet.contains("&dn=test"), "{magnet}");
+        assert_eq!(magnet.matches("&tr=").count(), 2, "duplicates collapse: {magnet}");
+        assert!(magnet.contains("&tr=udp%3A%2F%2Fa.example%3A6911"), "{magnet}");
+        assert!(magnet.contains("&tr=http%3A%2F%2Fb.example%2Fann"), "{magnet}");
+        assert_eq!(magnet_from_torrent(b"d3:foo3:bare"), None, "no info dict, no magnet");
+    }
 
     #[test]
     fn torrent_info_hash_uses_the_exact_info_dictionary() {

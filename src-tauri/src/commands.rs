@@ -681,7 +681,8 @@ pub async fn perform_grab_core(
 pub struct DownloadsView {
     pub torrents: Vec<QbitTorrent>,
     pub transfer: Option<TransferInfo>,
-    pub cloud: Vec<crate::bitport::BitportTransfer>,
+    /// the Bitport side, read from the poller's snapshot — never a live call
+    pub cloud: crate::cloud::CloudView,
     pub qbit_error: Option<String>,
 }
 
@@ -701,19 +702,9 @@ pub async fn downloads(state: State<'_, AppState>, all: bool) -> Result<Download
         Err(e) => (vec![], Some(e.to_string())),
     };
     let transfer = if qbit_error.is_none() { q.transfer_info().await.ok() } else { None };
-    // cloud transfers ride along whenever an account is connected — additive,
-    // and a Bitport hiccup must never blank the local list
-    let cloud = if cfg.bitport_token.is_empty() {
-        vec![]
-    } else {
-        let bp = crate::bitport::BitportClient { http: &state.http, token: cfg.bitport_token.clone() };
-        // short leash: this rides the 2s Downloads poll — a Bitport hiccup
-        // must never stall the local list behind a 20s network timeout
-        match tokio::time::timeout(std::time::Duration::from_secs(4), bp.transfers()).await {
-            Ok(Ok(t)) => t,
-            _ => vec![],
-        }
-    };
+    // the cloud side rides along from the poller's snapshot: this command
+    // runs every 2 s while the view is open and must never hit Bitport
+    let cloud = crate::cloud::view(state.inner(), &cfg).await;
     Ok(DownloadsView { torrents, transfer, cloud, qbit_error })
 }
 
@@ -1087,7 +1078,28 @@ pub async fn remove_indexer(state: State<'_, AppState>, id: i32) -> Result<()> {
 #[serde(rename_all = "camelCase")]
 pub struct BitportStatus {
     pub connected: bool,
+    /// the stored token was rejected: connected in name only
+    pub auth_failed: bool,
     pub quota: Option<crate::bitport::BitportQuota>,
+    /// where the manual flow sends a user whose browser is elsewhere
+    pub get_access_url: String,
+    /// where fetched files land when a grab carries no save path
+    pub default_download_dir: String,
+}
+
+async fn bitport_status_now(
+    state: &AppState,
+    cfg: &Config,
+    connected: bool,
+    quota: Option<crate::bitport::BitportQuota>,
+) -> BitportStatus {
+    BitportStatus {
+        connected,
+        auth_failed: connected && state.cloud.auth_failed.load(std::sync::atomic::Ordering::SeqCst),
+        quota,
+        get_access_url: crate::bitport::GET_ACCESS_URL.into(),
+        default_download_dir: crate::cloud::resolve_dest_root(cfg, None).to_string_lossy().into_owned(),
+    }
 }
 
 #[tauri::command]
@@ -1109,7 +1121,10 @@ pub async fn bitport_connect_flow(
     let listener = crate::bitport::bind_callback().await?;
     let oauth_state = crate::bitport::new_oauth_state()?;
     let url = crate::bitport::authorize_url(Some(&oauth_state));
-    crate::applog::info("bitport", "waiting for browser approval on 127.0.0.1:8788");
+    crate::applog::info(
+        "bitport",
+        format!("waiting for browser approval on 127.0.0.1:{}", crate::bitport::CALLBACK_PORT),
+    );
     app.opener()
         .open_url(url.clone(), None::<&str>)
         .map_err(|e| AppError::Other(format!("could not open your browser ({e}) — visit {url} manually")))?;
@@ -1128,45 +1143,70 @@ pub async fn bitport_connect_flow(
 /// transient probe failure would burn the user's whole approval.
 async fn bitport_store_and_probe(state: &AppState, token: String) -> Result<BitportStatus> {
     let bp = crate::bitport::BitportClient { http: &state.http, token: token.clone() };
-    match bp.me().await {
+    let probe = bp.me().await;
+    if let Err(AppError::BitportAuth) = probe {
+        return Err(AppError::Other(
+            "Bitport rejected the token it just issued — try connecting again".into(),
+        ));
+    }
+    let cfg = {
+        // save before committing to memory: a refused save must not report
+        // "connected" for a token that will be gone at restart
+        let mut cfg = state.config.write().await;
+        let mut next = cfg.clone();
+        next.bitport_token = token;
+        crate::config::save(&next)?;
+        *cfg = next;
+        cfg.clone()
+    };
+    state.cloud.auth_failed.store(false, std::sync::atomic::Ordering::SeqCst);
+    let quota = match probe {
         Ok(quota) => {
-            // save before committing to memory: a refused save must not
-            // report "connected" for a token that will be gone at restart
-            let mut cfg = state.config.write().await;
-            let mut next = cfg.clone();
-            next.bitport_token = token;
-            crate::config::save(&next)?;
-            *cfg = next;
             crate::applog::info(
                 "bitport",
-                format!("connected — plan {}, {:.0} GB free", quota.plan_name, quota.disk_available as f64 / 1e9),
+                format!(
+                    "connected — plan {}, {} free",
+                    quota.plan_name,
+                    crate::cloud::fmt_bytes(quota.disk_available)
+                ),
             );
-            Ok(BitportStatus { connected: true, quota: Some(quota) })
+            let mut snap = state.cloud.snapshot.write().await;
+            snap.quota = Some(quota.clone());
+            snap.quota_at = crate::db::now();
+            Some(quota)
         }
-        Err(e) if e.to_string().contains("rejected the token") => Err(e),
         Err(e) => {
-            let mut cfg = state.config.write().await;
-            let mut next = cfg.clone();
-            next.bitport_token = token;
-            crate::config::save(&next)?;
-            *cfg = next;
             crate::applog::warn(
                 "bitport",
                 format!("connected, but the account probe failed ({e}) — quota will appear once Bitport answers"),
             );
-            Ok(BitportStatus { connected: true, quota: None })
+            None
         }
-    }
+    };
+    // a fresh listing right away: transfers from an earlier install show up
+    state.cloud.wake.notify_one();
+    Ok(bitport_status_now(state, &cfg, true, quota).await)
 }
 
-/// Exchange the pasted authorization code and persist the token.
+/// Exchange a pasted code and persist the token. The paste may be the
+/// redirect URL (or its code) from the browser flow, or the short USER code
+/// bitport.io/get-access hands out — the two need different grants, so both
+/// are tried.
 #[tauri::command]
 pub async fn bitport_connect(state: State<'_, AppState>, code: String) -> Result<BitportStatus> {
     let code = crate::bitport::extract_code(&code);
     if code.is_empty() {
         return Err(AppError::Other("paste the code Bitport showed you".into()));
     }
-    let token = crate::bitport::exchange_code(&state.http, &code).await?;
+    let token = match crate::bitport::exchange(&state.http, &code, crate::bitport::CodeKind::Authorization).await {
+        Ok(t) => t,
+        Err(first) => {
+            match crate::bitport::exchange(&state.http, &code, crate::bitport::CodeKind::UserCode).await {
+                Ok(t) => t,
+                Err(_) => return Err(first),
+            }
+        }
+    };
     bitport_store_and_probe(&state, token).await
 }
 
@@ -1174,14 +1214,36 @@ pub async fn bitport_connect(state: State<'_, AppState>, code: String) -> Result
 pub async fn bitport_status(state: State<'_, AppState>) -> Result<BitportStatus> {
     let cfg = state.config.read().await.clone();
     if cfg.bitport_token.is_empty() {
-        return Ok(BitportStatus { connected: false, quota: None });
+        return Ok(bitport_status_now(state.inner(), &cfg, false, None).await);
     }
-    let bp = crate::bitport::BitportClient { http: &state.http, token: cfg.bitport_token.clone() };
-    match bp.me().await {
-        Ok(q) => Ok(BitportStatus { connected: true, quota: Some(q) }),
-        // connected-but-unreachable still counts as connected; quota just absent
-        Err(_) => Ok(BitportStatus { connected: true, quota: None }),
-    }
+    // the poller's quota when fresh; one live probe otherwise (Settings is
+    // opened rarely, and the answer is what the user came to see)
+    let cached = {
+        let snap = state.cloud.snapshot.read().await;
+        snap.quota.clone().filter(|_| crate::db::now() - snap.quota_at < 600)
+    };
+    let quota = match cached {
+        Some(q) => Some(q),
+        None => {
+            let bp = crate::bitport::BitportClient { http: &state.http, token: cfg.bitport_token.clone() };
+            match bp.me().await {
+                Ok(q) => {
+                    state.cloud.auth_failed.store(false, std::sync::atomic::Ordering::SeqCst);
+                    let mut snap = state.cloud.snapshot.write().await;
+                    snap.quota = Some(q.clone());
+                    snap.quota_at = crate::db::now();
+                    Some(q)
+                }
+                Err(AppError::BitportAuth) => {
+                    state.cloud.auth_failed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    None
+                }
+                // connected-but-unreachable still counts as connected; quota just absent
+                Err(_) => None,
+            }
+        }
+    };
+    Ok(bitport_status_now(state.inner(), &cfg, true, quota).await)
 }
 
 #[tauri::command]
@@ -1196,8 +1258,11 @@ pub async fn bitport_disconnect(state: State<'_, AppState>) -> Result<()> {
         crate::config::save(&next)?;
         *cfg = next;
     }
-    // no token means no completion pass will ever settle the open cloud
-    // claims - release them now so their episodes can be grabbed locally
+    *state.cloud.snapshot.write().await = crate::cloud::CloudSnapshot::default();
+    state.cloud.auth_failed.store(false, std::sync::atomic::Ordering::SeqCst);
+    // no token means no poll will ever settle the open cloud claims —
+    // release them now so their episodes can be grabbed locally. Rows
+    // already fetching keep their files; they resume on a reconnect.
     let conn = state.db.lock().await;
     let released = crate::db::ledger_release_backend(&conn, "bitport")?;
     if released > 0 {
@@ -1211,62 +1276,66 @@ pub async fn bitport_disconnect(state: State<'_, AppState>) -> Result<()> {
     Ok(())
 }
 
+/// Remove a transfer Trawler did NOT create (the "also in your cloud"
+/// section). Trawler's own grabs go through `cloud_remove`, but a ledger
+/// row that happens to match is released here too, exactly like deleting
+/// a local torrent releases its claim.
 #[tauri::command]
 pub async fn bitport_delete(state: State<'_, AppState>, token: String) -> Result<()> {
     let cfg = state.config.read().await.clone();
     let bp = crate::bitport::BitportClient { http: &state.http, token: cfg.bitport_token.clone() };
-    // capture the transfer's identity before it disappears — removing a cloud
-    // grab must RELEASE it in Trawler, exactly like deleting a local torrent:
-    // the ledger's anti-double-grab memory must not outlive the thing it
-    // points at, or a deliberate re-download stays blocked forever
-    let victim = bp.transfers().await.ok().and_then(|ts| ts.into_iter().find(|t| t.token == token));
+    let victim = {
+        let snap = state.cloud.snapshot.read().await;
+        snap.transfers.iter().find(|t| t.token == token).cloned()
+    };
     bp.delete_transfer(&token).await?;
+    {
+        let mut snap = state.cloud.snapshot.write().await;
+        snap.transfers.retain(|t| t.token != token);
+    }
     let vic_hash = victim.as_ref().and_then(crate::bitport::transfer_hash);
     let vic_norm = victim.as_ref().map(|t| normalize(&t.name));
     let conn = state.db.lock().await;
-    type BitportLedgerRow = (i64, String, Option<String>, Option<String>, Option<String>);
-    let rows: Vec<BitportLedgerRow> = conn
-        .prepare("SELECT id, title, info_hash, ep_ids, bp_token FROM grab_ledger WHERE backend = 'bitport' AND state IN ('grabbed','completed')")
-        .ok()
-        .map(|mut stmt| {
-            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
-                .map(|it| it.flatten().collect::<Vec<_>>())
-                .unwrap_or_default()
-        })
-        .unwrap_or_default();
-    let mut freed = 0usize;
-    let mut freed_name = String::new();
-    for (id, title, info_hash, ep_ids_raw, bp_token) in rows {
-        let tok_match = bp_token.as_deref() == Some(token.as_str());
-        let hash_match = match (&info_hash, &vic_hash) {
-            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
-            _ => false,
-        };
-        let norm_match = vic_norm.as_ref().map(|n| &normalize(&title) == n).unwrap_or(false);
+    let mut freed_name: Option<String> = None;
+    for row in crate::db::cloud_ledger_rows(&conn, &["dispatching", "grabbed", "fetching", "completed"]) {
+        let tok_match = row.bp_token.as_deref() == Some(token.as_str());
+        let hash_match =
+            matches!((&row.info_hash, &vic_hash), (Some(a), Some(b)) if a.eq_ignore_ascii_case(b));
+        let norm_match = vic_norm.as_ref().is_some_and(|n| &normalize(&row.title) == n);
         if tok_match || hash_match || norm_match {
-            let _ = conn.execute("UPDATE grab_ledger SET state = 'deleted' WHERE id = ?1", [id]);
-            crate::db::set_episodes_state_by_ids(
-                &conn,
-                &crate::db::parse_ep_ids(ep_ids_raw.as_deref()),
-                "wanted",
-                None,
-            );
-            freed += 1;
-            freed_name = title;
+            crate::db::cloud_fetch_delete_for_ledger(&conn, row.id);
+            let _ = crate::db::ledger_set_state(&conn, row.id, "deleted");
+            if row.state != "completed" {
+                crate::db::set_episodes_state_by_ids(&conn, &row.ep_ids, "wanted", None);
+            }
+            freed_name = Some(row.title);
         }
     }
-    if freed > 0 {
+    if let Some(name) = freed_name {
         crate::db::log_activity(
             &conn,
             "system",
             None,
             &format!(
                 "Removed from your cloud: {} — released; Trawler can grab it again",
-                freed_name.chars().take(60).collect::<String>()
+                name.chars().take(60).collect::<String>()
             ),
         );
     }
+    state.cloud.wake.notify_one();
     Ok(())
+}
+
+/// Try a cloud grab's failed files again.
+#[tauri::command]
+pub async fn cloud_retry(state: State<'_, AppState>, ledger_id: i64) -> Result<usize> {
+    crate::cloud::retry(state.inner(), ledger_id).await
+}
+
+/// Remove one of Trawler's cloud grabs: from the cloud too when asked.
+#[tauri::command]
+pub async fn cloud_remove(state: State<'_, AppState>, ledger_id: i64, delete_cloud: bool) -> Result<()> {
+    crate::cloud::remove(state.inner(), ledger_id, delete_cloud).await
 }
 
 // ---------- log console ----------
