@@ -1309,7 +1309,7 @@ pub async fn dispatch_precheck(state: &AppState, cfg: &Config, size: i64) -> Res
     };
     if quota.plan_expired {
         return Err(AppError::Other(
-            "your Bitport plan has expired — renew it or switch grabs back to qBittorrent in Settings".into(),
+            "your Bitport plan has expired — renew it, or grab this locally with qBittorrent instead".into(),
         ));
     }
     if size > 0 && quota.disk_available < size {

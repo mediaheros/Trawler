@@ -386,6 +386,13 @@ function ResultRow({ r, first }: { r: Release; first: boolean }) {
   // default only decides which button is the highlighted one
   const cloudConnected = useStore((s) => !!s.config?.bitportConnected);
   const defaultCloud = useStore((s) => s.config?.downloadBackend === "bitport");
+  // which of the two buttons was pressed, so only that one spins while the
+  // shared in-flight state disables both
+  const [pending, setPending] = useState<"qbittorrent" | "bitport" | null>(null);
+  const send = (backend: "qbittorrent" | "bitport") => {
+    setPending(backend);
+    void grab(r, backend);
+  };
   const p = r.parsed;
 
   return (
@@ -470,8 +477,9 @@ function ResultRow({ r, first }: { r: Release; first: boolean }) {
           <>
             <Button
               variant={defaultCloud ? "default" : "primary"}
-              busy={state === "loading"}
-              onClick={() => grab(r, "qbittorrent")}
+              busy={state === "loading" && pending === "qbittorrent"}
+              disabled={state === "loading"}
+              onClick={() => send("qbittorrent")}
               className="px-2.5 py-1 text-[11.5px]"
               title="Send to qBittorrent on this computer"
             >
@@ -479,8 +487,9 @@ function ResultRow({ r, first }: { r: Release; first: boolean }) {
             </Button>
             <Button
               variant={defaultCloud ? "primary" : "default"}
-              busy={state === "loading"}
-              onClick={() => grab(r, "bitport")}
+              busy={state === "loading" && pending === "bitport"}
+              disabled={state === "loading"}
+              onClick={() => send("bitport")}
               className="px-2.5 py-1 text-[11.5px]"
               title="Send to your Bitport cloud — the files come here over HTTPS when it finishes"
             >
