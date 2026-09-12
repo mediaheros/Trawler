@@ -49,6 +49,7 @@ pub async fn get_config(state: State<'_, AppState>) -> Result<Config> {
     // the whole config as a draft, and a draft must be able to neither wipe
     // nor read the secret
     let mut cfg = state.config.read().await.clone();
+    cfg.bitport_connected = !cfg.bitport_token.is_empty();
     cfg.bitport_token.clear();
     Ok(cfg)
 }
@@ -66,6 +67,7 @@ pub async fn set_config(state: State<'_, AppState>, config: Config) -> Result<Co
         config::save(&config)?;
         *guard = config.clone();
     }
+    config.bitport_connected = !config.bitport_token.is_empty();
     config.bitport_token.clear();
     Ok(config)
 }
@@ -533,6 +535,8 @@ pub async fn grab(
     info_hash: Option<String>,
     size: Option<i64>,
     ep_ids: Option<Vec<i64>>,
+    // "qbittorrent" | "bitport"; absent = the Settings default
+    backend: Option<String>,
 ) -> Result<GrabResult> {
     let save_path = {
         let cfg = state.config.read().await.clone();
@@ -556,6 +560,7 @@ pub async fn grab(
             save_path,
             info_hash,
             size: size.unwrap_or(0),
+            backend: backend.filter(|b| b == "bitport" || b == "qbittorrent"),
         },
         None,
         ep_ids.clone(),

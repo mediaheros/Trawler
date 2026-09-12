@@ -345,6 +345,7 @@ async fn grab_release(state: &AppState, ctx: &mut RunCtx, args: &Value) -> Value
     let outcome = crate::grab::dispatch(
         state,
         crate::grab::GrabOrder {
+            backend: None,
             title: stored.title.clone(),
             magnet_url: stored.magnet_url.clone(),
             download_url: stored.download_url.clone(),

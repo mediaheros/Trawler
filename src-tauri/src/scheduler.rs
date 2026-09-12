@@ -301,6 +301,7 @@ async fn execute_plan(app: &tauri::AppHandle, state: &AppState, plan: &PlannedGr
     let outcome = crate::grab::dispatch(
         state,
         crate::grab::GrabOrder {
+            backend: None,
             title: plan.title.clone(),
             magnet_url: plan.magnet_url.clone(),
             download_url: plan.download_url.clone(),

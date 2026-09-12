@@ -50,7 +50,10 @@ export default function BitportCard({
     const free = s.quota ? fmtBytes(s.quota.diskAvailable) + " free in the cloud" : "ready";
     // connected is not the same as used: grabs still go wherever the
     // picker says until the user moves it and saves
-    const hint = backendRef.current === "bitport" ? "" : " — pick \"Bitport cloud\" below and Save to send grabs there";
+    const hint =
+      backendRef.current === "bitport"
+        ? ""
+        : " — search results now offer a Cloud button; pick \"Bitport cloud\" below and Save to send automatic grabs there too";
     toast(`Bitport connected — ${free}${hint}`, "ok");
   };
 
@@ -173,7 +176,7 @@ export default function BitportCard({
 
           {/* not a <label>: a label's click would land on the first button and flip the choice */}
           <div>
-            <div className="mb-1 text-[11.5px] font-medium text-dim">Where do grabs go?</div>
+            <div className="mb-1 text-[11.5px] font-medium text-dim">Where do automatic grabs go?</div>
             <Segmented
               value={draft.downloadBackend === "bitport" ? "bitport" : "qbittorrent"}
               onChange={(b) => set({ downloadBackend: b })}
@@ -183,8 +186,9 @@ export default function BitportCard({
               ]}
             />
             <div className="mt-1 text-[11px] text-faint">
-              Manual grabs, the scheduler and the agent all follow this. Connect and disconnect take effect at once;
-              this and the options below apply after Save.
+              The scheduler, the RSS sweep and the agent follow this. In search results you choose per release:
+              every row offers both Grab and Cloud while Bitport is connected. Connect and disconnect take effect at
+              once; this and the options below apply after Save.
             </div>
           </div>
 

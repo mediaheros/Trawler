@@ -37,6 +37,8 @@ export interface Config {
   rssEnabled: boolean;
   rssMinutes: number;
   downloadBackend: string;
+  /** read-only: a Bitport account is connected (the token itself never reaches the UI) */
+  bitportConnected: boolean;
   /** bring finished cloud transfers to this machine over HTTPS */
   bitportFetchToLocal: boolean;
   /** delete the transfer from the cloud once its files are here and verified */
@@ -330,6 +332,8 @@ export interface GrabResult {
   detail: string;
 }
 
+export type GrabBackend = "qbittorrent" | "bitport";
+
 // ---------- followed shows ----------
 
 export interface QualityProfile {
@@ -503,7 +507,8 @@ export const api = {
   listIndexers: () => call<Indexer[]>("list_indexers"),
   search: (query: string, kind: string, indexerIds: number[] = []) =>
     call<SearchResponse>("search", { query, kind, indexerIds }),
-  grab: (r: Release, epIds: number[] = []) =>
+  /** backend: "qbittorrent" | "bitport" for this one grab; omitted = the Settings default */
+  grab: (r: Release, epIds: number[] = [], backend?: GrabBackend) =>
     call<GrabResult>("grab", {
       title: r.title,
       kind: r.kind,
@@ -512,6 +517,7 @@ export const api = {
       infoHash: r.infoHash,
       size: r.size,
       epIds,
+      backend: backend ?? null,
     }),
   downloads: (all = false) => call<DownloadsView>("downloads", { all }),
   torrentAction: (action: string, hash: string) =>
@@ -927,6 +933,7 @@ async function mock(cmd: string, args?: Record<string, unknown>): Promise<unknow
         rssEnabled: true,
         rssMinutes: 15,
         downloadBackend: "qbittorrent",
+        bitportConnected: mockBp.connected,
         bitportFetchToLocal: true,
         bitportDeleteAfterFetch: true,
         bitportDownloadDir: "",
@@ -969,8 +976,13 @@ async function mock(cmd: string, args?: Record<string, unknown>): Promise<unknow
         ],
       } satisfies SearchResponse;
     }
-    case "grab":
-      return { ok: true, detail: `Sent to qBittorrent: ${args?.title}` } satisfies GrabResult;
+    case "grab": {
+      const toCloud = (args as { backend?: string | null })?.backend === "bitport";
+      return {
+        ok: true,
+        detail: `${toCloud ? "Sent to your Bitport cloud" : "Sent to qBittorrent"}: ${args?.title}`,
+      } satisfies GrabResult;
+    }
     case "downloads":
       mockTorrents = mockTorrents.map((t) =>
         t.state === "downloading"

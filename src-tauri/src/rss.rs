@@ -361,6 +361,7 @@ pub async fn sweep(app: &AppHandle) -> Result<SweepStats> {
         let outcome = crate::grab::dispatch(
             state,
             crate::grab::GrabOrder {
+                backend: None,
                 title: cand.release.title.clone(),
                 magnet_url: cand.release.magnet_url.clone(),
                 download_url: cand.release.download_url.clone(),
@@ -453,6 +454,7 @@ pub async fn sweep(app: &AppHandle) -> Result<SweepStats> {
             let outcome = crate::grab::dispatch(
                 state,
                 crate::grab::GrabOrder {
+                    backend: None,
                     title: cand.release.title.clone(),
                     magnet_url: cand.release.magnet_url.clone(),
                     download_url: cand.release.download_url.clone(),

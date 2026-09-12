@@ -107,6 +107,11 @@ pub struct Config {
     pub download_backend: String,
     /// Bitport bearer token (empty = not connected); the connect flow mints it
     pub bitport_token: String,
+    /// derived for the webview only (the token itself never travels): is an
+    /// account connected, so search can offer "grab to cloud" per release.
+    /// Never read back from a draft or the file.
+    #[serde(skip_deserializing)]
+    pub bitport_connected: bool,
     /// bring finished cloud transfers to this machine over HTTPS (the whole
     /// point of the backend); off = files stay in the cloud and episodes are
     /// marked downloaded when Bitport finishes
@@ -159,6 +164,7 @@ impl Default for Config {
             rss_minutes: 15,
             download_backend: "qbittorrent".into(),
             bitport_token: String::new(),
+            bitport_connected: false,
             bitport_fetch_to_local: true,
             bitport_delete_after_fetch: true,
             bitport_download_dir: String::new(),

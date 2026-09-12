@@ -141,6 +141,10 @@ pub struct GrabOrder {
     pub save_path: Option<String>,
     pub info_hash: Option<String>,
     pub size: i64,
+    /// where THIS grab goes: "qbittorrent" or "bitport". None follows the
+    /// Settings default — what every automatic path does; a manual grab
+    /// from search picks per release.
+    pub backend: Option<String>,
 }
 
 pub enum GrabOutcome {
@@ -197,7 +201,18 @@ pub async fn dispatch(
     let title = order.title.clone();
     // the ADDITIVE cloud backend: same claim, same ledger, same episode
     // linkage — only the transport differs. Chosen per config, never forced.
-    let use_bitport = uses_bitport(&cfg);
+    let use_bitport = match order.backend.as_deref() {
+        Some("bitport") => {
+            if cfg.bitport_token.is_empty() {
+                return Err(AppError::Other(
+                    "Bitport is not connected — connect it under Settings → Connections first".into(),
+                ));
+            }
+            true
+        }
+        Some(_) => false,
+        None => uses_bitport(&cfg),
+    };
     let backend: &'static str = if use_bitport { "bitport" } else { "qbittorrent" };
     if use_bitport {
         // an expired plan or a full cloud disk is a definitive refusal, not
