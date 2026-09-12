@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  Cloud,
   ArrowDown,
   ArrowUp,
   Check,
@@ -381,6 +382,17 @@ function ageDays(r: Release): number {
 function ResultRow({ r, first }: { r: Release; first: boolean }) {
   const grab = useStore((s) => s.grab);
   const state = useStore((s) => s.grabState[r.guid ?? r.title]);
+  // with Bitport connected every release can go either way; the Settings
+  // default only decides which button is the highlighted one
+  const cloudConnected = useStore((s) => !!s.config?.bitportConnected);
+  const defaultCloud = useStore((s) => s.config?.downloadBackend === "bitport");
+  // which of the two buttons was pressed, so only that one spins while the
+  // shared in-flight state disables both
+  const [pending, setPending] = useState<"qbittorrent" | "bitport" | null>(null);
+  const send = (backend: "qbittorrent" | "bitport") => {
+    setPending(backend);
+    void grab(r, backend);
+  };
   const p = r.parsed;
 
   return (
@@ -457,24 +469,44 @@ function ResultRow({ r, first }: { r: Release; first: boolean }) {
             <ExternalLink size={13} />
           </a>
         )}
-        <Button
-          variant={state === "done" ? "default" : "primary"}
-          busy={state === "loading"}
-          disabled={state === "done"}
-          onClick={() => grab(r)}
-          className="px-2.5 py-1 text-[11.5px]"
-          title="Send to qBittorrent"
-        >
-          {state === "done" ? (
-            <>
-              <Check size={12} className="text-ok" /> Sent
-            </>
-          ) : (
-            <>
+        {state === "done" ? (
+          <Button variant="default" disabled className="px-2.5 py-1 text-[11.5px]">
+            <Check size={12} className="text-ok" /> Sent
+          </Button>
+        ) : cloudConnected ? (
+          <>
+            <Button
+              variant={defaultCloud ? "default" : "primary"}
+              busy={state === "loading" && pending === "qbittorrent"}
+              disabled={state === "loading"}
+              onClick={() => send("qbittorrent")}
+              className="px-2.5 py-1 text-[11.5px]"
+              title="Send to qBittorrent on this computer"
+            >
               <Magnet size={12} /> Grab
-            </>
-          )}
-        </Button>
+            </Button>
+            <Button
+              variant={defaultCloud ? "primary" : "default"}
+              busy={state === "loading" && pending === "bitport"}
+              disabled={state === "loading"}
+              onClick={() => send("bitport")}
+              className="px-2.5 py-1 text-[11.5px]"
+              title="Send to your Bitport cloud — the files come here over HTTPS when it finishes"
+            >
+              <Cloud size={12} /> Cloud
+            </Button>
+          </>
+        ) : (
+          <Button
+            variant="primary"
+            busy={state === "loading"}
+            onClick={() => grab(r)}
+            className="px-2.5 py-1 text-[11.5px]"
+            title="Send to qBittorrent"
+          >
+            <Magnet size={12} /> Grab
+          </Button>
+        )}
       </div>
     </div>
   );

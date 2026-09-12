@@ -138,6 +138,29 @@ pub(crate) fn scrub(msg: &str) -> String {
         o.push_str(rest);
         o
     };
+    // Bitport's signed CDN links: everything after "/dl/" up to the file
+    // name is the signature (token, expiry, account ids) — mask it all
+    let out = {
+        let mut o = String::with_capacity(out.len());
+        let mut rest = out.as_str();
+        const MARK: &str = ".energycdn.com/dl/";
+        while let Some(i) = rest.find(MARK) {
+            let end = i + MARK.len();
+            o.push_str(&rest[..end]);
+            o.push_str("•••/");
+            let tail = &rest[end..];
+            let stop = tail
+                .find(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+                .unwrap_or(tail.len());
+            // keep the trailing file name, drop the signed segments
+            let signed = &tail[..stop];
+            let name = signed.rsplit('/').next().unwrap_or("");
+            o.push_str(name);
+            rest = &tail[stop..];
+        }
+        o.push_str(rest);
+        o
+    };
 
     // pass 2: hex runs (a tracker passkey as a PATH segment of >=16 hex, or
     // any bare >=20-char hex run) and mixed letter+digit path segments of
@@ -282,6 +305,11 @@ mod tests {
         assert_eq!(
             scrub("fetch https://dir.bitport.io/qszik7hip9xqfj26/My%20Files/x.mkv done"),
             "fetch https://dir.bitport.io/•••/My%20Files/x.mkv done"
+        );
+        // and so is everything between /dl/ and the file name on their CDN
+        assert_eq!(
+            scrub("got https://ruthlessgoat-sto.energycdn.com/dl/KZzZM6iHl03y9YgAWVL0dw/1789824116/800424038/6a6770ced49cc7.89694210/Show.S01E01.mkv 206"),
+            "got https://ruthlessgoat-sto.energycdn.com/dl/•••/Show.S01E01.mkv 206"
         );
     }
 

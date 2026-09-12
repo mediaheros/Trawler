@@ -8,21 +8,30 @@ import {
   Play,
   Trash2,
 } from "lucide-react";
-import { api, type DownloadsView as DL, type QbitTorrent } from "../lib/api";
+import { api, type BitportTransfer, type CloudItem, type DownloadsView as DL, type QbitTorrent } from "../lib/api";
 import { fmtBytes, fmtEta, fmtSpeed, qbitStateLabel, stateKind } from "../lib/format";
 import { useStore } from "../store";
 import { Button, CenterMessage, Segmented, cx } from "../components/ui";
-import { Cloud } from "lucide-react";
+import { Cloud, CloudDownload } from "lucide-react";
+import { CloudGrabCard, OtherCloudCard } from "../components/CloudCards";
 
 export default function DownloadsView() {
   const [data, setData] = useState<DL | null>(null);
   const [error, setError] = useState<string | null>(null);
-  // tokens removed optimistically: a poll already in flight when the user
-  // clicked remove can still carry the dead transfer — hide it briefly
+  // removed optimistically: a poll already in flight when the user clicked
+  // remove can still carry the dead entry — hide it briefly. Keys are
+  // "t:<token>" for foreign cloud transfers and "l:<ledgerId>" for grabs.
   const removedRef = useRef<Map<string, number>>(new Map());
+  const hidden = (key: string) => {
+    const t = removedRef.current.get(key);
+    if (t && Date.now() - t < 15_000) return true;
+    if (t) removedRef.current.delete(key);
+    return false;
+  };
   const [scope, setScope] = useState<"trawler" | "all">("trawler");
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
   const toast = useStore((s) => s.toast);
+  const config = useStore((s) => s.config);
 
   useEffect(() => {
     let alive = true;
@@ -61,6 +70,69 @@ export default function DownloadsView() {
     }
   };
 
+  const retryCloud = async (item: CloudItem) => {
+    try {
+      const n = await api.cloudRetry(item.ledgerId);
+      toast(
+        n === 0
+          ? "Nothing left to retry"
+          : item.filesFailed > 0
+            ? `Retrying ${item.filesFailed} file${item.filesFailed === 1 ? "" : "s"}`
+            : "Trying again — Bitport will be re-read on the next check",
+        "info",
+      );
+    } catch (e) {
+      toast(String(e), "bad");
+    }
+  };
+
+  const removeCloud = async (item: CloudItem, deleteCloud: boolean) => {
+    // a finished grab either drops its kept cloud copy (the card stays) or
+    // leaves the list; anything unfinished is taken out of the cloud too
+    const dropCloudCopyOnly = item.phase === "done" && deleteCloud;
+    try {
+      await api.cloudRemove(item.ledgerId, deleteCloud);
+      if (dropCloudCopyOnly) {
+        setData((d) =>
+          d ? { ...d, cloud: { ...d.cloud, items: d.cloud.items.map((x) => (x.ledgerId === item.ledgerId ? { ...x, cloudCopy: false } : x)) } } : d,
+        );
+        toast(`Deleted the cloud copy of ${item.title}`, "info");
+        return;
+      }
+      removedRef.current.set(`l:${item.ledgerId}`, Date.now());
+      setData((d) => (d ? { ...d, cloud: { ...d.cloud, items: d.cloud.items.filter((x) => x.ledgerId !== item.ledgerId) } } : d));
+      toast(
+        item.phase === "done"
+          ? `Hid ${item.title}`
+          : item.cloudCopy && item.token
+            ? `Removed ${item.title} from Trawler and Bitport`
+            : `Removed ${item.title}`,
+        "info",
+      );
+    } catch (e) {
+      toast(String(e), "bad");
+    }
+  };
+
+  const deleteOther = async (t: BitportTransfer) => {
+    try {
+      await api.bitportDelete(t.token);
+      removedRef.current.set(`t:${t.token}`, Date.now());
+      setData((d) => (d ? { ...d, cloud: { ...d.cloud, others: d.cloud.others.filter((x) => x.token !== t.token) } } : d));
+      toast("Deleted from your Bitport cloud", "info");
+    } catch (e) {
+      toast(String(e), "bad");
+    }
+  };
+
+  const cloudItems = data?.cloud.items.filter((i) => !hidden(`l:${i.ledgerId}`)) ?? [];
+  const cloudOthers = data?.cloud.others.filter((t) => !hidden(`t:${t.token}`)) ?? [];
+  const showOthers = scope === "all" && cloudOthers.length > 0;
+  const nothingAtAll = !!data && data.torrents.length === 0 && cloudItems.length === 0 && !showOthers;
+  // a cloud-first setup may have no qBittorrent at all: its silence is a
+  // note, not an alarm (the local list is unknown, not known-empty)
+  const cloudOnly = config?.downloadBackend === "bitport" && !!data?.cloud.connected;
+
   return (
     <div className="flex h-full flex-col">
       <div className="flex items-center justify-between px-6 pt-5 pb-4">
@@ -78,6 +150,12 @@ export default function DownloadsView() {
               </span>
             </div>
           )}
+          {data && data.cloud.fetchSpeed > 0 && (
+            <span className="flex items-center gap-1 font-mono text-[11.5px] text-faint" title="Coming down from your Bitport cloud">
+              <CloudDownload size={11} className="text-accent2" />
+              {fmtSpeed(data.cloud.fetchSpeed)}
+            </span>
+          )}
         </div>
         <Segmented
           value={scope}
@@ -90,9 +168,24 @@ export default function DownloadsView() {
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto px-6 pb-6">
-        {(error ?? data?.qbitError) && data && (
+        {(error ?? data?.qbitError) && data && !cloudOnly && (
           <div className="mb-3 flex items-center gap-2 rounded-lg border border-warn/25 bg-warn/8 px-3 py-1.5 text-[11.5px] text-warn">
             qBittorrent didn't answer the last check — the local list may be stale
+          </div>
+        )}
+        {(error ?? data?.qbitError) && data && cloudOnly && (
+          <div className="mb-3 flex items-center gap-2 rounded-lg border border-line bg-bg1 px-3 py-1.5 text-[11.5px] text-faint">
+            <HardDrive size={12} /> qBittorrent isn't reachable — local torrents, if any, aren't listed
+          </div>
+        )}
+        {data?.cloud.connected && data.cloud.authFailed && (
+          <div className="mb-3 flex items-center gap-2 rounded-lg border border-bad/30 bg-bad/8 px-3 py-1.5 text-[11.5px] text-bad">
+            <Cloud size={13} /> Bitport no longer accepts Trawler's access — reconnect it under Settings → Connections
+          </div>
+        )}
+        {data?.cloud.connected && !data.cloud.authFailed && data.cloud.error && (
+          <div className="mb-3 flex items-center gap-2 rounded-lg border border-warn/25 bg-warn/8 px-3 py-1.5 text-[11.5px] text-warn">
+            <Cloud size={13} /> Bitport didn't answer the last check — the cloud list may be stale
           </div>
         )}
         {error && !data ? (
@@ -103,15 +196,19 @@ export default function DownloadsView() {
               <div key={i} className="skeleton h-[74px] rounded-(--radius-card)" />
             ))}
           </div>
-        ) : data.qbitError && data.torrents.length === 0 && data.cloud.length === 0 ? (
+        ) : data.qbitError && nothingAtAll && !cloudOnly ? (
           <CenterMessage icon={<HardDrive size={28} />} title="Can't reach qBittorrent" body={data.qbitError} />
-        ) : data.torrents.length === 0 && data.cloud.length === 0 ? (
+        ) : nothingAtAll ? (
           <CenterMessage
-            icon={<HardDrive size={28} />}
+            icon={cloudOnly ? <Cloud size={28} /> : <HardDrive size={28} />}
             title={scope === "trawler" ? "Nothing grabbed yet" : "No torrents"}
             body={
               scope === "trawler"
-                ? "Releases you grab land here, tagged with the trawler category."
+                ? cloudOnly
+                  ? data.cloud.fetchToLocal
+                    ? "Releases you grab go to your Bitport cloud and land here on their way to this computer."
+                    : "Releases you grab go to your Bitport cloud and are listed here; the files stay in the cloud."
+                  : "Releases you grab land here, tagged with the trawler category."
                 : undefined
             }
           />
@@ -120,31 +217,37 @@ export default function DownloadsView() {
             {data.torrents.map((t) => (
               <TorrentCard key={t.hash} t={t} onAction={act} />
             ))}
-            {data.cloud.some((c) => {
-              const t = removedRef.current.get(c.token);
-              return !t || Date.now() - t >= 15_000;
-            }) && (
+            {cloudItems.length > 0 && (
+              <>
+                <div className={cx("flex items-center gap-1.5 pb-1 text-[11.5px] font-medium text-dim", data.torrents.length > 0 && "pt-3")}>
+                  <Cloud size={13} className="text-accent2" /> Through your Bitport cloud
+                  {!data.cloud.fetchToLocal && (
+                    <span className="font-normal text-faint">· files stay in the cloud (Settings → Connections)</span>
+                  )}
+                </div>
+                {cloudItems.map((item) => (
+                  <CloudGrabCard key={item.ledgerId} item={item} onRetry={retryCloud} onRemove={removeCloud} />
+                ))}
+              </>
+            )}
+            {scope === "trawler" && cloudOthers.length > 0 && (
+              <button
+                type="button"
+                onClick={() => setScope("all")}
+                className="mt-3 cursor-pointer text-[11px] text-faint underline decoration-line2 underline-offset-2 hover:text-dim"
+              >
+                {cloudOthers.length} other transfer{cloudOthers.length === 1 ? "" : "s"} in your Bitport cloud — show everything
+              </button>
+            )}
+            {showOthers && (
               <>
                 <div className="flex items-center gap-1.5 pt-3 pb-1 text-[11.5px] font-medium text-dim">
-                  <Cloud size={13} className="text-accent2" /> In your Bitport cloud
+                  <Cloud size={13} className="text-faint" /> Also in your Bitport cloud
+                  <span className="font-normal text-faint">· other transfers in the account</span>
                 </div>
-                {data.cloud
-                  .filter((c) => {
-                    const t = removedRef.current.get(c.token);
-                    if (t && Date.now() - t < 15_000) return false;
-                    if (t) removedRef.current.delete(c.token);
-                    return true;
-                  })
-                  .map((c) => (
-                    <CloudCard
-                      key={c.token}
-                      c={c}
-                      onDeleted={() => {
-                        removedRef.current.set(c.token, Date.now());
-                        setData((d) => (d ? { ...d, cloud: d.cloud.filter((x) => x.token !== c.token) } : d));
-                      }}
-                    />
-                  ))}
+                {cloudOthers.map((t) => (
+                  <OtherCloudCard key={t.token} t={t} onDelete={deleteOther} />
+                ))}
               </>
             )}
           </div>
@@ -275,58 +378,3 @@ function TorrentCard({
   );
 }
 
-/** A transfer living on Bitport's servers — progress is theirs, bytes arrive
- *  over HTTPS whenever the user wants them locally. */
-function CloudCard({ c, onDeleted }: { c: import("../lib/api").BitportTransfer; onDeleted: () => void }) {
-  const toast = useStore((s) => s.toast);
-  const [confirm, setConfirm] = useState(false);
-  const done = c.status === "finished";
-  const pct = done ? 100 : c.progress;
-  return (
-    <div className="rounded-(--radius-card) border border-line bg-bg1 px-4 py-3">
-      <div className="flex items-center gap-2.5">
-        <Cloud size={14} className={done ? "shrink-0 text-ok" : "shrink-0 text-accent2"} />
-        <div className="min-w-0 flex-1">
-          <div className="truncate font-mono text-[12px] text-ink">{c.name}</div>
-          <div className="mt-0.5 flex items-center gap-2 text-[10.5px] text-faint">
-            <span>{done ? "finished — in your cloud" : c.substatus || c.status}</span>
-            {!done && <span>{pct.toFixed(0)}%</span>}
-          </div>
-        </div>
-        <a
-          href="https://bitport.io/my-files"
-          target="_blank"
-          rel="noreferrer"
-          className="shrink-0 rounded-md bg-bg2 px-2 py-1 text-[11px] text-dim transition-colors hover:bg-bg3 hover:text-ink"
-        >
-          Open in Bitport
-        </a>
-        <button
-          type="button"
-          className="shrink-0 cursor-pointer rounded-md px-2 py-1 text-[11px] text-faint transition-colors hover:text-bad"
-          onClick={async () => {
-            if (!confirm) {
-              setConfirm(true);
-              window.setTimeout(() => setConfirm(false), 2500);
-              return;
-            }
-            try {
-              await api.bitportDelete(c.token);
-              onDeleted();
-              toast("Removed from your cloud", "info");
-            } catch (e) {
-              toast(String(e), "bad");
-            }
-          }}
-        >
-          {confirm ? "sure?" : "remove"}
-        </button>
-      </div>
-      {!done && (
-        <div className="mt-2 h-[3px] overflow-hidden rounded-full bg-bg3">
-          <div className="h-full rounded-full bg-accent2 transition-[width] duration-500" style={{ width: pct + "%" }} />
-        </div>
-      )}
-    </div>
-  );
-}

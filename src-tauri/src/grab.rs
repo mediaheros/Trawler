@@ -58,11 +58,32 @@ pub async fn selected_backend_free_bytes(
     selected_backend_free_bytes_with(
         cfg,
         || async {
+            // a cloud grab needs room twice: on Bitport's disk while it
+            // torrents, and on the local destination once the files come
+            // down — the smaller of the two is what can actually be filled
             let client = crate::bitport::BitportClient {
                 http,
                 token: cfg.bitport_token.clone(),
             };
-            Ok(client.me().await?.disk_available)
+            let cloud = client.me().await?.disk_available;
+            if !cfg.bitport_fetch_to_local {
+                return Ok(cloud);
+            }
+            // this check has no grab in hand, so it looks at every place a
+            // fetch could land: the fallback folder and both save paths
+            let mut floor = cloud;
+            let mut candidates = vec![crate::cloud::resolve_dest_root(cfg, None)];
+            for p in [cfg.save_path_tv.trim(), cfg.save_path_movies.trim()] {
+                if !p.is_empty() {
+                    candidates.push(std::path::PathBuf::from(p));
+                }
+            }
+            for dest in candidates {
+                if let Some(local) = crate::cloud::local_free_bytes(&dest) {
+                    floor = floor.min(local);
+                }
+            }
+            Ok(floor)
         },
         || async {
             let client = crate::qbit::QbitClient {
@@ -120,6 +141,10 @@ pub struct GrabOrder {
     pub save_path: Option<String>,
     pub info_hash: Option<String>,
     pub size: i64,
+    /// where THIS grab goes: "qbittorrent" or "bitport". None follows the
+    /// Settings default — what every automatic path does; a manual grab
+    /// from search picks per release.
+    pub backend: Option<String>,
 }
 
 pub enum GrabOutcome {
@@ -176,8 +201,25 @@ pub async fn dispatch(
     let title = order.title.clone();
     // the ADDITIVE cloud backend: same claim, same ledger, same episode
     // linkage — only the transport differs. Chosen per config, never forced.
-    let use_bitport = uses_bitport(&cfg);
+    let use_bitport = match order.backend.as_deref() {
+        Some("bitport") => {
+            if cfg.bitport_token.is_empty() {
+                return Err(AppError::Other(
+                    "Bitport is not connected — connect it under Settings → Connections first".into(),
+                ));
+            }
+            true
+        }
+        Some(_) => false,
+        None => uses_bitport(&cfg),
+    };
     let backend: &'static str = if use_bitport { "bitport" } else { "qbittorrent" };
+    if use_bitport {
+        // an expired plan or a full cloud disk is a definitive refusal, not
+        // a transfer that quietly sits in "queued" forever — and it happens
+        // before any claim, so nothing has to be released
+        crate::cloud::dispatch_precheck(state, &cfg, order.size).await?;
+    }
     {
         let conn = state.db.lock().await;
         if !db::ledger_claim_dispatch(&conn, &db::DispatchClaim {
@@ -198,22 +240,23 @@ pub async fn dispatch(
         let dispatch_result: Result<Option<String>> = async {
             if use_bitport {
             // Bitport receives a magnet and nothing else: a download_url can
-            // carry Prowlarr's API key or a private-tracker passkey, and
-            // .torrent bytes embed the passkey in their announce URL — none
-            // of that may leave this machine. Resolve through local Prowlarr;
-            // most "torrent" links are magnet redirects anyway.
+            // carry Prowlarr's API key — that must never leave this machine,
+            // and their API refuses file uploads anyway. Resolve through
+            // local Prowlarr; a link that turns out to be a .torrent file
+            // becomes an equivalent magnet (btih, name, trackers). The
+            // trackers travel on purpose: a private torrent has no DHT.
             let src = if let Some(m) = order.magnet_url.clone() {
                 m
             } else if let Some(du) = order.download_url.clone() {
                 let p = crate::commands::prowlarr_pub(&http, &cfg)?;
-                let (_bytes, magnet) = p.fetch_torrent(&du).await?;
+                let (bytes, magnet) = p.fetch_torrent(&du).await?;
                 match magnet {
                     Some(m) => m,
-                    None => {
-                        return Err(crate::error::AppError::Other(
-                            "this release only offers a .torrent file — cloud grabs need a magnet link (uploading the file would hand tracker credentials to Bitport)".into(),
-                        ))
-                    }
+                    None => crate::qbit::magnet_from_torrent(&bytes).ok_or_else(|| {
+                        crate::error::AppError::Other(
+                            "the indexer returned something that is neither a magnet nor a .torrent file".into(),
+                        )
+                    })?,
                 }
             } else {
                 return Err(crate::error::AppError::Other(
@@ -221,16 +264,46 @@ pub async fn dispatch(
                 ))
             };
             // the magnet's btih makes cloud completion/reaper matching exact
-            // even when the search result carried no info_hash
-            if order.info_hash.is_none() {
-                order.info_hash = crate::scheduler::magnet_hash(Some(&src));
-                if let Some(info_hash) = order.info_hash.as_deref() {
+            // even when the search result carried no info_hash — and a
+            // .torrent's real hash beats whatever the indexer claimed
+            let resolved = crate::scheduler::magnet_hash(Some(&src));
+            if let Some(info_hash) = resolved.as_deref() {
+                let differs = order
+                    .info_hash
+                    .as_deref()
+                    .is_none_or(|claimed| !claimed.eq_ignore_ascii_case(info_hash));
+                if differs {
                     let conn = db::open_existing()?;
                     db::ledger_set_dispatch_info_hash(&conn, &ck, info_hash)?;
                 }
+                order.info_hash = Some(info_hash.to_string());
+            }
+            {
+                let conn = db::open_existing()?;
+                // a release Bitport already failed on stays refused until
+                // the user removes that stalled grab from Downloads
+                if let Some(h) = order.info_hash.as_deref() {
+                    if db::cloud_ledger_stalled_hash(&conn, h) {
+                        return Err(crate::error::AppError::Other(format!(
+                            "Bitport already failed on \"{}\" — pick another release, or remove the failed cloud grab in Downloads to try again",
+                            order.title.chars().take(70).collect::<String>()
+                        )));
+                    }
+                }
+                if let Some(path) = order.save_path.as_deref().filter(|p| !p.trim().is_empty()) {
+                    db::ledger_set_dispatch_save_path(&conn, &ck, path)?;
+                }
             }
             let bp = crate::bitport::BitportClient { http: &http, token: cfg.bitport_token.clone() };
-            let tok = bp.add_transfer(&src).await?;
+            let mut tok = bp.add_transfer(&src).await?;
+            if tok.is_none() {
+                // the add answers with nothing; the listing has it within
+                // seconds — pin the token now so every later pass matches
+                // exactly instead of by hash
+                if let Some(h) = order.info_hash.as_deref() {
+                    tok = crate::cloud::locate_new_transfer(&bp, h).await.map(|t| t.token);
+                }
+            }
             crate::applog::info("bitport", format!("sent to cloud: {}", order.title.chars().take(70).collect::<String>()));
                 Ok(tok)
             } else {
@@ -452,6 +525,11 @@ pub async fn dispatch(
     handle
         .await
         .map_err(|e| AppError::Other(format!("grab task failed: {e}")))??;
+    if use_bitport {
+        // the poller picks the new transfer up right away instead of on its
+        // next cadence, so the Downloads view shows it within seconds
+        state.cloud.wake.notify_one();
+    }
     Ok(GrabOutcome::Grabbed { backend })
 }
 

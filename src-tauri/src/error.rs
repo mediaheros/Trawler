@@ -38,6 +38,11 @@ pub enum AppError {
     #[error("this release has no usable magnet link or download URL")]
     NoDownloadSource,
 
+    /// Bitport rejected the bearer token. Distinct so the cloud poller can
+    /// flip the account into "reconnect needed" instead of retrying forever.
+    #[error("Bitport rejected the token — reconnect the account in Settings")]
+    BitportAuth,
+
     /// The backend request may have been accepted, but its response was lost.
     /// The durable dispatch row must remain until backend reconciliation.
     #[error("{0}")]

@@ -48,16 +48,23 @@ impl RetiredReleases {
 
 fn retired_releases(conn: &rusqlite::Connection) -> RetiredReleases {
     let mut out = RetiredReleases { titles: Default::default(), hashes: Default::default() };
+    // both backends: a release Bitport gave up on must leave the ranking
+    // just like a dead local swarm, or the planner picks it again every
+    // cycle only for the dispatcher to refuse it (episodes flapping
+    // grabbed → wanted each time)
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT title, info_hash FROM grab_ledger WHERE state = 'stalled' AND backend = 'qbittorrent'",
+        "SELECT title, info_hash, backend FROM grab_ledger WHERE state = 'stalled'",
     ) {
         let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, String>(2)?))
+            })
             .map(|it| it.flatten().collect::<Vec<_>>())
             .unwrap_or_default();
-        for (title, hash) in rows {
+        for (title, hash, backend) in rows {
             out.titles.insert(normalize(&title));
-            if let Some(h) = hash.filter(|h| qbt_comparable_hash(h)) {
+            // cloud rows carry the magnet's btih, always comparable
+            if let Some(h) = hash.filter(|h| backend != "qbittorrent" || qbt_comparable_hash(h)) {
                 out.hashes.insert(h.to_ascii_lowercase());
             }
         }
@@ -294,6 +301,7 @@ async fn execute_plan(app: &tauri::AppHandle, state: &AppState, plan: &PlannedGr
     let outcome = crate::grab::dispatch(
         state,
         crate::grab::GrabOrder {
+            backend: None,
             title: plan.title.clone(),
             magnet_url: plan.magnet_url.clone(),
             download_url: plan.download_url.clone(),
@@ -364,7 +372,7 @@ async fn execute_plan(app: &tauri::AppHandle, state: &AppState, plan: &PlannedGr
 /// are not two independent observations. A genuinely empty session — the
 /// user deleted their only torrent — still confirms once the window passes.
 #[derive(Default)]
-struct AbsenceStrikes {
+pub(crate) struct AbsenceStrikes {
     /// row id → (first time seen missing, observations, any observation
     /// came from an empty listing)
     first_missing: std::collections::HashMap<i64, (i64, u32, bool)>,
@@ -380,7 +388,7 @@ impl AbsenceStrikes {
 
     /// The row's transfer is in the listing (or the row has been settled):
     /// forget any strikes.
-    fn present(&mut self, id: i64) {
+    pub(crate) fn present(&mut self, id: i64) {
         self.first_missing.remove(&id);
     }
 
@@ -388,7 +396,7 @@ impl AbsenceStrikes {
     /// The strike is kept until the caller settles the row with `present`,
     /// so a retire that fails (a busy database) is retried next cycle
     /// instead of restarting the window.
-    fn missing(&mut self, id: i64, now: i64, listing_empty: bool) -> bool {
+    pub(crate) fn missing(&mut self, id: i64, now: i64, listing_empty: bool) -> bool {
         let slot = self.first_missing.entry(id).or_insert((now, 0, false));
         slot.1 += 1;
         // a weak observation anywhere in the streak (not only the current
@@ -716,178 +724,6 @@ pub(crate) fn magnet_hash(magnet: Option<&str>) -> Option<String> {
         return None;
     }
     Some(decoded.iter().map(|byte| format!("{byte:02x}")).collect())
-}
-
-/// Cloud-side completion and reaping. A Bitport transfer reporting
-/// "finished" flips its ledger row and linked episodes exactly like a
-/// finished local torrent; a transfer that has VANISHED from the account
-/// (deleted in Bitport's own UI, or an add that never stuck) releases its
-/// row and episodes, mirroring the local orphan reaper. Rows are matched by
-/// the transfer token stored at grab time; the magnet's btih and the title
-/// cover rows without one.
-async fn bitport_completion_pass(app: &tauri::AppHandle, state: &AppState) {
-    let cfg = state.config.read().await.clone();
-    if cfg.bitport_token.is_empty() {
-        return;
-    }
-    let bp = crate::bitport::BitportClient { http: &state.http, token: cfg.bitport_token.clone() };
-    let transfers = match bp.transfers().await {
-        Ok(t) => t,
-        Err(e) => {
-            // no reaping on a failed poll — absence of evidence only counts
-            // when the account actually answered
-            crate::applog::warn("bitport", format!("transfer poll failed: {e}"));
-            return;
-        }
-    };
-    let done_tokens: std::collections::HashSet<&str> = transfers
-        .iter()
-        .filter(|t| t.status == "finished")
-        .map(|t| t.token.as_str())
-        .collect();
-    let done_hashes: std::collections::HashSet<String> = transfers
-        .iter()
-        .filter(|t| t.status == "finished")
-        .filter_map(crate::bitport::transfer_hash)
-        .collect();
-    let done_norms: std::collections::HashSet<String> = transfers
-        .iter()
-        .filter(|t| t.status == "finished")
-        .map(|t| normalize(&t.name))
-        .collect();
-    let live_tokens: std::collections::HashSet<&str> =
-        transfers.iter().map(|t| t.token.as_str()).collect();
-    let live_hashes: std::collections::HashSet<String> =
-        transfers.iter().filter_map(crate::bitport::transfer_hash).collect();
-    let live_norms: std::collections::HashSet<String> =
-        transfers.iter().map(|t| normalize(&t.name)).collect();
-    // Absence is evidence only when it persists (see AbsenceStrikes): one
-    // odd listing (pagination surprise, partial or empty response) must not
-    // release every claim at once.
-    static BP_STRIKES: std::sync::OnceLock<std::sync::Mutex<AbsenceStrikes>> =
-        std::sync::OnceLock::new();
-    let listing_empty = transfers.is_empty();
-    let reap_cutoff = db::now() - 5 * 60; // covers the add-to-listing gap
-    let recent_cutoff = db::now() - 3 * 86_400; // first cycle after an upgrade may flip a backlog
-    let mut completed_display: Vec<String> = vec![];
-    let conn = state.db.lock().await;
-    // taken after the last .await: a std MutexGuard is !Send, and this
-    // future runs under tauri::async_runtime::spawn
-    let mut strikes = BP_STRIKES
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    type BitportOpenRow =
-        (i64, String, Option<String>, Option<String>, Option<String>, i64, String);
-    let rows: Vec<BitportOpenRow> = conn
-        .prepare("SELECT id, title, info_hash, ep_ids, bp_token, ts, state FROM grab_ledger WHERE state IN ('dispatching','grabbed') AND backend = 'bitport'")
-        .ok()
-        .map(|mut stmt| {
-            stmt.query_map([], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
-            })
-            .map(|it| it.flatten().collect::<Vec<_>>())
-            .unwrap_or_default()
-        })
-        .unwrap_or_default();
-    if listing_empty && !rows.is_empty() {
-        // an empty listing with open rows is suspicious, not evidence
-        crate::applog::warn(
-            "bitport",
-            "transfer listing came back empty while cloud grabs are open — claims are released only if that persists for half an hour",
-        );
-    }
-    for (id, title, info_hash, ep_ids_raw, bp_token, ts, ledger_state) in rows {
-        let h = info_hash.map(|x| x.to_ascii_lowercase());
-        let norm = normalize(&title);
-        // a row WITH a token must not complete off an unrelated old transfer
-        // that happens to share an infohash — token match is exact
-        let is_done = match bp_token.as_deref() {
-            Some(tok) => done_tokens.contains(tok),
-            None => {
-                h.as_ref().map(|x| done_hashes.contains(x)).unwrap_or(false)
-                    || done_norms.contains(&norm)
-            }
-        };
-        if is_done {
-            strikes.present(id);
-            let _ = conn.execute("UPDATE grab_ledger SET state = 'completed' WHERE id = ?1", [id]);
-            db::set_episodes_state_by_ids(&conn, &db::parse_ep_ids(ep_ids_raw.as_deref()), "downloaded", None);
-            db::log_activity(
-                &conn,
-                "complete",
-                None,
-                &format!("Finished in the cloud: {}", title.chars().take(60).collect::<String>()),
-            );
-            if ts >= recent_cutoff {
-                completed_display.push(title.chars().take(60).collect());
-            }
-            continue;
-        }
-        let is_present = match bp_token.as_deref() {
-            Some(tok) => live_tokens.contains(tok),
-            None => {
-                h.as_ref().map(|x| live_hashes.contains(x)).unwrap_or(false)
-                    || live_norms.contains(&norm)
-            }
-        };
-        if is_present {
-            strikes.present(id);
-            if ledger_state == "dispatching" {
-                if let Err(error) = db::ledger_confirm_present(
-                    &conn,
-                    id,
-                    &title,
-                    &db::parse_ep_ids(ep_ids_raw.as_deref()),
-                ) {
-                    crate::applog::error(
-                        "bitport",
-                        format!("could not recover pending ledger row {id}: {error}"),
-                    );
-                }
-            }
-            continue;
-        }
-        // every absence counts, an empty listing included; the strike window
-        // is what keeps a startup blip or a partial page from being evidence
-        let confirmed = strikes.missing(id, db::now(), listing_empty);
-        if ts < reap_cutoff && confirmed {
-            if let Err(error) = db::ledger_confirm_missing(
-                &conn,
-                id,
-                &db::parse_ep_ids(ep_ids_raw.as_deref()),
-            ) {
-                crate::applog::error(
-                    "bitport",
-                    format!("could not retire missing ledger row {id}: {error}"),
-                );
-                continue;
-            }
-            strikes.present(id);
-            db::log_activity(
-                &conn,
-                "system",
-                None,
-                &format!(
-                    "{} vanished from your Bitport cloud — its claim is released, Trawler can grab again",
-                    title.chars().take(60).collect::<String>()
-                ),
-            );
-        }
-    }
-    drop(strikes);
-    drop(conn);
-    if !completed_display.is_empty() {
-        let (title, body) = if completed_display.len() == 1 {
-            ("Finished in the cloud".to_string(), completed_display[0].clone())
-        } else {
-            (
-                format!("{} cloud transfers finished", completed_display.len()),
-                completed_display.iter().take(6).cloned().collect::<Vec<_>>().join("\n"),
-            )
-        };
-        crate::notify::dispatch(app, crate::notify::Kind::Complete, title, body);
-    }
 }
 
 /// Flip grabbed → downloaded by matching qBittorrent's finished torrents.
@@ -1318,7 +1154,7 @@ async fn run_cycle_inner(app: &tauri::AppHandle, state: &AppState) -> Result<usi
     // pack whose episodes still read as wanted
     let dead = completion_pass(app, state).await;
     medic_pass(app, state, dead).await;
-    bitport_completion_pass(app, state).await;
+    // (cloud completion lives in cloud::poll_loop, on its own cadence)
 
     let now = db::now();
     let mut grabs = 0usize;

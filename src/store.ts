@@ -11,6 +11,7 @@ import {
   type ConnectionStatus,
   type EpisodeRow,
   type ProposalRow,
+  type GrabBackend,
   type Release,
   type SearchResponse,
   type ShowRow,
@@ -78,7 +79,8 @@ interface Store {
   setFilter: (dim: keyof SearchFilters, value: string | null) => void;
 
   grabState: Record<string, "loading" | "done" | "error">;
-  grab: (r: Release) => Promise<void>;
+  /** backend picks the destination for this one grab; omitted = Settings default */
+  grab: (r: Release, backend?: GrabBackend) => Promise<void>;
 
   // ---- followed shows ----
   shows: ShowRow[];
@@ -322,7 +324,7 @@ export const useStore = create<Store>((set, get) => ({
     })),
 
   grabState: {},
-  grab: async (r) => {
+  grab: async (r, backend) => {
     const key = r.guid ?? r.title;
     set((s) => ({ grabState: { ...s.grabState, [key]: "loading" } }));
     try {
@@ -337,7 +339,8 @@ export const useStore = create<Store>((set, get) => ({
               ? [link0.ep.tvmazeEpId]
               : []
           : [];
-      const res = await api.grab(r, linked);
+      // the destination rides along only when the caller chose one
+      const res = backend ? await api.grab(r, linked, backend) : await api.grab(r, linked);
       if (!res.ok) {
         // nothing was sent (another path is mid-grab, or the ledger already
         // has it): say so, and leave the button usable for a retry

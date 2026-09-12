@@ -461,6 +461,7 @@ pub async fn proposal_resolve(state: State<'_, AppState>, id: i64, approve: bool
     let outcome = crate::grab::dispatch(
         state.inner(),
         crate::grab::GrabOrder {
+            backend: None,
             title: title.clone(),
             magnet_url: magnet,
             download_url: download,

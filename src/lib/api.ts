@@ -37,6 +37,14 @@ export interface Config {
   rssEnabled: boolean;
   rssMinutes: number;
   downloadBackend: string;
+  /** read-only: a Bitport account is connected (the token itself never reaches the UI) */
+  bitportConnected: boolean;
+  /** bring finished cloud transfers to this machine over HTTPS */
+  bitportFetchToLocal: boolean;
+  /** delete the transfer from the cloud once its files are here and verified */
+  bitportDeleteAfterFetch: boolean;
+  /** where fetched files land when a grab has no save path of its own */
+  bitportDownloadDir: string;
   upgradeScoutEnabled: boolean;
   upgradeWindowDays: number;
 }
@@ -232,34 +240,90 @@ export interface QbitTorrent {
 }
 
 export interface BitportQuota {
+  /** the account e-mail, so a wrong account is visible right after connecting */
+  account: string | null;
   planName: string;
   planExpired: boolean;
+  /** "YYYY-MM-DD HH:MM:SS" UTC, as Bitport reports it */
+  planExpiration: string | null;
   diskSize: number;
   diskAvailable: number;
   diskUsed: number;
 }
 
+export interface BitportDisconnectOutcome {
+  /** grabs that were torrenting or waiting in the cloud */
+  released: number;
+  /** grabs whose files were on their way down (partials removed) */
+  downloading: number;
+}
+
 export interface BitportStatus {
   connected: boolean;
+  /** the stored token was rejected — connected in name only */
+  authFailed: boolean;
   quota: BitportQuota | null;
+  getAccessUrl: string;
+  defaultDownloadDir: string;
 }
 
 export interface BitportTransfer {
   token: string;
   name: string;
+  /** queued | downloading | finished | seeding | error */
   status: string;
   substatus: string | null;
   progress: number;
   size: number | null;
+  message: string | null;
   fileId: string | null;
   folderId: string | null;
   src: string | null;
 }
 
+export type CloudPhase = "sending" | "queued" | "cloud" | "fetching" | "done" | "error";
+
+/** One of Trawler's own cloud grabs: the transfer on Bitport plus the
+ *  HTTPS fetch bringing its files here. */
+export interface CloudItem {
+  ledgerId: number;
+  title: string;
+  token: string | null;
+  phase: CloudPhase;
+  cloudStatus: string;
+  cloudProgress: number;
+  message: string | null;
+  /** the transfer still exists in the account (a kept cloud copy can be deleted) */
+  cloudCopy: boolean;
+  filesTotal: number;
+  filesDone: number;
+  filesFailed: number;
+  bytesTotal: number;
+  bytesDone: number;
+  /** local download speed, bytes per second */
+  speed: number;
+  localPath: string | null;
+  error: string | null;
+  ts: number;
+}
+
+export interface CloudView {
+  connected: boolean;
+  authFailed: boolean;
+  error: string | null;
+  fetchedAt: number;
+  quota: BitportQuota | null;
+  items: CloudItem[];
+  /** transfers in the account that Trawler did not create */
+  others: BitportTransfer[];
+  fetchSpeed: number;
+  fetchToLocal: boolean;
+}
+
 export interface DownloadsView {
   torrents: QbitTorrent[];
   transfer: { dl_info_speed: number; up_info_speed: number } | null;
-  cloud: BitportTransfer[];
+  cloud: CloudView;
   qbitError: string | null;
 }
 
@@ -267,6 +331,8 @@ export interface GrabResult {
   ok: boolean;
   detail: string;
 }
+
+export type GrabBackend = "qbittorrent" | "bitport";
 
 // ---------- followed shows ----------
 
@@ -441,7 +507,8 @@ export const api = {
   listIndexers: () => call<Indexer[]>("list_indexers"),
   search: (query: string, kind: string, indexerIds: number[] = []) =>
     call<SearchResponse>("search", { query, kind, indexerIds }),
-  grab: (r: Release, epIds: number[] = []) =>
+  /** backend: "qbittorrent" | "bitport" for this one grab; omitted = the Settings default */
+  grab: (r: Release, epIds: number[] = [], backend?: GrabBackend) =>
     call<GrabResult>("grab", {
       title: r.title,
       kind: r.kind,
@@ -450,6 +517,7 @@ export const api = {
       infoHash: r.infoHash,
       size: r.size,
       epIds,
+      backend: backend ?? null,
     }),
   downloads: (all = false) => call<DownloadsView>("downloads", { all }),
   torrentAction: (action: string, hash: string) =>
@@ -509,8 +577,11 @@ export const api = {
   bitportConnect: (code: string) => call<BitportStatus>("bitport_connect", { code }),
   bitportConnectFlow: () => call<BitportStatus>("bitport_connect_flow"),
   bitportStatus: () => call<BitportStatus>("bitport_status"),
-  bitportDisconnect: () => call<void>("bitport_disconnect"),
+  bitportDisconnect: () => call<BitportDisconnectOutcome>("bitport_disconnect"),
   bitportDelete: (token: string) => call<void>("bitport_delete", { token }),
+  cloudRetry: (ledgerId: number) => call<number>("cloud_retry", { ledgerId }),
+  cloudRemove: (ledgerId: number, deleteCloud: boolean) =>
+    call<void>("cloud_remove", { ledgerId, deleteCloud }),
   logsRecent: () => call<LogEntry[]>("logs_recent"),
   logsSupportBundle: () => call<string>("logs_support_bundle"),
   setupFlaresolverr: () => call<string[]>("setup_flaresolverr"),
@@ -710,7 +781,64 @@ const mockEpisodes: EpisodeRow[] = Array.from({ length: 19 }, (_, i) => {
 const mockChat: ChatRow[] = [];
 
 const mockFs = { done: false };
-const mockBp = { connected: false, deleted: new Set<string>() };
+const mockBp = {
+  connected: false,
+  deleted: new Set<string>(),
+  removed: new Set<number>(),
+  cloudDeleted: new Set<number>(),
+  retried: new Set<number>(),
+  startedAt: Date.now(),
+};
+
+function mockBpStatus(): BitportStatus {
+  return mockBp.connected
+    ? {
+        connected: true,
+        authFailed: false,
+        quota: { account: "you@example.com", planName: "big", planExpired: false, planExpiration: "2027-08-16 00:00:00", diskSize: 1073741824000, diskAvailable: 343501989179, diskUsed: 730239834821 },
+        getAccessUrl: "https://bitport.io/get-access",
+        defaultDownloadDir: "C:\\Users\\you\\Downloads\\Trawler",
+      }
+    : { connected: false, authFailed: false, quota: null, getAccessUrl: "https://bitport.io/get-access", defaultDownloadDir: "C:\\Users\\you\\Downloads\\Trawler" };
+}
+
+/** A believable cloud section: one grab still torrenting on Bitport, one
+ *  streaming down to disk (progress advances with time), one finished, one
+ *  Bitport gave up on — plus a transfer that isn't Trawler's. */
+function mockCloudView(): CloudView {
+  if (!mockBp.connected) {
+    return { connected: false, authFailed: false, error: null, fetchedAt: 0, quota: null, items: [], others: [], fetchSpeed: 0, fetchToLocal: true };
+  }
+  const elapsed = (Date.now() - mockBp.startedAt) / 1000;
+  const fetchTotal = 2_062_986_864;
+  const fetchDone = Math.min(fetchTotal, 400_000_000 + elapsed * 38_000_000);
+  const fetching = fetchDone < fetchTotal;
+  const now = Math.floor(Date.now() / 1000);
+  const all = [
+    { ledgerId: 901, title: "Lioness.S03E04.1080p.WEB.h264-ETHEL", token: "bp2", phase: "cloud", cloudStatus: "downloading", cloudProgress: Math.min(99, 61 + elapsed * 0.4), message: null, cloudCopy: true, filesTotal: 0, filesDone: 0, filesFailed: 0, bytesTotal: 1_944_671_130, bytesDone: 0, speed: 0, localPath: null, error: null, ts: now - 240 },
+    { ledgerId: 902, title: "28.Years.Later.2025.1080p.WEB-DL.HEVC.x265.5.1-BONE", token: "bp3", phase: fetching ? "fetching" : "done", cloudStatus: "finished", cloudProgress: 100, message: null, cloudCopy: fetching, filesTotal: 2, filesDone: fetching ? 1 : 2, filesFailed: 0, bytesTotal: fetchTotal, bytesDone: fetchDone, speed: fetching ? 38_000_000 : 0, localPath: "D:\\Media\\Movies\\28.Years.Later.2025.1080p.WEB-DL.HEVC.x265.5.1-BONE", error: null, ts: now - 1800 },
+    { ledgerId: 903, title: "Andor.S02E03.Harvest.1080p.HEVC.x265-MeGusta", token: "bp4", phase: "done", cloudStatus: "finished", cloudProgress: 100, message: null, cloudCopy: true, filesTotal: 1, filesDone: 1, filesFailed: 0, bytesTotal: 664_179_969, bytesDone: 664_179_969, speed: 0, localPath: "D:\\Media\\TV\\Andor.S02E03.Harvest.1080p.HEVC.x265-MeGusta.mkv", error: null, ts: now - 7200 },
+    { ledgerId: 904, title: "Citizen.Vigilante.2026.1080p.WEBRip.10Bit.DDP5.1.x265-NeoNoir", token: "bp5", phase: "error", cloudStatus: "error", cloudProgress: 0, message: "No peers found", cloudCopy: true, filesTotal: 0, filesDone: 0, filesFailed: 0, bytesTotal: 2_013_234_133, bytesDone: 0, speed: 0, localPath: null, error: "No peers found", ts: now - 10800 },
+    // a local fetch that gave up on one file: the Retry action's home in the demo
+    { ledgerId: 905, title: "Daredevil.Born.Again.S01E01.1080p.WEB.h264-successfulcrab", token: "bp6", phase: mockBp.retried.has(905) ? "fetching" : "error", cloudStatus: "finished", cloudProgress: 100, message: null, cloudCopy: true, filesTotal: 3, filesDone: 2, filesFailed: mockBp.retried.has(905) ? 0 : 1, bytesTotal: 2_421_552_513, bytesDone: 2_300_000_000, speed: 0, localPath: "D:\\Media\\TV\\Daredevil.Born.Again.S01E01.1080p.WEB.h264-successfulcrab", error: mockBp.retried.has(905) ? null : "checksum mismatch (expected 9b238312, got 1f00aa07) — the file was discarded", ts: now - 14400 },
+  ] satisfies CloudItem[];
+  const items: CloudItem[] = all
+    .filter((i) => !mockBp.removed.has(i.ledgerId))
+    .map((i) => (mockBp.cloudDeleted.has(i.ledgerId) ? { ...i, cloudCopy: false } : i));
+  return {
+    connected: true,
+    authFailed: false,
+    error: null,
+    fetchedAt: now - 4,
+    quota: mockBpStatus().quota,
+    items,
+    others: [
+      { token: "bp1", name: "UFC.Fight.Night.Ankalaev.vs.Guskov.720p.WEBRip.2CH.x265.HEVC-PSA.mkv", status: "finished", substatus: null, progress: 100, size: null, message: null, fileId: "f1", folderId: null, src: null },
+    ].filter((t) => !mockBp.deleted.has(t.token)),
+    fetchSpeed: fetching ? 38_000_000 : 0,
+    fetchToLocal: true,
+  };
+}
 const mockSetup: SetupStatus = {
   qbit: "missing",
   prowlarr: "missing",
@@ -805,7 +933,11 @@ async function mock(cmd: string, args?: Record<string, unknown>): Promise<unknow
         rssEnabled: true,
         rssMinutes: 15,
         downloadBackend: "qbittorrent",
-  upgradeScoutEnabled: false,
+        bitportConnected: mockBp.connected,
+        bitportFetchToLocal: true,
+        bitportDeleteAfterFetch: true,
+        bitportDownloadDir: "",
+        upgradeScoutEnabled: false,
         upgradeWindowDays: 30,
       } satisfies Config;
     case "set_config":
@@ -844,8 +976,13 @@ async function mock(cmd: string, args?: Record<string, unknown>): Promise<unknow
         ],
       } satisfies SearchResponse;
     }
-    case "grab":
-      return { ok: true, detail: `Sent to qBittorrent: ${args?.title}` } satisfies GrabResult;
+    case "grab": {
+      const toCloud = (args as { backend?: string | null })?.backend === "bitport";
+      return {
+        ok: true,
+        detail: `${toCloud ? "Sent to your Bitport cloud" : "Sent to qBittorrent"}: ${args?.title}`,
+      } satisfies GrabResult;
+    }
     case "downloads":
       mockTorrents = mockTorrents.map((t) =>
         t.state === "downloading"
@@ -855,12 +992,7 @@ async function mock(cmd: string, args?: Record<string, unknown>): Promise<unknow
       return {
         torrents: mockTorrents,
         transfer: { dl_info_speed: 8.4e6, up_info_speed: 1.3e6 },
-        cloud: mockBp.connected
-          ? [
-              { token: "bp1", name: "UFC.Fight.Night.720p.WEBRip.x265-PSA.mkv", status: "finished", substatus: null, progress: 100, size: null, fileId: "f1", folderId: null, src: null },
-              { token: "bp2", name: "Lioness.S03E04.1080p.WEB.h264.mkv", status: "downloading", substatus: null, progress: 61, size: null, fileId: null, folderId: null, src: null },
-            ].filter((t) => !mockBp.deleted.has(t.token))
-          : [],
+        cloud: mockCloudView(),
         qbitError: null,
       } satisfies DownloadsView;
     case "torrent_action":
@@ -1005,21 +1137,30 @@ async function mock(cmd: string, args?: Record<string, unknown>): Promise<unknow
     case "bitport_connect_flow":
       await sleep(1500);
       mockBp.connected = true;
-      return { connected: true, quota: { planName: "big", planExpired: false, diskSize: 1073741824000, diskAvailable: 343501989179, diskUsed: 730239834821 } };
+      return mockBpStatus();
     case "bitport_connect":
       await sleep(700);
       mockBp.connected = true;
-      return { connected: true, quota: { planName: "big", planExpired: false, diskSize: 1073741824000, diskAvailable: 343501989179, diskUsed: 730239834821 } };
+      return mockBpStatus();
     case "bitport_status":
-      return mockBp.connected
-        ? { connected: true, quota: { planName: "big", planExpired: false, diskSize: 1073741824000, diskAvailable: 343501989179, diskUsed: 730239834821 } }
-        : { connected: false, quota: null };
+      return mockBpStatus();
     case "bitport_disconnect":
       mockBp.connected = false;
-      return;
+      return { released: 1, downloading: 0 } satisfies BitportDisconnectOutcome;
     case "bitport_delete":
       mockBp.deleted.add(String((args as { token?: string })?.token));
       return;
+    case "cloud_retry":
+      mockBp.retried.add(Number((args as { ledgerId?: number })?.ledgerId));
+      return 1;
+    case "cloud_remove": {
+      const id = Number((args as { ledgerId?: number })?.ledgerId);
+      // a done grab losing its cloud copy keeps its card, as the real backend does
+      const done = mockCloudView().items.some((i) => i.ledgerId === id && i.phase === "done");
+      if ((args as { deleteCloud?: boolean })?.deleteCloud && done) mockBp.cloudDeleted.add(id);
+      else mockBp.removed.add(id);
+      return;
+    }
     case "logs_recent": {
       const now = Date.now() / 1000;
       return [

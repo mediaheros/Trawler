@@ -167,6 +167,32 @@ pub fn open() -> Result<Connection> {
     add_column(&conn, "ALTER TABLE grab_ledger ADD COLUMN ep_ids TEXT")?;
     add_column(&conn, "ALTER TABLE shows ADD COLUMN alias_status TEXT")?;
     add_column(&conn, "ALTER TABLE shows ADD COLUMN seasons_json TEXT")?;
+    // where a cloud grab's files should land once Bitport has them — the
+    // qBittorrent path hands this to the client at add time and forgets it
+    add_column(&conn, "ALTER TABLE grab_ledger ADD COLUMN save_path TEXT")?;
+    // why a cloud grab stalled, in the user's words — the transfer itself
+    // often carries no message (a flagged file, nothing fetchable)
+    add_column(&conn, "ALTER TABLE grab_ledger ADD COLUMN note TEXT")?;
+    // one file of one cloud transfer on its way to this machine (cloud.rs)
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS cloud_fetch (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           ledger_id INTEGER NOT NULL,
+           bp_token TEXT NOT NULL,
+           file_code TEXT NOT NULL,
+           rel_path TEXT NOT NULL,
+           dest_dir TEXT NOT NULL,
+           size INTEGER NOT NULL DEFAULT 0,
+           crc32 TEXT,
+           state TEXT NOT NULL DEFAULT 'pending',
+           bytes_done INTEGER NOT NULL DEFAULT 0,
+           attempts INTEGER NOT NULL DEFAULT 0,
+           error TEXT,
+           updated_at INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_cloud_fetch_ledger ON cloud_fetch(ledger_id);",
+    )
+    .map_err(db_err)?;
     // one-shot backfill: link every healthy in-flight grab to its episodes by
     // the title match that still works TODAY, so the linkage survives the
     // refollow that would otherwise sever it tomorrow
@@ -267,7 +293,7 @@ pub fn open_existing() -> Result<Connection> {
 /// Is this content already satisfied (grabbed or completed)?
 pub fn ledger_satisfied(conn: &Connection, content_key: &str) -> bool {
     conn.query_row(
-        "SELECT COUNT(*) FROM grab_ledger WHERE content_key = ?1 AND state IN ('dispatching','grabbed','completed')",
+        "SELECT COUNT(*) FROM grab_ledger WHERE content_key = ?1 AND state IN ('dispatching','grabbed','fetching','completed')",
         [content_key],
         |r| r.get::<_, i64>(0),
     )
@@ -299,7 +325,7 @@ pub fn ledger_claim_dispatch(
     .map_err(db_err)?;
     let active = tx
         .query_row(
-            "SELECT COUNT(*) FROM grab_ledger WHERE content_key = ?1 AND state IN ('dispatching','grabbed','completed')",
+            "SELECT COUNT(*) FROM grab_ledger WHERE content_key = ?1 AND state IN ('dispatching','grabbed','fetching','completed')",
             [claim.content_key],
             |row| row.get::<_, i64>(0),
         )
@@ -358,7 +384,7 @@ pub fn ledger_claim_dispatch(
 /// scheduler (whose episodes were explicitly handed back) use the plain check.
 pub fn ledger_satisfied_for_automation(conn: &Connection, content_key: &str) -> bool {
     conn.query_row(
-        "SELECT COUNT(*) FROM grab_ledger WHERE content_key = ?1 AND state IN ('dispatching','grabbed','completed','deleted')",
+        "SELECT COUNT(*) FROM grab_ledger WHERE content_key = ?1 AND state IN ('dispatching','grabbed','fetching','completed','deleted')",
         [content_key],
         |r| r.get::<_, i64>(0),
     )
@@ -380,7 +406,7 @@ pub fn ledger_adopt_episodes(conn: &Connection, content_key: &str, ep_ids: &[i64
     let row: Option<(i64, String, String, Option<String>)> = conn
         .query_row(
             "SELECT id, title, state, ep_ids FROM grab_ledger
-             WHERE content_key = ?1 AND state IN ('dispatching','grabbed','completed')
+             WHERE content_key = ?1 AND state IN ('dispatching','grabbed','fetching','completed')
              ORDER BY id DESC LIMIT 1",
             [content_key],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
@@ -425,31 +451,6 @@ pub fn ledger_adopt_episodes(conn: &Connection, content_key: &str, ep_ids: &[i64
     conn.execute("UPDATE grab_ledger SET ep_ids = ?2 WHERE id = ?1", rusqlite::params![id, json])
         .map_err(db_err)?;
     Ok(true)
-}
-
-/// Release every open claim held by one backend (the user disconnected the
-/// account): the rows go to 'removed' and their episodes back to 'wanted',
-/// so the content can be grabbed again through whatever backend remains.
-pub fn ledger_release_backend(conn: &Connection, backend: &str) -> Result<usize> {
-    let rows: Vec<(i64, Option<String>)> = {
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, ep_ids FROM grab_ledger WHERE backend = ?1 AND state IN ('dispatching','grabbed')",
-            )
-            .map_err(db_err)?;
-        let rows = stmt
-            .query_map([backend], |r| Ok((r.get(0)?, r.get(1)?)))
-            .map_err(db_err)?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(db_err)?;
-        rows
-    };
-    for (id, ep_ids) in &rows {
-        conn.execute("UPDATE grab_ledger SET state = 'removed' WHERE id = ?1", [id])
-            .map_err(db_err)?;
-        set_episodes_state_by_ids(conn, &parse_ep_ids(ep_ids.as_deref()), "wanted", None);
-    }
-    Ok(rows.len())
 }
 
 pub fn ledger_finish_dispatch(
@@ -580,6 +581,280 @@ pub fn ledger_confirm_missing(conn: &Connection, id: i64, ep_ids: &[i64]) -> Res
     Ok(changed > 0)
 }
 
+/// Remember where a pending cloud grab's files should land. Separate from
+/// the claim so the claim's shape (and every test of it) stays untouched.
+pub fn ledger_set_dispatch_save_path(conn: &Connection, content_key: &str, save_path: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE grab_ledger SET save_path = ?2
+         WHERE id = (
+           SELECT id FROM grab_ledger
+           WHERE content_key = ?1 AND state = 'dispatching'
+           ORDER BY id DESC LIMIT 1
+         )",
+        rusqlite::params![content_key, save_path],
+    )
+    .map_err(db_err)?;
+    Ok(())
+}
+
+// ---------- cloud (Bitport) ledger rows and per-file fetches ----------
+
+/// A Bitport-backed ledger row as the cloud poller and the Downloads view
+/// see it.
+#[derive(Debug, Clone)]
+pub struct CloudLedgerRow {
+    pub id: i64,
+    pub title: String,
+    pub info_hash: Option<String>,
+    pub ep_ids: Vec<i64>,
+    pub bp_token: Option<String>,
+    pub ts: i64,
+    pub state: String,
+    pub save_path: Option<String>,
+    pub size: i64,
+    /// the stall reason, when Trawler (not Bitport) decided the grab failed
+    pub note: Option<String>,
+}
+
+pub fn cloud_ledger_rows(conn: &Connection, states: &[&str]) -> Vec<CloudLedgerRow> {
+    if states.is_empty() {
+        return vec![];
+    }
+    let placeholders = states.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT id, title, info_hash, ep_ids, bp_token, ts, state, save_path, size, note
+         FROM grab_ledger WHERE backend = 'bitport' AND state IN ({placeholders}) ORDER BY id"
+    );
+    conn.prepare(&sql)
+        .ok()
+        .map(|mut stmt| {
+            stmt.query_map(rusqlite::params_from_iter(states.iter()), |r| {
+                Ok(CloudLedgerRow {
+                    id: r.get(0)?,
+                    title: r.get(1)?,
+                    info_hash: r.get::<_, Option<String>>(2)?.map(|h| h.to_ascii_lowercase()),
+                    ep_ids: parse_ep_ids(r.get::<_, Option<String>>(3)?.as_deref()),
+                    bp_token: r.get(4)?,
+                    ts: r.get(5)?,
+                    state: r.get(6)?,
+                    save_path: r.get(7)?,
+                    size: r.get(8)?,
+                    note: r.get(9)?,
+                })
+            })
+            .map(|it| it.flatten().collect::<Vec<_>>())
+            .unwrap_or_default()
+        })
+        .unwrap_or_default()
+}
+
+/// Hand a dead grab's episodes back to wanted — but only the ones it still
+/// owns. A replacement grab may have claimed some of them since (its title
+/// is stamped on them), and those must stay grabbed.
+pub fn hand_back_owned_episodes(conn: &Connection, ids: &[i64], owner_title: &str) {
+    if ids.is_empty() {
+        return;
+    }
+    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "UPDATE episodes SET state = 'wanted', grabbed_title = NULL, grabbed_at = NULL, last_searched_at = 0
+         WHERE tvmaze_ep_id IN ({placeholders}) AND state = 'grabbed' AND grabbed_title = ?"
+    );
+    let mut params: Vec<rusqlite::types::Value> = ids.iter().map(|i| rusqlite::types::Value::from(*i)).collect();
+    params.push(owner_title.to_string().into());
+    let _ = conn.execute(&sql, rusqlite::params_from_iter(params));
+}
+
+pub fn ledger_set_note(conn: &Connection, id: i64, note: &str) {
+    let _ = conn.execute(
+        "UPDATE grab_ledger SET note = ?2 WHERE id = ?1",
+        rusqlite::params![id, note.chars().take(300).collect::<String>()],
+    );
+}
+
+pub fn ledger_set_bp_token(conn: &Connection, id: i64, token: &str) {
+    let _ = conn.execute(
+        "UPDATE grab_ledger SET bp_token = ?2 WHERE id = ?1",
+        rusqlite::params![id, token],
+    );
+}
+
+/// Move a row to `to` only if it is still in one of `from`. Every cloud
+/// transition goes through here: the poller and the fetcher both act on
+/// snapshots taken before their awaits, and a row the user removed in the
+/// meantime must stay removed — never be resurrected or completed.
+/// Returns whether the row moved; callers skip episode side effects on
+/// false.
+pub fn ledger_transition(conn: &Connection, id: i64, from: &[&str], to: &str) -> Result<bool> {
+    if from.is_empty() {
+        return Ok(false);
+    }
+    let placeholders = from.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!("UPDATE grab_ledger SET state = ?1 WHERE id = ?2 AND state IN ({placeholders})");
+    let mut params: Vec<rusqlite::types::Value> = vec![to.to_string().into(), id.into()];
+    params.extend(from.iter().map(|s| rusqlite::types::Value::from(s.to_string())));
+    let changed = conn.execute(&sql, rusqlite::params_from_iter(params)).map_err(db_err)?;
+    Ok(changed > 0)
+}
+
+/// Is there a stalled cloud row for this hash? A release Bitport already
+/// failed on must not be re-sent every cycle (the qBittorrent path has the
+/// same rule for dead swarms).
+pub fn cloud_ledger_stalled_hash(conn: &Connection, info_hash: &str) -> bool {
+    conn.query_row(
+        "SELECT COUNT(*) FROM grab_ledger WHERE backend = 'bitport' AND state = 'stalled' AND lower(info_hash) = lower(?1)",
+        [info_hash],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|n| n > 0)
+    .unwrap_or(false)
+}
+
+#[derive(Debug, Clone)]
+pub struct CloudFetchRow {
+    pub id: i64,
+    pub ledger_id: i64,
+    pub bp_token: String,
+    pub file_code: String,
+    pub rel_path: String,
+    pub dest_dir: String,
+    pub size: i64,
+    pub crc32: Option<String>,
+    pub state: String,
+    pub bytes_done: i64,
+    pub attempts: i64,
+    pub error: Option<String>,
+    pub updated_at: i64,
+}
+
+fn read_fetch_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<CloudFetchRow> {
+    Ok(CloudFetchRow {
+        id: r.get(0)?,
+        ledger_id: r.get(1)?,
+        bp_token: r.get(2)?,
+        file_code: r.get(3)?,
+        rel_path: r.get(4)?,
+        dest_dir: r.get(5)?,
+        size: r.get(6)?,
+        crc32: r.get(7)?,
+        state: r.get(8)?,
+        bytes_done: r.get(9)?,
+        attempts: r.get(10)?,
+        error: r.get(11)?,
+        updated_at: r.get(12)?,
+    })
+}
+
+const FETCH_COLUMNS: &str =
+    "id, ledger_id, bp_token, file_code, rel_path, dest_dir, size, crc32, state, bytes_done, attempts, error, updated_at";
+
+pub struct NewCloudFetch<'a> {
+    pub ledger_id: i64,
+    pub bp_token: &'a str,
+    pub file_code: &'a str,
+    pub rel_path: &'a str,
+    pub dest_dir: &'a str,
+    pub size: i64,
+}
+
+pub fn cloud_fetch_insert(conn: &Connection, rows: &[NewCloudFetch<'_>]) -> Result<()> {
+    let tx = conn.unchecked_transaction().map_err(db_err)?;
+    let ts = now();
+    for row in rows {
+        tx.execute(
+            "INSERT INTO cloud_fetch (ledger_id, bp_token, file_code, rel_path, dest_dir, size, state, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)",
+            rusqlite::params![row.ledger_id, row.bp_token, row.file_code, row.rel_path, row.dest_dir, row.size, ts],
+        )
+        .map_err(db_err)?;
+    }
+    tx.commit().map_err(db_err)?;
+    Ok(())
+}
+
+/// Every fetch that still needs work, oldest ledger first. `fetching` rows
+/// are included: after a crash they are resumable partials, and the caller
+/// skips the ones it is actively working on.
+pub fn cloud_fetch_open(conn: &Connection) -> Vec<CloudFetchRow> {
+    let sql = format!(
+        "SELECT {FETCH_COLUMNS} FROM cloud_fetch WHERE state IN ('pending','fetching') ORDER BY ledger_id, id"
+    );
+    conn.prepare(&sql)
+        .ok()
+        .map(|mut stmt| {
+            stmt.query_map([], read_fetch_row)
+                .map(|it| it.flatten().collect::<Vec<_>>())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default()
+}
+
+pub fn cloud_fetch_for_ledger(conn: &Connection, ledger_id: i64) -> Vec<CloudFetchRow> {
+    let sql = format!("SELECT {FETCH_COLUMNS} FROM cloud_fetch WHERE ledger_id = ?1 ORDER BY id");
+    conn.prepare(&sql)
+        .ok()
+        .map(|mut stmt| {
+            stmt.query_map([ledger_id], read_fetch_row)
+                .map(|it| it.flatten().collect::<Vec<_>>())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default()
+}
+
+/// Move one fetch to a new state; `bytes_done` and `error` are replaced,
+/// `attempts` grows when asked. Returns whether the row still existed —
+/// false means the grab was removed while the fetch ran.
+pub fn cloud_fetch_set_state(
+    conn: &Connection,
+    id: i64,
+    state: &str,
+    bytes_done: i64,
+    error: Option<&str>,
+    bump_attempts: bool,
+) -> bool {
+    conn.execute(
+        "UPDATE cloud_fetch SET state = ?2, bytes_done = ?3, error = ?4,
+                attempts = attempts + ?5, updated_at = ?6 WHERE id = ?1",
+        rusqlite::params![id, state, bytes_done, error, if bump_attempts { 1 } else { 0 }, now()],
+    )
+    .map(|n| n > 0)
+    .unwrap_or(false)
+}
+
+/// Files still to fetch (or mid-fetch) across every grab — what keeps the
+/// fetcher and the fast poll cadence alive.
+pub fn cloud_fetch_open_count(conn: &Connection) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM cloud_fetch WHERE state IN ('pending','fetching')",
+        [],
+        |r| r.get::<_, i64>(0),
+    )
+    .unwrap_or(0)
+}
+
+/// The file-info endpoint knows the size and checksum better than the
+/// listing did.
+pub fn cloud_fetch_set_identity(conn: &Connection, id: i64, size: i64, crc32: Option<&str>) {
+    let _ = conn.execute(
+        "UPDATE cloud_fetch SET size = ?2, crc32 = COALESCE(?3, crc32) WHERE id = ?1",
+        rusqlite::params![id, size, crc32],
+    );
+}
+
+/// Give every failed file of a grab another run.
+pub fn cloud_fetch_reset_failed(conn: &Connection, ledger_id: i64) -> usize {
+    conn.execute(
+        "UPDATE cloud_fetch SET state = 'pending', attempts = 0, error = NULL, updated_at = ?2
+         WHERE ledger_id = ?1 AND state = 'failed'",
+        rusqlite::params![ledger_id, now()],
+    )
+    .unwrap_or(0)
+}
+
+pub fn cloud_fetch_delete_for_ledger(conn: &Connection, ledger_id: i64) {
+    let _ = conn.execute("DELETE FROM cloud_fetch WHERE ledger_id = ?1", [ledger_id]);
+}
+
 /// Parse a ledger row's ep_ids JSON into ids (empty when absent/invalid).
 pub fn parse_ep_ids(raw: Option<&str>) -> Vec<i64> {
     raw.and_then(|r| serde_json::from_str::<Vec<i64>>(r).ok()).unwrap_or_default()
@@ -650,7 +925,7 @@ pub fn set_episodes_state_by_ids(conn: &Connection, ids: &[i64], state: &str, gr
 /// The upgrade scout uses this to see what quality the user already has.
 pub fn ledger_entries(conn: &Connection, content_key: &str) -> Vec<(String, i64)> {
     conn.prepare(
-        "SELECT title, size FROM grab_ledger WHERE content_key = ?1 AND state IN ('grabbed','completed')",
+        "SELECT title, size FROM grab_ledger WHERE content_key = ?1 AND state IN ('grabbed','fetching','completed')",
     )
     .ok()
     .map(|mut stmt| {
@@ -1331,23 +1606,46 @@ mod tests {
     }
 
     #[test]
-    fn disconnecting_bitport_releases_its_open_claims() {
+    fn guarded_transitions_move_only_from_expected_states() {
         let conn = ledger_with_episodes();
+        // the cloud read model selects the two columns the migrations add
+        conn.execute_batch(
+            "ALTER TABLE grab_ledger ADD COLUMN save_path TEXT;
+             ALTER TABLE grab_ledger ADD COLUMN note TEXT;",
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO grab_ledger (content_key, title, size, state, ts, ep_ids, backend)
-             VALUES ('tv:show:s01e01', 'Show.S01E01', 10, 'grabbed', 1, '[7]', 'bitport'),
-                    ('tv:show:s01e02', 'Show.S01E02', 10, 'completed', 1, '[8]', 'bitport'),
-                    ('tv:show:s01e03', 'Show.S01E03', 10, 'grabbed', 1, '[9]', 'qbittorrent')",
+             VALUES ('tv:show:s01e01', 'Show.S01E01', 10, 'fetching', 1, '[7]', 'bitport'),
+                    ('tv:show:s01e02', 'Show.S01E02', 10, 'deleted', 1, '[8]', 'bitport')",
             [],
         )
         .unwrap();
-        conn.execute("UPDATE episodes SET state = 'grabbed', grabbed_title = 'x'", []).unwrap();
-        let released = super::ledger_release_backend(&conn, "bitport").unwrap();
-        assert_eq!(released, 1, "only open cloud claims are released");
+        // a removed row is never resurrected by a pass working from a stale snapshot
+        assert!(!super::ledger_transition(&conn, 2, &["fetching", "grabbed"], "completed").unwrap());
+        assert!(super::ledger_transition(&conn, 1, &["fetching"], "completed").unwrap());
+        assert!(!super::ledger_transition(&conn, 1, &["fetching"], "removed").unwrap(), "already moved on");
+        assert!(!super::ledger_transition(&conn, 1, &[], "removed").unwrap(), "an empty from-list moves nothing");
+        let rows = super::cloud_ledger_rows(&conn, &["completed"]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ep_ids, vec![7]);
+        assert!(ledger_satisfied(&conn, "tv:show:s01e01"));
+    }
+
+    #[test]
+    fn hand_back_respects_a_replacement_grab() {
+        let conn = ledger_with_episodes();
+        // 7 still belongs to the dead cloud grab; 8 was re-claimed by a
+        // season pack after the first stall handed it back
+        conn.execute(
+            "UPDATE episodes SET state = 'grabbed', grabbed_title = CASE tvmaze_ep_id WHEN 8 THEN 'Show.S01.Pack' ELSE 'Show.S01E01' END",
+            [],
+        )
+        .unwrap();
+        super::hand_back_owned_episodes(&conn, &[7, 8, 9], "Show.S01E01");
         assert_eq!(ep_state(&conn, 7), "wanted");
-        assert_eq!(ep_state(&conn, 8), "grabbed", "completed cloud content stays as it is");
-        assert_eq!(ep_state(&conn, 9), "grabbed", "local grabs are untouched");
-        assert!(!ledger_satisfied(&conn, "tv:show:s01e01"));
+        assert_eq!(ep_state(&conn, 8), "grabbed", "owned by the replacement, untouched");
+        assert_eq!(ep_state(&conn, 9), "wanted");
     }
 
     #[test]

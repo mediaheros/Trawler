@@ -41,6 +41,7 @@ futures = "0.3"
 fs2 = "0.4"
 rusqlite = { version = "0.40", features = ["bundled"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
+crc32fast = "1"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
