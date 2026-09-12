@@ -73,7 +73,14 @@ export default function DownloadsView() {
   const retryCloud = async (item: CloudItem) => {
     try {
       const n = await api.cloudRetry(item.ledgerId);
-      toast(n > 0 ? `Retrying ${n} file${n === 1 ? "" : "s"}` : "Nothing left to retry", "info");
+      toast(
+        n === 0
+          ? "Nothing left to retry"
+          : item.filesFailed > 0
+            ? `Retrying ${item.filesFailed} file${item.filesFailed === 1 ? "" : "s"}`
+            : "Trying again — Bitport will be re-read on the next check",
+        "info",
+      );
     } catch (e) {
       toast(String(e), "bad");
     }

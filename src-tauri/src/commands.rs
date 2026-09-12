@@ -1365,7 +1365,7 @@ pub async fn bitport_delete(state: State<'_, AppState>, token: String) -> Result
             }
             crate::db::cloud_fetch_delete_for_ledger(&conn, row.id);
             if row.state != "stalled" {
-                crate::db::set_episodes_state_by_ids(&conn, &row.ep_ids, "wanted", None);
+                crate::db::hand_back_owned_episodes(&conn, &row.ep_ids, &row.title);
             }
             freed_name = Some(row.title);
         }

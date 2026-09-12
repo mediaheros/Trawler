@@ -648,6 +648,23 @@ pub fn cloud_ledger_rows(conn: &Connection, states: &[&str]) -> Vec<CloudLedgerR
         .unwrap_or_default()
 }
 
+/// Hand a dead grab's episodes back to wanted — but only the ones it still
+/// owns. A replacement grab may have claimed some of them since (its title
+/// is stamped on them), and those must stay grabbed.
+pub fn hand_back_owned_episodes(conn: &Connection, ids: &[i64], owner_title: &str) {
+    if ids.is_empty() {
+        return;
+    }
+    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "UPDATE episodes SET state = 'wanted', grabbed_title = NULL, grabbed_at = NULL, last_searched_at = 0
+         WHERE tvmaze_ep_id IN ({placeholders}) AND state = 'grabbed' AND grabbed_title = ?"
+    );
+    let mut params: Vec<rusqlite::types::Value> = ids.iter().map(|i| rusqlite::types::Value::from(*i)).collect();
+    params.push(owner_title.to_string().into());
+    let _ = conn.execute(&sql, rusqlite::params_from_iter(params));
+}
+
 pub fn ledger_set_note(conn: &Connection, id: i64, note: &str) {
     let _ = conn.execute(
         "UPDATE grab_ledger SET note = ?2 WHERE id = ?1",
@@ -1609,11 +1626,26 @@ mod tests {
         assert!(super::ledger_transition(&conn, 1, &["fetching"], "completed").unwrap());
         assert!(!super::ledger_transition(&conn, 1, &["fetching"], "removed").unwrap(), "already moved on");
         assert!(!super::ledger_transition(&conn, 1, &[], "removed").unwrap(), "an empty from-list moves nothing");
-        // fetching counts as an active claim: nothing may double-grab it
         let rows = super::cloud_ledger_rows(&conn, &["completed"]);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].ep_ids, vec![7]);
         assert!(ledger_satisfied(&conn, "tv:show:s01e01"));
+    }
+
+    #[test]
+    fn hand_back_respects_a_replacement_grab() {
+        let conn = ledger_with_episodes();
+        // 7 still belongs to the dead cloud grab; 8 was re-claimed by a
+        // season pack after the first stall handed it back
+        conn.execute(
+            "UPDATE episodes SET state = 'grabbed', grabbed_title = CASE tvmaze_ep_id WHEN 8 THEN 'Show.S01.Pack' ELSE 'Show.S01E01' END",
+            [],
+        )
+        .unwrap();
+        super::hand_back_owned_episodes(&conn, &[7, 8, 9], "Show.S01E01");
+        assert_eq!(ep_state(&conn, 7), "wanted");
+        assert_eq!(ep_state(&conn, 8), "grabbed", "owned by the replacement, untouched");
+        assert_eq!(ep_state(&conn, 9), "wanted");
     }
 
     #[test]

@@ -444,7 +444,8 @@ async fn vanish_row(state: &AppState, row: &CloudLedgerRow) {
     let moved = match row.state.as_str() {
         "stalled" => db::ledger_transition(&conn, row.id, &["stalled"], "removed"),
         "fetching" => db::ledger_transition(&conn, row.id, &["fetching"], "removed"),
-        _ => db::ledger_confirm_missing(&conn, row.id, &row.ep_ids),
+        // episodes are handed back below, ownership-aware, not by the helper
+        _ => db::ledger_confirm_missing(&conn, row.id, &[]),
     };
     match moved {
         Ok(true) => {
@@ -452,7 +453,9 @@ async fn vanish_row(state: &AppState, row: &CloudLedgerRow) {
                 state.cloud.cancel_fetches(row.id);
                 drop_parts(&db::cloud_fetch_for_ledger(&conn, row.id));
                 db::cloud_fetch_delete_for_ledger(&conn, row.id);
-                db::set_episodes_state_by_ids(&conn, &row.ep_ids, "wanted", None);
+            }
+            if row.state != "stalled" {
+                db::hand_back_owned_episodes(&conn, &row.ep_ids, &row.title);
             }
             if row.state != "stalled" {
                 db::log_activity(
@@ -494,7 +497,7 @@ async fn stall_row(app: &tauri::AppHandle, state: &AppState, row: &CloudLedgerRo
         match db::ledger_transition(&conn, row.id, &["dispatching", "grabbed"], "stalled") {
             Ok(true) => {
                 db::ledger_set_note(&conn, row.id, reason);
-                db::set_episodes_state_by_ids(&conn, &row.ep_ids, "wanted", None);
+                db::hand_back_owned_episodes(&conn, &row.ep_ids, &row.title);
                 // only followed episodes get re-planned; a movie or a manual
                 // grab is up to the user
                 let next = if row.ep_ids.is_empty() { "" } else { " — Trawler will look for another release" };
@@ -635,6 +638,10 @@ fn classify_listing_error(e: AppError) -> PlanError {
     let msg = e.to_string().to_ascii_lowercase();
     if msg.contains("not found") || msg.contains("not owned") || msg.contains("not your file") {
         PlanError::Definitive("its files are no longer in the cloud".into())
+    } else if msg.contains("unexpected response shape") {
+        // an answer that parsed but made no sense will not improve with
+        // time; the user can Retry once Bitport behaves
+        PlanError::Definitive("Bitport returned an unreadable file listing".into())
     } else {
         PlanError::Retry(e)
     }
@@ -1334,11 +1341,18 @@ pub async fn retry(state: &AppState, ledger_id: i64) -> Result<usize> {
     let n = {
         let conn = state.db.lock().await;
         let files = db::cloud_fetch_reset_failed(&conn, ledger_id);
-        let row = if db::ledger_transition(&conn, ledger_id, &["stalled"], "grabbed")? {
-            db::ledger_set_note(&conn, ledger_id, "");
-            1
-        } else {
-            0
+        let stalled = db::cloud_ledger_rows(&conn, &["stalled"]).into_iter().find(|r| r.id == ledger_id);
+        let row = match stalled {
+            Some(row) if db::ledger_transition(&conn, ledger_id, &["stalled"], "grabbed")? => {
+                db::ledger_set_note(&conn, ledger_id, "");
+                // the grab is live again, so it claims its episodes again —
+                // only those still wanted and unclaimed; ones a replacement
+                // grab took meanwhile stay with it, and a later stall hands
+                // back only what this row owns
+                db::set_episodes_state_by_ids(&conn, &row.ep_ids, "grabbed", Some(&row.title));
+                1
+            }
+            _ => 0,
         };
         files + row
     };
@@ -1447,7 +1461,7 @@ pub async fn remove(state: &AppState, ledger_id: i64, delete_cloud: bool) -> Res
     drop_parts(&db::cloud_fetch_for_ledger(&conn, ledger_id));
     db::cloud_fetch_delete_for_ledger(&conn, ledger_id);
     if current != "completed" && current != "stalled" {
-        db::set_episodes_state_by_ids(&conn, &row.ep_ids, "wanted", None);
+        db::hand_back_owned_episodes(&conn, &row.ep_ids, &row.title);
     }
     if current != "completed" {
         let where_ = if cloud_deleted { "Removed from your cloud" } else { "Removed" };
@@ -1482,11 +1496,11 @@ pub async fn release_all(state: &AppState) -> Result<(usize, usize)> {
                 state.cloud.cancel_fetches(row.id);
                 drop_parts(&db::cloud_fetch_for_ledger(&conn, row.id));
                 db::cloud_fetch_delete_for_ledger(&conn, row.id);
-                db::set_episodes_state_by_ids(&conn, &row.ep_ids, "wanted", None);
+                db::hand_back_owned_episodes(&conn, &row.ep_ids, &row.title);
                 downloading += 1;
             }
             _ => {
-                db::set_episodes_state_by_ids(&conn, &row.ep_ids, "wanted", None);
+                db::hand_back_owned_episodes(&conn, &row.ep_ids, &row.title);
                 released += 1;
             }
         }
@@ -1621,8 +1635,10 @@ fn build_item(
         cloud_status: transfer.map(|t| t.status.clone()).unwrap_or_else(|| "waiting".into()),
         cloud_progress: transfer.map(|t| t.progress).unwrap_or(0.0),
         message: transfer.and_then(|t| t.message.clone()),
-        // a completed row can only act on a copy it can name by token
-        cloud_copy: transfer.is_some() && (row.state != "completed" || row.bp_token.is_some()),
+        // "there is a cloud copy Trawler can act on": the actions only ever
+        // delete by the row's own token, so a hash- or name-matched transfer
+        // does not count until the poller has pinned it
+        cloud_copy: transfer.is_some() && row.bp_token.is_some(),
         files_total: 0,
         files_done: 0,
         files_failed: 0,
