@@ -170,6 +170,9 @@ pub fn open() -> Result<Connection> {
     // where a cloud grab's files should land once Bitport has them — the
     // qBittorrent path hands this to the client at add time and forgets it
     add_column(&conn, "ALTER TABLE grab_ledger ADD COLUMN save_path TEXT")?;
+    // why a cloud grab stalled, in the user's words — the transfer itself
+    // often carries no message (a flagged file, nothing fetchable)
+    add_column(&conn, "ALTER TABLE grab_ledger ADD COLUMN note TEXT")?;
     // one file of one cloud transfer on its way to this machine (cloud.rs)
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS cloud_fetch (
@@ -634,6 +637,8 @@ pub struct CloudLedgerRow {
     pub state: String,
     pub save_path: Option<String>,
     pub size: i64,
+    /// the stall reason, when Trawler (not Bitport) decided the grab failed
+    pub note: Option<String>,
 }
 
 pub fn cloud_ledger_rows(conn: &Connection, states: &[&str]) -> Vec<CloudLedgerRow> {
@@ -642,7 +647,7 @@ pub fn cloud_ledger_rows(conn: &Connection, states: &[&str]) -> Vec<CloudLedgerR
     }
     let placeholders = states.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let sql = format!(
-        "SELECT id, title, info_hash, ep_ids, bp_token, ts, state, save_path, size
+        "SELECT id, title, info_hash, ep_ids, bp_token, ts, state, save_path, size, note
          FROM grab_ledger WHERE backend = 'bitport' AND state IN ({placeholders}) ORDER BY id"
     );
     conn.prepare(&sql)
@@ -659,12 +664,20 @@ pub fn cloud_ledger_rows(conn: &Connection, states: &[&str]) -> Vec<CloudLedgerR
                     state: r.get(6)?,
                     save_path: r.get(7)?,
                     size: r.get(8)?,
+                    note: r.get(9)?,
                 })
             })
             .map(|it| it.flatten().collect::<Vec<_>>())
             .unwrap_or_default()
         })
         .unwrap_or_default()
+}
+
+pub fn ledger_set_note(conn: &Connection, id: i64, note: &str) {
+    let _ = conn.execute(
+        "UPDATE grab_ledger SET note = ?2 WHERE id = ?1",
+        rusqlite::params![id, note.chars().take(300).collect::<String>()],
+    );
 }
 
 pub fn ledger_set_bp_token(conn: &Connection, id: i64, token: &str) {

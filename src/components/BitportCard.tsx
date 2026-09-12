@@ -43,7 +43,11 @@ export default function BitportCard({
 
   const announce = (s: BitportStatus) => {
     setStatus(s);
-    toast(`Bitport connected — ${s.quota ? fmtBytes(s.quota.diskAvailable) + " free in the cloud" : "ready"}`, "ok");
+    const free = s.quota ? fmtBytes(s.quota.diskAvailable) + " free in the cloud" : "ready";
+    // connected is not the same as used: grabs still go wherever the
+    // picker says until the user moves it and saves
+    const hint = draft.downloadBackend === "bitport" ? "" : " — pick \"Bitport cloud\" below and Save to send grabs there";
+    toast(`Bitport connected — ${free}${hint}`, "ok");
   };
 
   const connectFlow = async () => {
@@ -75,11 +79,16 @@ export default function BitportCard({
 
   const disconnect = async () => {
     try {
-      await api.bitportDisconnect();
+      const out = await api.bitportDisconnect();
       setStatus((s) => (s ? { ...s, connected: false, authFailed: false, quota: null } : s));
       set({ downloadBackend: "qbittorrent" });
       await loadConfig();
-      toast("Bitport disconnected — grabs go to local qBittorrent", "info");
+      const n = out.released + out.downloading;
+      const handedBack =
+        n === 0
+          ? ""
+          : ` — ${n} cloud grab${n === 1 ? "" : "s"} handed back${out.downloading > 0 ? ` (${out.downloading} mid-download, partial files removed)` : ""}`;
+      toast(`Bitport disconnected — grabs go to local qBittorrent${handedBack}`, "info");
     } catch (e) {
       toast(String(e), "bad");
     }
@@ -101,13 +110,18 @@ export default function BitportCard({
             Couldn't read the Bitport connection state: {statusError}
           </span>
         </div>
-      ) : status?.connected ? (
+      ) : !status ? (
+        // the probe may take a while when Bitport is slow; a connected user
+        // must not be shown a Connect button in the meantime
+        <div className="text-[11.5px] text-faint">Checking the Bitport connection…</div>
+      ) : status.connected ? (
         <div className="space-y-3.5">
           {status.authFailed && (
             <div className="flex items-center gap-2.5 rounded-lg border border-bad/30 bg-bad/8 px-3 py-2 text-[11.5px] text-bad">
               <AlertTriangle size={14} className="shrink-0" />
               <span className="flex-1">
-                Bitport no longer accepts Trawler's access. Cloud grabs are paused until you reconnect.
+                Bitport no longer accepts Trawler's access. New cloud grabs are refused and downloads in progress
+                wait until you reconnect.
               </span>
               <Button variant="primary" busy={waiting} onClick={() => void connectFlow()} className="shrink-0 px-2.5 py-1 text-[11.5px]">
                 {waiting ? "Waiting…" : "Reconnect"}
@@ -164,7 +178,10 @@ export default function BitportCard({
                 { value: "bitport", label: "Bitport cloud" },
               ]}
             />
-            <div className="mt-1 text-[11px] text-faint">Applies after Save — every grab path honors it</div>
+            <div className="mt-1 text-[11px] text-faint">
+              Manual grabs, the scheduler and the agent all follow this. Connect and disconnect take effect at once;
+              this and the options below apply after Save.
+            </div>
           </div>
 
           <div className="space-y-2 rounded-lg border border-line bg-bg2/40 px-3 py-2.5">
@@ -182,6 +199,12 @@ export default function BitportCard({
                   Downloaded over HTTPS into the TV or Movies save path, checksum-verified. Episodes count as downloaded
                   only once the files are here.
                 </span>
+                {!draft.bitportFetchToLocal && (
+                  <span className="block text-[11px] text-warn">
+                    Off: episodes count as downloaded as soon as Bitport finishes, and the files stay in your cloud
+                    until you delete them there. Applies to transfers that finish from now on.
+                  </span>
+                )}
               </span>
             </label>
             <label
@@ -203,7 +226,7 @@ export default function BitportCard({
               </span>
             </label>
             {draft.bitportFetchToLocal && (
-              <Field label="Fallback download folder" hint="Used when a grab has no TV or Movies save path">
+              <Field label="Fallback download folder" hint="Used when a grab has no TV, Movies or per-show save path">
                 <TextInput
                   mono
                   value={draft.bitportDownloadDir}
@@ -234,7 +257,11 @@ export default function BitportCard({
               <Cloud size={13} />
               {waiting ? "Waiting for your approval…" : "Connect Bitport"}
             </Button>
-            {waiting && <span className="text-[11px] text-faint">Approve Trawler on the Bitport page that just opened.</span>}
+            {waiting && (
+              <span className="text-[11px] text-faint">
+                Approve Trawler on the Bitport page that just opened. This gives up after five minutes.
+              </span>
+            )}
           </div>
           {!waiting && (
             <button

@@ -249,6 +249,13 @@ export interface BitportQuota {
   diskUsed: number;
 }
 
+export interface BitportDisconnectOutcome {
+  /** grabs that were torrenting or waiting in the cloud */
+  released: number;
+  /** grabs whose files were on their way down (partials removed) */
+  downloading: number;
+}
+
 export interface BitportStatus {
   connected: boolean;
   /** the stored token was rejected — connected in name only */
@@ -564,7 +571,7 @@ export const api = {
   bitportConnect: (code: string) => call<BitportStatus>("bitport_connect", { code }),
   bitportConnectFlow: () => call<BitportStatus>("bitport_connect_flow"),
   bitportStatus: () => call<BitportStatus>("bitport_status"),
-  bitportDisconnect: () => call<void>("bitport_disconnect"),
+  bitportDisconnect: () => call<BitportDisconnectOutcome>("bitport_disconnect"),
   bitportDelete: (token: string) => call<void>("bitport_delete", { token }),
   cloudRetry: (ledgerId: number) => call<number>("cloud_retry", { ledgerId }),
   cloudRemove: (ledgerId: number, deleteCloud: boolean) =>
@@ -1122,7 +1129,7 @@ async function mock(cmd: string, args?: Record<string, unknown>): Promise<unknow
       return mockBpStatus();
     case "bitport_disconnect":
       mockBp.connected = false;
-      return;
+      return { released: 1, downloading: 0 } satisfies BitportDisconnectOutcome;
     case "bitport_delete":
       mockBp.deleted.add(String((args as { token?: string })?.token));
       return;

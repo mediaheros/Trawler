@@ -1125,9 +1125,11 @@ pub async fn bitport_connect_flow(
         "bitport",
         format!("waiting for browser approval on 127.0.0.1:{}", crate::bitport::CALLBACK_PORT),
     );
+    // (the listener dies with this error, so "visit the link yourself" would
+    // land on a closed port — the code path is the way out)
     app.opener()
         .open_url(url.clone(), None::<&str>)
-        .map_err(|e| AppError::Other(format!("could not open your browser ({e}) — visit {url} manually")))?;
+        .map_err(|e| AppError::Other(format!("could not open your browser ({e}) — use \"connect with a code\" instead")))?;
     let code = crate::bitport::await_code(
         listener,
         std::time::Duration::from_secs(300),
@@ -1194,18 +1196,30 @@ async fn bitport_store_and_probe(state: &AppState, token: String) -> Result<Bitp
 /// are tried.
 #[tauri::command]
 pub async fn bitport_connect(state: State<'_, AppState>, code: String) -> Result<BitportStatus> {
+    // a pasted redirect URL is an authorization code; a bare paste is almost
+    // always the user code from bitport.io/get-access — try the likely
+    // grant first and report ITS failure
+    let from_redirect = code.contains("code=");
     let code = crate::bitport::extract_code(&code);
     if code.is_empty() {
         return Err(AppError::Other("paste the code Bitport showed you".into()));
     }
-    let token = match crate::bitport::exchange(&state.http, &code, crate::bitport::CodeKind::Authorization).await {
+    let (first, second) = if from_redirect {
+        (crate::bitport::CodeKind::Authorization, crate::bitport::CodeKind::UserCode)
+    } else {
+        (crate::bitport::CodeKind::UserCode, crate::bitport::CodeKind::Authorization)
+    };
+    let token = match crate::bitport::exchange(&state.http, &code, first).await {
         Ok(t) => t,
-        Err(first) => {
-            match crate::bitport::exchange(&state.http, &code, crate::bitport::CodeKind::UserCode).await {
-                Ok(t) => t,
-                Err(_) => return Err(first),
+        Err(primary) => match crate::bitport::exchange(&state.http, &code, second).await {
+            Ok(t) => t,
+            Err(_) => {
+                return Err(AppError::Other(format!(
+                    "{primary} — codes expire within minutes; get a fresh one at {}",
+                    crate::bitport::GET_ACCESS_URL
+                )))
             }
-        }
+        },
     };
     bitport_store_and_probe(&state, token).await
 }
@@ -1246,8 +1260,19 @@ pub async fn bitport_status(state: State<'_, AppState>) -> Result<BitportStatus>
     Ok(bitport_status_now(state.inner(), &cfg, true, quota).await)
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BitportDisconnectOutcome {
+    /// cloud grabs that were torrenting or waiting and are now free to be
+    /// grabbed locally
+    pub released: usize,
+    /// grabs whose files were on their way down; their partial files are
+    /// gone and they are free to be grabbed locally too
+    pub downloading: usize,
+}
+
 #[tauri::command]
-pub async fn bitport_disconnect(state: State<'_, AppState>) -> Result<()> {
+pub async fn bitport_disconnect(state: State<'_, AppState>) -> Result<BitportDisconnectOutcome> {
     {
         let mut cfg = state.config.write().await;
         let mut next = cfg.clone();
@@ -1260,20 +1285,25 @@ pub async fn bitport_disconnect(state: State<'_, AppState>) -> Result<()> {
     }
     *state.cloud.snapshot.write().await = crate::cloud::CloudSnapshot::default();
     state.cloud.auth_failed.store(false, std::sync::atomic::Ordering::SeqCst);
-    // no token means no poll will ever settle the open cloud claims —
-    // release them now so their episodes can be grabbed locally. Rows
-    // already fetching keep their files; they resume on a reconnect.
-    let conn = state.db.lock().await;
-    let released = crate::db::ledger_release_backend(&conn, "bitport")?;
-    if released > 0 {
+    // no token means no poll will ever settle the open cloud grabs, and a
+    // download cannot get a fresh link — release everything open so the
+    // episodes can be grabbed locally
+    let (released, downloading) = crate::cloud::release_all(state.inner()).await?;
+    if released + downloading > 0 {
+        let conn = state.db.lock().await;
+        let n = released + downloading;
         crate::db::log_activity(
             &conn,
             "system",
             None,
-            &format!("Bitport disconnected — released {released} in-flight cloud grab(s); Trawler can grab them locally"),
+            &format!(
+                "Bitport disconnected — {n} cloud grab{} handed back; Trawler can grab {} locally",
+                if n == 1 { "" } else { "s" },
+                if n == 1 { "it" } else { "them" }
+            ),
         );
     }
-    Ok(())
+    Ok(BitportDisconnectOutcome { released, downloading })
 }
 
 /// Remove a transfer Trawler did NOT create (the "also in your cloud"
@@ -1297,11 +1327,13 @@ pub async fn bitport_delete(state: State<'_, AppState>, token: String) -> Result
     let conn = state.db.lock().await;
     let mut freed_name: Option<String> = None;
     // identity only — a same-named transfer the user added by hand is a
-    // different transfer, and Trawler's own must keep running
+    // different transfer, and Trawler's own must keep running. A row that
+    // already knows its token matches by token alone: an older transfer of
+    // the same release is not it.
     for row in crate::db::cloud_ledger_rows(&conn, &["dispatching", "grabbed", "fetching", "completed", "stalled"]) {
         let tok_match = row.bp_token.as_deref() == Some(token.as_str());
-        let hash_match =
-            matches!((&row.info_hash, &vic_hash), (Some(a), Some(b)) if a.eq_ignore_ascii_case(b));
+        let hash_match = row.bp_token.is_none()
+            && matches!((&row.info_hash, &vic_hash), (Some(a), Some(b)) if a.eq_ignore_ascii_case(b));
         if tok_match || hash_match {
             state.cloud.cancel_fetches(row.id);
             crate::db::cloud_fetch_delete_for_ledger(&conn, row.id);
@@ -1325,7 +1357,7 @@ pub async fn bitport_delete(state: State<'_, AppState>, token: String) -> Result
             "system",
             None,
             &format!(
-                "Removed from your cloud: {} — released; Trawler can grab it again",
+                "Removed from your cloud: {} — Trawler can grab it again",
                 name.chars().take(60).collect::<String>()
             ),
         );

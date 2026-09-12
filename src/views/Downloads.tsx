@@ -80,20 +80,21 @@ export default function DownloadsView() {
   };
 
   const removeCloud = async (item: CloudItem, deleteCloud: boolean) => {
-    // a finished grab only leaves the list (or drops its kept cloud copy);
-    // anything unfinished is taken out of the cloud too
+    // a finished grab either drops its kept cloud copy (the card stays) or
+    // leaves the list; anything unfinished is taken out of the cloud too
+    const dropCloudCopyOnly = item.phase === "done" && deleteCloud;
     try {
       await api.cloudRemove(item.ledgerId, deleteCloud);
+      if (dropCloudCopyOnly) {
+        setData((d) =>
+          d ? { ...d, cloud: { ...d.cloud, items: d.cloud.items.map((x) => (x.ledgerId === item.ledgerId ? { ...x, cloudCopy: false } : x)) } } : d,
+        );
+        toast(`Deleted the cloud copy of ${item.title}`, "info");
+        return;
+      }
       removedRef.current.set(`l:${item.ledgerId}`, Date.now());
       setData((d) => (d ? { ...d, cloud: { ...d.cloud, items: d.cloud.items.filter((x) => x.ledgerId !== item.ledgerId) } } : d));
-      toast(
-        item.phase === "done"
-          ? deleteCloud
-            ? `Deleted the cloud copy of ${item.title}`
-            : `Hid ${item.title}`
-          : `Removed ${item.title} from Trawler and Bitport`,
-        "info",
-      );
+      toast(item.phase === "done" ? `Hid ${item.title}` : `Removed ${item.title} from Trawler and Bitport`, "info");
     } catch (e) {
       toast(String(e), "bad");
     }
@@ -114,9 +115,9 @@ export default function DownloadsView() {
   const cloudOthers = data?.cloud.others.filter((t) => !hidden(`t:${t.token}`)) ?? [];
   const showOthers = scope === "all" && cloudOthers.length > 0;
   const nothingAtAll = !!data && data.torrents.length === 0 && cloudItems.length === 0 && !showOthers;
-  // a cloud-only setup has no qBittorrent to reach: its silence is not a
-  // warning unless local torrents are actually expected
-  const cloudOnly = config?.downloadBackend === "bitport" && !!data?.cloud.connected && (data?.torrents.length ?? 0) === 0;
+  // a cloud-first setup may have no qBittorrent at all: its silence is a
+  // note, not an alarm (the local list is unknown, not known-empty)
+  const cloudOnly = config?.downloadBackend === "bitport" && !!data?.cloud.connected;
 
   return (
     <div className="flex h-full flex-col">
@@ -158,6 +159,11 @@ export default function DownloadsView() {
             qBittorrent didn't answer the last check — the local list may be stale
           </div>
         )}
+        {(error ?? data?.qbitError) && data && cloudOnly && (
+          <div className="mb-3 flex items-center gap-2 rounded-lg border border-line bg-bg1 px-3 py-1.5 text-[11.5px] text-faint">
+            <HardDrive size={12} /> qBittorrent isn't reachable — local torrents, if any, aren't listed
+          </div>
+        )}
         {data?.cloud.connected && data.cloud.authFailed && (
           <div className="mb-3 flex items-center gap-2 rounded-lg border border-bad/30 bg-bad/8 px-3 py-1.5 text-[11.5px] text-bad">
             <Cloud size={13} /> Bitport no longer accepts Trawler's access — reconnect it under Settings → Connections
@@ -185,7 +191,9 @@ export default function DownloadsView() {
             body={
               scope === "trawler"
                 ? cloudOnly
-                  ? "Releases you grab go to your Bitport cloud and land here on their way to this computer."
+                  ? data.cloud.fetchToLocal
+                    ? "Releases you grab go to your Bitport cloud and land here on their way to this computer."
+                    : "Releases you grab go to your Bitport cloud and are listed here; the files stay in the cloud."
                   : "Releases you grab land here, tagged with the trawler category."
                 : undefined
             }
@@ -212,7 +220,7 @@ export default function DownloadsView() {
               <>
                 <div className="flex items-center gap-1.5 pt-3 pb-1 text-[11.5px] font-medium text-dim">
                   <Cloud size={13} className="text-faint" /> Also in your Bitport cloud
-                  <span className="font-normal text-faint">· not from Trawler</span>
+                  <span className="font-normal text-faint">· other transfers in the account</span>
                 </div>
                 {cloudOthers.map((t) => (
                   <OtherCloudCard key={t.token} t={t} onDelete={deleteOther} />

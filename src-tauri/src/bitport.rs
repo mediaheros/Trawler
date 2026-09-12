@@ -176,9 +176,16 @@ fn judge_callback(query: &str, expected_state: &str) -> CallbackVerdict {
 /// probes carry cors/no-cors and image/script/empty. Headers absent (an
 /// old browser, curl) are accepted — this is a hurdle, not a proof.
 fn looks_like_navigation(request: &str) -> bool {
+    // a redirect is always a GET; a POST body could otherwise smuggle
+    // header-looking lines, so the body is never read as headers either
+    if !request.starts_with("GET ") {
+        return false;
+    }
+    let headers = request.split("\r\n\r\n").next().unwrap_or(request);
+    let headers = headers.split("\n\n").next().unwrap_or(headers);
     let mut mode: Option<String> = None;
     let mut dest: Option<String> = None;
-    for line in request.lines().skip(1) {
+    for line in headers.lines().skip(1) {
         let Some((name, value)) = line.split_once(':') else { continue };
         match name.trim().to_ascii_lowercase().as_str() {
             "sec-fetch-mode" => mode = Some(value.trim().to_ascii_lowercase()),
@@ -191,6 +198,35 @@ fn looks_like_navigation(request: &str) -> bool {
     mode_ok && dest_ok
 }
 
+/// Read one HTTP request head (through the blank line), bounded in size and
+/// time. A single `read` may return only the first segment; the browser
+/// does not retry, so a truncated request line would strand the flow.
+async fn read_request_head(sock: &mut tokio::net::TcpStream) -> Option<String> {
+    use tokio::io::AsyncReadExt;
+    const LIMIT: usize = 16 * 1024;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = match tokio::time::timeout_at(deadline, sock.read(&mut chunk)).await {
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Ok(n)) => n,
+            Ok(Err(_)) => return None,
+        };
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.windows(2).any(|w| w == b"\n\n") {
+            break;
+        }
+        if buf.len() >= LIMIT {
+            break;
+        }
+    }
+    if buf.is_empty() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
 /// Wait for the browser to hand back the authorization code. Ignores the
 /// stray requests browsers make (favicon, prefetch) and keeps listening.
 pub async fn await_code(
@@ -198,7 +234,7 @@ pub async fn await_code(
     timeout: std::time::Duration,
     expected_state: &str,
 ) -> Result<String> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let (mut sock, _) = match tokio::time::timeout_at(deadline, listener.accept()).await {
@@ -210,15 +246,10 @@ pub async fn await_code(
             Ok(Ok(pair)) => pair,
             Ok(Err(e)) => return Err(AppError::Other(format!("callback listener failed: {e}"))),
         };
-        let mut buf = [0u8; 4096];
         // a connection that never sends (a browser's speculative preconnect,
         // a port scanner) must not park the whole flow — and the listener
         // with it — until the app restarts
-        let n = match tokio::time::timeout(std::time::Duration::from_secs(5), sock.read(&mut buf)).await {
-            Ok(Ok(n)) => n,
-            _ => continue,
-        };
-        let req = String::from_utf8_lossy(&buf[..n]);
+        let Some(req) = read_request_head(&mut sock).await else { continue };
         let target = req
             .lines()
             .next()
@@ -254,7 +285,7 @@ pub async fn await_code(
             CallbackVerdict::Code(c) => {
                 let _ = sock
                     .write_all(
-                        callback_page(true, "Connected", "Trawler has your Bitport account. You can close this tab.")
+                        callback_page(true, "Approved", "Return to Trawler — it is finishing the connection. You can close this tab.")
                             .as_bytes(),
                     )
                     .await;
@@ -541,12 +572,22 @@ impl BitportClient<'_> {
         if resp.status().as_u16() == 401 {
             return Err(AppError::BitportAuth);
         }
+        let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        if text.trim().is_empty() {
-            return Ok(()); // "Returns an empty response on success"
+        // a gateway error page is not "Returns an empty response on success"
+        if !status.is_success() {
+            return Err(AppError::Other(format!(
+                "Bitport answered {status} to the delete: {}",
+                text.chars().take(200).collect::<String>()
+            )));
         }
-        let v: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
-        unwrap_envelope(v).map(|_| ())
+        if text.trim().is_empty() {
+            return Ok(());
+        }
+        match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(v) => unwrap_envelope(v).map(|_| ()),
+            Err(_) => Err(AppError::Other("Bitport answered the delete with something other than JSON".into())),
+        }
     }
 }
 
@@ -692,16 +733,13 @@ fn parse_folder(v: &serde_json::Value) -> Option<CloudFolder> {
 
 /// Their progress arrives as a string ("", "42", maybe "42%") or a number.
 fn parse_progress(v: Option<&serde_json::Value>) -> f64 {
-    match v {
-        Some(serde_json::Value::Number(n)) => n.as_f64().unwrap_or(0.0).clamp(0.0, 100.0),
-        Some(serde_json::Value::String(s)) => s
-            .trim()
-            .trim_end_matches('%')
-            .parse::<f64>()
-            .unwrap_or(0.0)
-            .clamp(0.0, 100.0),
+    let raw = match v {
+        Some(serde_json::Value::Number(n)) => n.as_f64().unwrap_or(0.0),
+        Some(serde_json::Value::String(s)) => s.trim().trim_end_matches('%').parse::<f64>().unwrap_or(0.0),
         _ => 0.0,
-    }
+    };
+    // "nan" parses; serde would send it as null and the view would choke
+    if raw.is_finite() { raw.clamp(0.0, 100.0) } else { 0.0 }
 }
 
 /// The btih out of a transfer's src magnet, for ledger matching. Transfers
@@ -767,6 +805,13 @@ mod tests {
         assert!(!looks_like_navigation(fetch));
         let img = "GET /bitport-callback?code=x HTTP/1.1\r\nsec-fetch-mode: no-cors\r\nsec-fetch-dest: image\r\n\r\n";
         assert!(!looks_like_navigation(img));
+        // a POST body cannot smuggle header-looking lines past the check
+        let smuggled = "POST /bitport-callback?code=x HTTP/1.1\r\nSec-Fetch-Mode: no-cors\r\nSec-Fetch-Dest: empty\r\n\r\nsec-fetch-mode: navigate\r\nsec-fetch-dest: document";
+        assert!(!looks_like_navigation(smuggled));
+        let get_with_body = "GET /bitport-callback?code=x HTTP/1.1\r\nSec-Fetch-Mode: no-cors\r\n\r\nsec-fetch-mode: navigate";
+        assert!(!looks_like_navigation(get_with_body));
+        assert_eq!(parse_progress(Some(&serde_json::json!("nan"))), 0.0);
+        assert_eq!(parse_progress(Some(&serde_json::json!("inf"))), 0.0);
     }
 
     #[test]

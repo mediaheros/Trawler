@@ -69,7 +69,7 @@ export function CloudGrabCard({
               {phase === "sending" && "sending to Bitport…"}
               {phase === "queued" && "queued on Bitport"}
               {phase === "cloud" && (CLOUD_STATUS_LABEL[item.cloudStatus] ?? item.cloudStatus)}
-              {phase === "fetching" && (item.speed > 0 ? "bringing the files here" : "waiting to fetch")}
+              {phase === "fetching" && (item.speed > 0 ? "bringing the files here" : item.message ?? "waiting to fetch")}
               {phase === "done" && (item.localPath ? "on this computer" : "finished in the cloud")}
               {phase === "error" && (item.error ?? "failed")}
             </span>
@@ -130,7 +130,15 @@ export function CloudGrabCard({
             <Button
               variant="ghost"
               className="px-2 py-1.5 hover:text-bad"
-              title={confirm === "cloud" ? "Click again to delete the cloud copy (local files stay)" : "Delete the cloud copy (local files stay)"}
+              title={
+                item.localPath
+                  ? confirm === "cloud"
+                    ? "Click again to delete the cloud copy (local files stay)"
+                    : "Delete the cloud copy (local files stay)"
+                  : confirm === "cloud"
+                    ? "Click again to delete it from Bitport — this is the only copy"
+                    : "Delete from Bitport — this is the only copy"
+              }
               onClick={() => {
                 if (confirm !== "cloud") {
                   arm("cloud");
