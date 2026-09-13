@@ -5,9 +5,11 @@ import { useStore } from "../store";
 import { isMac } from "../lib/platform";
 import { Badge, Button, IconBtn, TextInput, cx } from "./ui";
 
-/** Verified against Prowlarr's catalog this session — healthy public defs. */
+/** Healthy public defs, by current Prowlarr display name. Adding and the installed
+ * check both go by slug (see defKey), so a catalog rename such as
+ * TorrentDownloads -> Torrent Downloads keeps working until the label is refreshed. */
 const CURATED = [
-  "TorrentDownloads",
+  "Torrent Downloads",
   "Torrent[CORE]",
   "TorrentsCSV",
   "Uindex",
@@ -16,6 +18,15 @@ const CURATED = [
   "TorrentProject2",
 ];
 const CURATED_ANIME = ["Nyaa.si", "SubsPlease", "Anidex"];
+
+/** Mirror of the backend's definition_key: lowercase ASCII alphanumerics with
+ * diacritics folded, the shape of Prowlarr's definition slugs. */
+const defKey = (s: string) =>
+  s
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
 
 export default function IndexerManager() {
   const toast = useStore((s) => s.toast);
@@ -61,8 +72,10 @@ export default function IndexerManager() {
     }
   }, [browse, defs, toast]);
 
+  // keyed by slug so a curated label still reads as installed after Prowlarr
+  // renames the definition (the installed indexer keeps whatever name it had)
   const installedNames = useMemo(
-    () => new Set((installed ?? []).map((i) => i.name)),
+    () => new Set((installed ?? []).map((i) => defKey(i.name))),
     [installed],
   );
 
@@ -138,7 +151,7 @@ export default function IndexerManager() {
     if (!defs) return [];
     const f = filter.toLowerCase();
     return defs.filter(
-      (d) => !installedNames.has(d.name) && (!f || d.name.toLowerCase().includes(f) || d.description.toLowerCase().includes(f)),
+      (d) => !installedNames.has(defKey(d.name)) && (!f || d.name.toLowerCase().includes(f) || d.description.toLowerCase().includes(f)),
     );
   }, [defs, filter, installedNames]);
 
@@ -194,7 +207,7 @@ export default function IndexerManager() {
         <div className="mb-1.5 text-[11.5px] font-medium text-dim">Quick add — reliable public indexers</div>
         <div className="flex flex-wrap gap-1.5">
           {[...CURATED, ...CURATED_ANIME].map((name) => {
-            const have = installedNames.has(name);
+            const have = installedNames.has(defKey(name));
             const anime = CURATED_ANIME.includes(name);
             return (
               <button

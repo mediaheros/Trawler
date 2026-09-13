@@ -1083,7 +1083,7 @@ async function mock(cmd: string, args?: Record<string, unknown>): Promise<unknow
     case "indexer_defs":
       return [
         { name: "ExtraTorrent.st", description: "Public tracker for MOVIE / TV / GENERAL", privacy: "public", language: "en-US" },
-        { name: "TorrentDownloads", description: "Public torrent site", privacy: "public", language: "en-US" },
+        { name: "Torrent Downloads", description: "Public torrent site", privacy: "public", language: "en-US" },
         { name: "Nyaa.si", description: "Public torrent site focused on Eastern Asian media", privacy: "public", language: "en-US" },
       ] satisfies IndexerDef[];
     case "add_indexer":

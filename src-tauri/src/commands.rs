@@ -813,6 +813,51 @@ pub async fn torrent_action(
 #[cfg(test)]
 mod tests {
     use super::matches_query;
+    use super::{definition_key, find_definition};
+
+    #[test]
+    fn find_definition_survives_catalog_renames() {
+        // Prowlarr renamed "TorrentDownloads" to "Torrent Downloads"; the
+        // definition slug stayed. A curated name from before the rename must
+        // still resolve, and a near miss must not.
+        let public = |name: &str, def: &str| {
+            serde_json::json!({"name": name, "definitionName": def, "privacy": "public", "protocol": "torrent"})
+        };
+        let defs = vec![
+            public("Torrent Downloads", "torrentdownloads"),
+            public("TorrentDownload", "torrentdownload"),
+            public("Torrent[CORE]", "torrentcore"),
+            // the live catalog: showRSS is a preset of the generic feed, and
+            // shares its definitionName with it
+            public("showRSS", "Torrent RSS Feed"),
+            public("Torrent RSS Feed", "Torrent RSS Feed"),
+            public("Anime Tosho", "animetosho-xyz"),
+            public("Bit-Bázis", "bitbazis"),
+            // the Newznab family: one definitionName, many private presets
+            serde_json::json!({"name": "abNZB", "definitionName": "Newznab", "privacy": "private", "protocol": "usenet"}),
+            serde_json::json!({"name": "altHUB", "definitionName": "Newznab", "privacy": "private", "protocol": "usenet"}),
+            serde_json::json!({"name": "HD-Torrents", "definitionName": "hdtorrents", "privacy": "private", "protocol": "torrent"}),
+        ];
+        assert_eq!(find_definition(&defs, "TorrentDownload"), Some(1), "exact display name wins");
+        assert_eq!(find_definition(&defs, "TorrentDownloads"), Some(0), "renamed display name resolves by slug");
+        assert_eq!(find_definition(&defs, "torrentdownloads"), Some(0), "the slug itself resolves");
+        assert_eq!(find_definition(&defs, "Torrent [CORE]"), Some(2));
+        assert_eq!(
+            find_definition(&defs, "Torrent RSS Feed"),
+            Some(4),
+            "an exact display name beats an earlier definitionName hit"
+        );
+        assert_eq!(find_definition(&defs, "animetosho-xyz"), Some(5), "resolves through definitionName alone");
+        assert_eq!(find_definition(&defs, "Bit-Bazis"), Some(6), "diacritics fold");
+        assert_eq!(find_definition(&defs, "Newznab"), None, "a shared family slug is ambiguous");
+        assert_eq!(find_definition(&defs, "hdtorrents"), None, "fuzzy passes never reach a private definition");
+        assert_eq!(find_definition(&defs, "HD-Torrents"), Some(9), "an exact name still does, as before");
+        assert_eq!(find_definition(&defs, "Torrent Down"), None, "no prefix or fuzzy matching");
+        assert_eq!(find_definition(&defs, ""), None);
+        assert_eq!(definition_key("kickasstorrents.ws"), "kickasstorrentsws");
+        assert_eq!(definition_key("Bit-Bázis"), "bitbazis");
+        assert_eq!(definition_key("PT分享站 (itzmx)"), "ptitzmx");
+    }
 
     #[test]
     fn query_matching() {
@@ -1023,16 +1068,70 @@ pub async fn indexer_defs(state: State<'_, AppState>) -> Result<Vec<IndexerDef>>
     Ok(out)
 }
 
+/// Lowercased ASCII alphanumerics with diacritics folded: the shape Prowlarr's
+/// definition slugs take ("Torrent Downloads" and "TorrentDownloads" both
+/// become `torrentdownloads`, "Bit-Bázis" becomes `bitbazis`).
+pub(crate) fn definition_key(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars().flat_map(char::to_lowercase) {
+        match fold_diacritic(c) {
+            Some(folded) => out.push_str(folded),
+            None if c.is_ascii_alphanumeric() => out.push(c),
+            None => {}
+        }
+    }
+    out
+}
+
+/// Locate a catalog definition by the name the UI knows it by. Prowlarr renames
+/// display names in its catalog updates ("TorrentDownloads" became
+/// "Torrent Downloads" and the curated quick-add broke), but the slug in
+/// `definitionName` is stable for Cardigann definitions. An exact display name
+/// wins, as it always did. Otherwise the name is compared by slug, first against
+/// display names, then against `definitionName`, and only among definitions the
+/// picker shows (public torrent): `definitionName` is a shared family name for
+/// the Newznab and Torznab presets, so a fuzzy hit there could otherwise install
+/// a private usenet preset. A slug that fits more than one definition is
+/// ambiguous and resolves to nothing rather than to whichever Prowlarr listed
+/// first.
+pub(crate) fn find_definition(defs: &[serde_json::Value], name: &str) -> Option<usize> {
+    fn field<'a>(d: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+        d.get(key).and_then(|v| v.as_str())
+    }
+    if let Some(i) = defs.iter().position(|d| field(d, "name") == Some(name)) {
+        return Some(i);
+    }
+    let key = definition_key(name);
+    if key.is_empty() {
+        return None;
+    }
+    let listed = |d: &serde_json::Value| {
+        field(d, "privacy") == Some("public") && field(d, "protocol") == Some("torrent")
+    };
+    let only_match = |by: &str| {
+        let mut hits = defs.iter().enumerate().filter(|(_, d)| {
+            listed(d) && field(d, by).is_some_and(|n| definition_key(n) == key)
+        });
+        match (hits.next(), hits.next()) {
+            (Some((i, _)), None) => Some(i),
+            _ => None,
+        }
+    };
+    only_match("name").or_else(|| only_match("definitionName"))
+}
+
 /// Install an indexer from its catalog definition (defaults untouched).
 #[tauri::command]
 pub async fn add_indexer(state: State<'_, AppState>, name: String) -> Result<String> {
     let cfg = state.config.read().await.clone();
     let client = prowlarr(&state.http, &cfg)?;
-    let defs = client.schema().await?;
-    let mut def = defs
-        .into_iter()
-        .find(|d| d.get("name").and_then(|v| v.as_str()) == Some(name.as_str()))
-        .ok_or_else(|| AppError::Other(format!("no definition named {name}")))?;
+    let mut defs = client.schema().await?;
+    let idx = find_definition(&defs, &name).ok_or_else(|| {
+        AppError::Other(format!(
+            "Prowlarr's catalog has no indexer called \"{name}\". It may have been renamed or dropped; browse the full catalog to find it."
+        ))
+    })?;
+    let mut def = defs.swap_remove(idx);
     def["enable"] = serde_json::Value::Bool(true);
     def["appProfileId"] = serde_json::Value::from(1);
     let added = match client.add_indexer_raw(&def).await {

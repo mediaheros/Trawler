@@ -103,11 +103,9 @@ pub async fn setup_starter_indexers(state: State<'_, AppState>) -> Result<Vec<St
     let mut last_err: Option<AppError> = None;
     let mut found_in_catalog = 0;
     for name in STARTERS {
-        let Some(def) = defs
-            .iter()
-            .find(|d| d.get("name").and_then(|v| v.as_str()) == Some(name))
-        else {
-            continue; // renamed/removed from Prowlarr's catalog — skip quietly
+        // by exact name, then by slug, so a catalog rename does not drop a starter
+        let Some(def) = crate::commands::find_definition(&defs, name).map(|i| &defs[i]) else {
+            continue; // removed from Prowlarr's catalog — skip quietly
         };
         found_in_catalog += 1;
         let mut def = def.clone();
