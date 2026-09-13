@@ -1,43 +1,43 @@
 {
-  "version": "0.5.6",
-  "notes": "v0.5.6: a duplicate add in qBittorrent is adopted instead of retried every cycle, the info hash now comes from the magnet or torrent itself rather than the indexer, dead swarms and vanished torrents are judged across cycles so a VPN drop or a qBittorrent restart no longer pauses and re-grabs everything, unattended runs refuse releases of unknown size, a config.json that cannot be read is never overwritten with defaults, a brief reply with odd braces no longer crashes the app, and three UI state leaks (show search stealing focus, doubled agent steps, a composer stuck disabled) are fixed.",
-  "pub_date": "2026-09-05T04:35:21Z",
+  "version": "0.6.0",
+  "notes": "v0.6.0: the Bitport cloud backend now works end to end - connecting an account succeeds (the OAuth redirect and the token exchange were both broken), finished cloud transfers are fetched to your save folder with resume and checksum verification before an episode counts as downloaded, verified downloads free the cloud quota by default, and a transfer Bitport gives up on hands its episodes back and is not re-sent. With an account connected every search result offers both Grab (qBittorrent on this computer) and Cloud (Bitport); the Settings default only decides which one the scheduler, the RSS sweep and the agent use. Torrent-only releases reach Bitport as magnets built from the torrent file. Stalled cloud grabs show why and can be retried, removing a grab also cancels its in-flight fetch, and a rejected token pauses fetching until you reconnect.",
+  "pub_date": "2026-09-13T09:40:33Z",
   "platforms": {
     "windows-x86_64": {
-      "url": "https://github.com/mediaheros/Trawler/releases/download/v0.5.6/Trawler_0.5.6_windows-x64-setup.exe",
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVDdvNU5DYTR2d3lxVHNqeHh1WDRmNlNpcHFDbnhvdHlhcEo4eEdsanZzRnV6dkY5TEZ4aWRzQ0JiZDFJUnYzL2JtLzk1Y3BTWHMrSEliV1NtclpuRmttbis1TTV5RVFFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg4NTQ5MjQ0CWZpbGU6VHJhd2xlcl8wLjUuNl94NjQtc2V0dXAuZXhlCm1uOGQyaDlKdGdaTWJwZTJWS0szYnpqYklQOVd2RVNXRjh1ZUZYakgrYkpLRnBrU0hYaHU0Y1dXV2pWLy9CVm1SRE5IVjB2RWlweWdZY3FkdGl6b0RnPT0K"
+      "url": "https://github.com/mediaheros/Trawler/releases/download/v0.6.0/Trawler_0.6.0_windows-x64-setup.exe",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVDdvNU5DYTR2d3dqZitCY1hpTkxLVXFNL0xqMk5QU3M2K2VnbGpmN3haYUQza09VZWdqajZWTzVaQW4xMzhXUGlTdzlLbi9QbzA0Y3ZUdnlCV3Z3aXRIak10RENBOEFnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg5MjkyMjUwCWZpbGU6VHJhd2xlcl8wLjYuMF94NjQtc2V0dXAuZXhlCnRRdUhkSDQ4cjJ4RThFWHZiU1dXZGl0R3c2LzA2UGhIT0twbjIxNUVEQWI5TnN4QTJvMkd5QnhTeWVjdGpqSjhrRnBpYU44RXl3TU50c053MndNUUNRPT0K"
     },
     "windows-x86_64-nsis": {
-      "url": "https://github.com/mediaheros/Trawler/releases/download/v0.5.6/Trawler_0.5.6_windows-x64-setup.exe",
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVDdvNU5DYTR2d3lxVHNqeHh1WDRmNlNpcHFDbnhvdHlhcEo4eEdsanZzRnV6dkY5TEZ4aWRzQ0JiZDFJUnYzL2JtLzk1Y3BTWHMrSEliV1NtclpuRmttbis1TTV5RVFFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg4NTQ5MjQ0CWZpbGU6VHJhd2xlcl8wLjUuNl94NjQtc2V0dXAuZXhlCm1uOGQyaDlKdGdaTWJwZTJWS0szYnpqYklQOVd2RVNXRjh1ZUZYakgrYkpLRnBrU0hYaHU0Y1dXV2pWLy9CVm1SRE5IVjB2RWlweWdZY3FkdGl6b0RnPT0K"
+      "url": "https://github.com/mediaheros/Trawler/releases/download/v0.6.0/Trawler_0.6.0_windows-x64-setup.exe",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVDdvNU5DYTR2d3dqZitCY1hpTkxLVXFNL0xqMk5QU3M2K2VnbGpmN3haYUQza09VZWdqajZWTzVaQW4xMzhXUGlTdzlLbi9QbzA0Y3ZUdnlCV3Z3aXRIak10RENBOEFnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg5MjkyMjUwCWZpbGU6VHJhd2xlcl8wLjYuMF94NjQtc2V0dXAuZXhlCnRRdUhkSDQ4cjJ4RThFWHZiU1dXZGl0R3c2LzA2UGhIT0twbjIxNUVEQWI5TnN4QTJvMkd5QnhTeWVjdGpqSjhrRnBpYU44RXl3TU50c053MndNUUNRPT0K"
     },
     "windows-aarch64": {
-      "url": "https://github.com/mediaheros/Trawler/releases/download/v0.5.6/Trawler_0.5.6_windows-arm64-setup.exe",
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVDdvNU5DYTR2dzBwcnZjRExTamN4VlFDMEs3anhnakRQem43eExqL1I1azM0K3FQUlVObGpkaGdUZXkxOFp1b0FXaGhwUVU2NFIrNUZsbUxQTFJvRXA5YnQrU3AybkFvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg4NTQ5MzY1CWZpbGU6VHJhd2xlcl8wLjUuNl9hcm02NC1zZXR1cC5leGUKS3pxU1I2TkZOaStKK0FvU2FDa1B4d2RWYWF5dXZreXZKK295RVErdUg1OHU3aXdhZnJ6empXbEZCSk1BRzltWUw5UG5BK21sMS9KUWpOcHBYWjV0RFE9PQo="
+      "url": "https://github.com/mediaheros/Trawler/releases/download/v0.6.0/Trawler_0.6.0_windows-arm64-setup.exe",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVDdvNU5DYTR2d3dUTTdPUG5rWnFIdkVLdkNna01Kak5jdmVvY2tQWDBLUmpBQTlSZSt1M3BWTzFiZ0Fsc2xyOGQ4aEZsR0NJYkdpTWxNd05menEvV0pKMGNFSXNJVlFVPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg5MjkyMzcxCWZpbGU6VHJhd2xlcl8wLjYuMF9hcm02NC1zZXR1cC5leGUKbzA0SWZWaWZKUTVBd2cwSnlzR0dUa3oweG8wSkJjUVk1OHdaamJNZjFZZFZ6OVpiMFNQUklYYy95bllaOHlDOXhZQysrU2R4RHhuRndCa015eEd0Q1E9PQo="
     },
     "windows-aarch64-nsis": {
-      "url": "https://github.com/mediaheros/Trawler/releases/download/v0.5.6/Trawler_0.5.6_windows-arm64-setup.exe",
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVDdvNU5DYTR2dzBwcnZjRExTamN4VlFDMEs3anhnakRQem43eExqL1I1azM0K3FQUlVObGpkaGdUZXkxOFp1b0FXaGhwUVU2NFIrNUZsbUxQTFJvRXA5YnQrU3AybkFvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg4NTQ5MzY1CWZpbGU6VHJhd2xlcl8wLjUuNl9hcm02NC1zZXR1cC5leGUKS3pxU1I2TkZOaStKK0FvU2FDa1B4d2RWYWF5dXZreXZKK295RVErdUg1OHU3aXdhZnJ6empXbEZCSk1BRzltWUw5UG5BK21sMS9KUWpOcHBYWjV0RFE9PQo="
+      "url": "https://github.com/mediaheros/Trawler/releases/download/v0.6.0/Trawler_0.6.0_windows-arm64-setup.exe",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVDdvNU5DYTR2d3dUTTdPUG5rWnFIdkVLdkNna01Kak5jdmVvY2tQWDBLUmpBQTlSZSt1M3BWTzFiZ0Fsc2xyOGQ4aEZsR0NJYkdpTWxNd05menEvV0pKMGNFSXNJVlFVPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg5MjkyMzcxCWZpbGU6VHJhd2xlcl8wLjYuMF9hcm02NC1zZXR1cC5leGUKbzA0SWZWaWZKUTVBd2cwSnlzR0dUa3oweG8wSkJjUVk1OHdaamJNZjFZZFZ6OVpiMFNQUklYYy95bllaOHlDOXhZQysrU2R4RHhuRndCa015eEd0Q1E9PQo="
     },
     "darwin-aarch64": {
-      "url": "https://github.com/mediaheros/Trawler/releases/download/v0.5.6/Trawler_0.5.6_macos-universal.app.tar.gz",
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVDdvNU5DYTR2dzFiTDVaNWwwZ3BBT3Yzb3lSaUNoZ1dJSCtZQWVXMFZrSFpPZWQ4NDV3bTZRVGd1cHJlR04ycDlRb3RPS3BWRnJ6MUFVUHNackkwS0s2OVRSSDRaS2c4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg4NTQ5NDEwCWZpbGU6VHJhd2xlci5hcHAudGFyLmd6CnNnM0FaTFpkaVpOSHFHZlM0cGpwZHk0b2NaVGhHZGYvSE9abUlQTXJ3UEk2V3NQQTBwVFR2Z1ZrUW9QOHJOQStKa2RkT01CeWNES2wyeWx3SEZ3NkNRPT0K"
+      "url": "https://github.com/mediaheros/Trawler/releases/download/v0.6.0/Trawler_0.6.0_macos-universal.app.tar.gz",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVDdvNU5DYTR2dzlQTC9QOTNjWFZRVzhJaEJKSEIrRWVhMnFoay9oS3lxdDk5VzJFaEhOZkljd0w4dVlTaEhhMWliOEFncXF1ZXo4d0tObXV0Vk1jeWJodkpaeUIzTUFvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg5MjkyMjY1CWZpbGU6VHJhd2xlci5hcHAudGFyLmd6CkNMaGhhMElEUWNVYW1BeDF1b0JiSExuRVY4N1pIVVpJV1phS0k3QTRQTCt6RjVqRGhGQkIrbHpGRjRNWmw4dnhObmZNNy9ZNktMRHdCVHlFc1o2ekJRPT0K"
     },
     "darwin-x86_64": {
-      "url": "https://github.com/mediaheros/Trawler/releases/download/v0.5.6/Trawler_0.5.6_macos-universal.app.tar.gz",
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVDdvNU5DYTR2dzFiTDVaNWwwZ3BBT3Yzb3lSaUNoZ1dJSCtZQWVXMFZrSFpPZWQ4NDV3bTZRVGd1cHJlR04ycDlRb3RPS3BWRnJ6MUFVUHNackkwS0s2OVRSSDRaS2c4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg4NTQ5NDEwCWZpbGU6VHJhd2xlci5hcHAudGFyLmd6CnNnM0FaTFpkaVpOSHFHZlM0cGpwZHk0b2NaVGhHZGYvSE9abUlQTXJ3UEk2V3NQQTBwVFR2Z1ZrUW9QOHJOQStKa2RkT01CeWNES2wyeWx3SEZ3NkNRPT0K"
+      "url": "https://github.com/mediaheros/Trawler/releases/download/v0.6.0/Trawler_0.6.0_macos-universal.app.tar.gz",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVDdvNU5DYTR2dzlQTC9QOTNjWFZRVzhJaEJKSEIrRWVhMnFoay9oS3lxdDk5VzJFaEhOZkljd0w4dVlTaEhhMWliOEFncXF1ZXo4d0tObXV0Vk1jeWJodkpaeUIzTUFvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg5MjkyMjY1CWZpbGU6VHJhd2xlci5hcHAudGFyLmd6CkNMaGhhMElEUWNVYW1BeDF1b0JiSExuRVY4N1pIVVpJV1phS0k3QTRQTCt6RjVqRGhGQkIrbHpGRjRNWmw4dnhObmZNNy9ZNktMRHdCVHlFc1o2ekJRPT0K"
     },
     "darwin-universal": {
-      "url": "https://github.com/mediaheros/Trawler/releases/download/v0.5.6/Trawler_0.5.6_macos-universal.app.tar.gz",
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVDdvNU5DYTR2dzFiTDVaNWwwZ3BBT3Yzb3lSaUNoZ1dJSCtZQWVXMFZrSFpPZWQ4NDV3bTZRVGd1cHJlR04ycDlRb3RPS3BWRnJ6MUFVUHNackkwS0s2OVRSSDRaS2c4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg4NTQ5NDEwCWZpbGU6VHJhd2xlci5hcHAudGFyLmd6CnNnM0FaTFpkaVpOSHFHZlM0cGpwZHk0b2NaVGhHZGYvSE9abUlQTXJ3UEk2V3NQQTBwVFR2Z1ZrUW9QOHJOQStKa2RkT01CeWNES2wyeWx3SEZ3NkNRPT0K"
+      "url": "https://github.com/mediaheros/Trawler/releases/download/v0.6.0/Trawler_0.6.0_macos-universal.app.tar.gz",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVDdvNU5DYTR2dzlQTC9QOTNjWFZRVzhJaEJKSEIrRWVhMnFoay9oS3lxdDk5VzJFaEhOZkljd0w4dVlTaEhhMWliOEFncXF1ZXo4d0tObXV0Vk1jeWJodkpaeUIzTUFvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg5MjkyMjY1CWZpbGU6VHJhd2xlci5hcHAudGFyLmd6CkNMaGhhMElEUWNVYW1BeDF1b0JiSExuRVY4N1pIVVpJV1phS0k3QTRQTCt6RjVqRGhGQkIrbHpGRjRNWmw4dnhObmZNNy9ZNktMRHdCVHlFc1o2ekJRPT0K"
     },
     "linux-x86_64": {
-      "url": "https://github.com/mediaheros/Trawler/releases/download/v0.5.6/Trawler_0.5.6_linux-x64.AppImage",
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVDdvNU5DYTR2d3crRlRJYTJFQUFTSXA3WjM3ZGt3eW5kaHpFYXZ5b2hGZXluWWxlRjE0ZjI1cnFpbE00WWZDd3ZDbXVsMnZ6czR5Z3pmQ2Y1RTdvL3RBb0JTNEUybGc4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg4NTQ5MTU2CWZpbGU6VHJhd2xlcl8wLjUuNl9hbWQ2NC5BcHBJbWFnZQpXY1lUbUZWN3VOMW5VdloxV1NWS3hvRFB2U2xjbVlTY1hvZ2srMGoyVXRHbHd2bGR1QTd5Y1pCaG5JRUIzU3Jvc0ZNZ3FUbUlJeEQ2TW9EOEd0WmlEQT09Cg=="
+      "url": "https://github.com/mediaheros/Trawler/releases/download/v0.6.0/Trawler_0.6.0_linux-x64.AppImage",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVDdvNU5DYTR2d3dwUFRKOUVyNVBwUzA1T0tkYXV0ZGlubGZzNUpZK1hCNWIyV1dKZXVIWmhLNS9yZnVZZndSekhxYkxpZi9wUXBqUGkxMG0vNmhyVGdxQVNMcXFJVHd3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg5MjkyMTQxCWZpbGU6VHJhd2xlcl8wLjYuMF9hbWQ2NC5BcHBJbWFnZQo1MTRUVXl0ZC9ESVpVaXZrRXpua0ltV2VGQ2VCWnVTT3U2Q1N4dGowL0lNdlBBODlKYkdMRVY4eHprek5YTml4bUIwQWdnWFJXOEJaVWFkbVNTS2tCdz09Cg=="
     },
     "linux-x86_64-appimage": {
-      "url": "https://github.com/mediaheros/Trawler/releases/download/v0.5.6/Trawler_0.5.6_linux-x64.AppImage",
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVDdvNU5DYTR2d3crRlRJYTJFQUFTSXA3WjM3ZGt3eW5kaHpFYXZ5b2hGZXluWWxlRjE0ZjI1cnFpbE00WWZDd3ZDbXVsMnZ6czR5Z3pmQ2Y1RTdvL3RBb0JTNEUybGc4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg4NTQ5MTU2CWZpbGU6VHJhd2xlcl8wLjUuNl9hbWQ2NC5BcHBJbWFnZQpXY1lUbUZWN3VOMW5VdloxV1NWS3hvRFB2U2xjbVlTY1hvZ2srMGoyVXRHbHd2bGR1QTd5Y1pCaG5JRUIzU3Jvc0ZNZ3FUbUlJeEQ2TW9EOEd0WmlEQT09Cg=="
+      "url": "https://github.com/mediaheros/Trawler/releases/download/v0.6.0/Trawler_0.6.0_linux-x64.AppImage",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVDdvNU5DYTR2d3dwUFRKOUVyNVBwUzA1T0tkYXV0ZGlubGZzNUpZK1hCNWIyV1dKZXVIWmhLNS9yZnVZZndSekhxYkxpZi9wUXBqUGkxMG0vNmhyVGdxQVNMcXFJVHd3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg5MjkyMTQxCWZpbGU6VHJhd2xlcl8wLjYuMF9hbWQ2NC5BcHBJbWFnZQo1MTRUVXl0ZC9ESVpVaXZrRXpua0ltV2VGQ2VCWnVTT3U2Q1N4dGowL0lNdlBBODlKYkdMRVY4eHprek5YTml4bUIwQWdnWFJXOEJaVWFkbVNTS2tCdz09Cg=="
     }
   }
 }
